@@ -18,7 +18,8 @@ public partial class MainWindow
     int origHz;
     bool display60Possible;
 
-    CheckBox Fullscreen = null!, Display60 = null!, FpsCounter = null!, Ultrawide = null!, FramePacing = null!, Audio = null!, Handheld = null!, InvertY = null!;
+    CheckBox Fullscreen = null!, Display60 = null!, FpsCounter = null!, Ultrawide = null!, FramePacing = null!, Audio = null!, Handheld = null!, InvertY = null!,
+             NvidiaDlss = null!;
     WrapPanel ResolutionGroup = null!, UpscaleGroup = null!, FrameRateGroup = null!, SpeedGroup = null!, FramegenGroup = null!, UiLanguageGroup = null!;
     Slider Sharpness = null!;
     TextBlock SharpnessText = null!, Display60Hint = null!, FolderText = null!;
@@ -68,6 +69,10 @@ public partial class MainWindow
                     "Native is the sharpest. The percentages lighten the graphics card's work; the game scales the picture up afterwards."),
                   "Resolution", (1, L("Native", "Native")), (0, L("Automatique", "Automatic")), (2, "75 %"), (3, "67 %"), (5, "58 %"), (4, "50 %"));
         UpscaleGroup = ChoiceRow(RowsDisplay, L("Mise à l'échelle", "Upscaling"), null, "Upscale", (0, L("Simple", "Simple")), (1, "Catmull-Rom"), (2, "Lanczos"));
+        SwitchRow(RowsDisplay, L("NVIDIA DLSS (cartes RTX)", "NVIDIA DLSS (RTX cards)"),
+                  L("Le jeu est reconstruit avec le SDK DLSS, téléchargé chez NVIDIA. L'activer, c'est accepter la licence du SDK NVIDIA DLSS (github.com/NVIDIA/DLSS). Ensuite, choisissez DLSS ou DLAA dans le menu du jeu (touche Insert, Upscaler).",
+                    "The game is built again with the DLSS SDK, downloaded from NVIDIA. Turning this on accepts NVIDIA's DLSS SDK license (github.com/NVIDIA/DLSS). Then choose DLSS or DLAA in the game's menu (Insert key, Upscaler)."),
+                  out NvidiaDlss, out _);
 
         Sharpness = new Slider { Style = St("Line"), Minimum = 0, Maximum = 100, TickFrequency = 5, IsSnapToTickEnabled = true, Width = 210, LargeChange = 10, SmallChange = 5 };
         SharpnessText = new TextBlock { Width = 48, TextAlignment = TextAlignment.Right, VerticalAlignment = VerticalAlignment.Center, Foreground = Res("BoneSoft") };
@@ -203,6 +208,14 @@ public partial class MainWindow
         OnSwitch(Audio, v => s.Audio = v);
         OnSwitch(Handheld, v => s.Handheld = v ? 1 : 0);
         OnSwitch(InvertY, v => s.InvertY = v);
+        OnSwitch(NvidiaDlss, v =>
+        {
+            s.NvidiaDlss = v;
+            // (turned on with a game installed: built again now, NVIDIA's SDK fetched first; off: the next build is without it)
+            var tools = Tools.Find();
+            if (v && tools != null && game == null && Game.Installed(s.Folder))
+                Dispatcher.BeginInvoke(() => Rebuild(tools, s.Folder));
+        });
         OnPick(ResolutionGroup, v => s.Resolution = v);
         OnPick(UpscaleGroup, v => s.Upscaling = v);
         OnPick(FrameRateGroup, v => s.FrameRate = v);
@@ -231,6 +244,7 @@ public partial class MainWindow
         Audio.IsChecked = s.Audio;
         Handheld.IsChecked = s.Handheld != 0;
         InvertY.IsChecked = s.InvertY;
+        NvidiaDlss.IsChecked = s.NvidiaDlss;
         Pick(ResolutionGroup, s.Resolution);
         Pick(UpscaleGroup, s.Upscaling);
         Pick(FrameRateGroup, s.FrameRate);
