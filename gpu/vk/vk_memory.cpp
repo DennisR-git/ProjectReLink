@@ -1822,6 +1822,7 @@ void memory_recording_value(uint64_t value, uint64_t completed) {
 /// village (hs641 / hs640). The meter's pool is bound late in the frame, by when the GPU is past that submission. The wait
 /// is 20 ms at most and flushes nothing: pools_mu is held here. RX_VK_CAPTURE_LATE_EAGER=1: at the take, as before
 bool vk_timeline_wait_brief(uint64_t v, uint32_t ms);   // (vk_replay.cpp)
+bool vk_timeline_wait_for(uint64_t v, uint32_t ms);     // (vk_replay.cpp: the queue flushed first)
 namespace {   // (declared with CapBuf, in this file's anonymous namespace)
 // (relink, 15/11) The late pages' copy without the game's thread. take_capture copied a capture's late pages again (pages the
 // CPU wrote that a submission still on the GPU writes back: the exposure meter's and the frame's ring of constants, 74 such
@@ -2008,7 +2009,25 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         static const bool log_wait = getenv("RX_VK_LOG_CAPWAIT") != nullptr;
         const bool pending = log_wait && vk_timeline_completed() < c->late_value;
         const auto w0 = std::chrono::steady_clock::now();
-        vk_timeline_wait(c->late_value);
+        // (relink, 15/11) RX_VK_CAPTURE_WAIT_MAX_MS=<n>, default 20: the wait gives up after n ms (the pages are then copied as
+        // they are, as without the wait; 0: no limit, as before). Most waits are short (median 2.7 ms at the Market, hs2932); the
+        // long ones are stalls: 140-220 ms in each arrival in Hyrule Castle, the GPU busy with the area's texture uploads
+        // (hs2955-2958). MEASURED: Hyrule Castle's arrival at the player's 75 % (arrive_ab.ps1, 2 runs a side, castle_waitmax_1115):
+        // time lost in frames of 40 ms and more 1039 / 1177 ms -> 835 / 867 (20 ms), 957 / 905 (30 ms); the longest frame 250 /
+        // 319 -> 138 / 158 ms. Exposure's steps (expo_ab, the player's save): 2.1 / 2.5 a thousand -> 3.4 / 2.1 with 20 ms (8.1
+        // with 8 ms, 31.7 with 4: below ~20 ms the cut waits are the ones the exposure needs). Market while the camera turns: no
+        // change (turn_waitmax_1115: waits over 20 ms are rare there)
+        static const int wait_max_ms = getenv("RX_VK_CAPTURE_WAIT_MAX_MS") ? std::max(0, atoi(getenv("RX_VK_CAPTURE_WAIT_MAX_MS"))) : 20;
+        if (wait_max_ms > 0) {
+            static std::atomic<int64_t> st_waits{0}, st_cut{0};
+            const bool done = vk_timeline_wait_for(c->late_value, (uint32_t)wait_max_ms);
+            st_cut += !done;
+            if (++st_waits % 1200 == 0)
+                logf("vk: captures' waits for late pages: %lld, %lld of them cut at %d ms (RX_VK_CAPTURE_WAIT_MAX_MS)",
+                     (long long)st_waits.load(), (long long)st_cut.load(), wait_max_ms);
+        } else {
+            vk_timeline_wait(c->late_value);
+        }
         if (log_wait) {   // (each wait over 1 ms: how long, which pages; 300 lines at most)
             const double wms1 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
             static std::atomic<int> told{0};
