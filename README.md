@@ -74,6 +74,11 @@ frames a second or unlocked, frame generation), the game's language and the cont
 you play, so that every frame lasts the same time on a 100 or 144 Hz display, and puts the display's own rate back
 afterwards. In the game, **Insert** or **F1** opens the same menu, and **F11** switches full screen.
 
+**Upscaler** (since 0.7): what scales the 3D up to the screen. The game's own network by default; **AMD FSR 3.1** on any
+graphics card (AMD's library comes with ReLink); or **NVIDIA DLSS / DLAA** on an RTX card, after turning on **NVIDIA DLSS** on
+the launcher's Display page: that builds the game again with NVIDIA's DLSS SDK, downloaded from NVIDIA under NVIDIA's license.
+With FSR or DLSS, set Sharpness to about 80 %. The frame rates below are measured without them.
+
 The launcher is in English; French is one click away on its Game page. An Xbox controller or any XInput controller works,
 and so do keyboard and mouse (the keys are listed on the Controls page). Since 0.6.2 the install also brings SDL, which the
 game uses for the other controllers (Switch Pro, DualSense, DualShock 4): 0.6.1 shipped without it and they did nothing in
@@ -225,6 +230,11 @@ d'installer quoi que ce soit.
    en choisir un, le déposer sur la fenêtre, ou donner les dossiers `romfs` et `exefs`.
 4. Appuyez sur **Install**. Comptez 10 à 45 minutes selon le processeur ; le PC reste utilisable.
 5. Appuyez sur **Play**. Le lanceur est en anglais par défaut ; le français se choisit dans sa page Game.
+
+**Upscaler** (depuis la 0.7) : ce qui agrandit la 3D jusqu'à l'écran. Le réseau du jeu par défaut ; **AMD FSR 3.1** sur toutes
+les cartes graphiques (la bibliothèque d'AMD est livrée avec ReLink) ; ou **NVIDIA DLSS / DLAA** sur une carte RTX, après avoir
+activé **NVIDIA DLSS** dans la page Display du lanceur : le jeu est reconstruit avec le SDK DLSS, téléchargé chez NVIDIA sous
+la licence de NVIDIA. Avec FSR ou DLSS, mettez la netteté vers 80 %.
 
 Il faut Windows 10 ou 11 en 64 bits, un processeur avec AVX2, une carte graphique avec Vulkan 1.3 et les mesh shaders
 (GeForce RTX 20 ou plus récente, Radeon RX 6000 ou plus récente, Intel Arc ; nous n'avons testé que sur NVIDIA), 16 Go de RAM
