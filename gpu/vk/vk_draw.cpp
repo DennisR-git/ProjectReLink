@@ -3206,6 +3206,19 @@ void buffer_markers_report(const char* why = "device lost") {
     const uint32_t end = std::max(start, stuck.empty() ? start + 8 : std::min(stuck.front(), start + 16));
     for (uint32_t s = start; s && s <= end && s <= n; s++) line(s == last_done ? "RUNNING after" : "running", s);
     for (size_t j = 0; j < stuck.size() && j < 12; j++) line("reached, earlier work unfinished", stuck[j]);
+    // (relink, 15/11) With the parallel replay the markers are numbered as each worker records, so "the last whose earlier work
+    // all finished" can be another command buffer's (an RTX 5080's report: the last done 1710626, reached and unfinished from
+    // 1709970). Within one command buffer the numbers do run in order: the lowest marker reached and not finished is the most
+    // telling, and the work before it is what hung. Its eight before, with what each marker says
+    if (!stuck.empty()) {
+        const uint32_t s0 = stuck.front();
+        for (uint32_t s = s0 > 8 ? s0 - 8 : 1; s < s0; s++) {
+            const uint32_t i = (s - 1) & 0xFFFF;
+            const bool r = marker_words[2 * i] == s, d = marker_words[2 * i + 1] == s;
+            line(d ? "before the first unfinished: done" : r ? "before the first unfinished: reached, NOT done"
+                                                            : "before the first unfinished: not reached", s);
+        }
+    }
 }
 } // namespace
 

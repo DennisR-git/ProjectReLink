@@ -826,6 +826,17 @@ inline void cap_entry_set(uint64_t page, CapEntry e) {
     }
     cap_table[c][page % kCapChunkPages] = e;
 }
+// (relink, 15/11) A capture's late pages copied again by a thread of its own as soon as the submission writing them back is
+// done (take_capture), instead of by the game's thread waiting for it: see late_helper_main
+struct LateJob {
+    uint64_t value = 0;                                  // (the submission whose write-back the copy waits for)
+    void* map = nullptr;
+    VmaAllocation alloc = nullptr;
+    uint64_t nbytes = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> pages;    // (page, slot in the capture's buffer)
+    std::vector<uint64_t> masks;                         // (a page's 64-byte blocks the write-back writes; empty: whole pages)
+    std::atomic<bool> done{false};
+};
 // (each kept capture's copy on the GPU, by its generation)
 struct CapBuf {
     uint64_t value; VkBuffer buffer; VmaAllocation alloc; uint64_t size; void* map; uint64_t last_use = 0;
@@ -833,6 +844,7 @@ struct CapBuf {
     // buffer) and that submission: copied again the first time the capture is read, once it is done (capture_late_fix)
     uint64_t late_value = 0;
     std::vector<std::pair<uint32_t, uint32_t>> late;
+    std::shared_ptr<LateJob> job;   // (relink, 15/11: the late pages' copy on the helper thread, until it is done)
 };
 std::map<uint32_t, CapBuf> cap_bufs;
 void capture_late_fix(CapBuf& b);   // (below, before take_capture; pools_mu held)
@@ -1690,8 +1702,9 @@ std::unique_ptr<Capture> capture_make() {
                             if (last_cap != seq) last_cap = seq, caps++;
                             if (i + 1 == n || true) {
                                 static uint64_t logged_at;
-                                if (caps / 600 != logged_at && by.size()) {
-                                    logged_at = caps / 600;
+                                static const uint64_t every = getenv("RX_VK_LOG_LATE_EVERY") ? std::max(1, atoi(getenv("RX_VK_LOG_LATE_EVERY"))) : 600;
+                                if (caps / every != logged_at && by.size()) {
+                                    logged_at = caps / every;
                                     std::vector<std::pair<uint32_t, uint32_t>> top;
                                     for (const auto& [k, c2] : by) top.push_back({c2, k});
                                     std::sort(top.rbegin(), top.rend());
@@ -1810,7 +1823,125 @@ void memory_recording_value(uint64_t value, uint64_t completed) {
 /// is 20 ms at most and flushes nothing: pools_mu is held here. RX_VK_CAPTURE_LATE_EAGER=1: at the take, as before
 bool vk_timeline_wait_brief(uint64_t v, uint32_t ms);   // (vk_replay.cpp)
 namespace {   // (declared with CapBuf, in this file's anonymous namespace)
+// (relink, 15/11) The late pages' copy without the game's thread. take_capture copied a capture's late pages again (pages the
+// CPU wrote that a submission still on the GPU writes back: the exposure meter's and the frame's ring of constants, 74 such
+// pages a capture at the Market) after waiting there, on the game's own thread, for that submission: about six waits a second
+// over 1 ms while the camera turned at the Market (median 2.7 ms, one in ten over 10 ms; hs2932), and almost all of them in the
+// frames over 22 ms (all-thread samples, hs2930: 1.71 samples of that wait a long frame, 0.11 a normal one). Without the wait
+// (RX_VK_CAPTURE_WAIT=0, which brings the exposure's steps back) the frames over 25 ms went from 64 to 50.5 (2 runs a side,
+// turn_capwait_1115.txt). Here the copy is a job for this thread: it waits for the submission and copies the pages at once
+// (the same moment the game's thread copied them, give or take what the game wrote since), and the capture's first reader
+// (capture_late_fix, on the replay's side, later anyway) waits for the job instead.
+// MEASURED, NOT KEPT (expo_ab, the player's save, hs2941): the exposure's steps came back, 110.7 a thousand frames against 2.5
+// with the game's thread waiting (243 without any wait). "Give or take" is the point: the game, no longer held, writes those
+// pages again before the write-back lands, and the copy takes those writes (RX_VK_LATE_HELPER=2 is that version, kept to compare).
+// Each late page's 64-byte blocks that the write-back changes are learned while the game's thread still waits (the capture's
+// copy, taken before the wait, against guest memory after it: the game's thread was held meanwhile, so what differs is the
+// GPU's), from kLateLearn such waits a page on. With them, RX_VK_LATE_HELPER=1 leaves the wait out for a capture none of whose
+// late pages the write-back changes (its copy is right as taken). See late_helper_mode for what was measured: not kept
+std::mutex late_mask_mu;
+struct LateMask { uint32_t seen = 0; uint64_t blocks = 0; };
+std::unordered_map<uint32_t, LateMask> late_masks;   // (by page)
+constexpr uint32_t kLateLearn = 6;
+std::atomic<int64_t> st_late_learned{0};
+// MEASURED 15/11 (expo_ab, the player's save): the game's thread waiting, 1.7 and 2.5 steps a thousand frames; mode 2 (whole
+// pages on the helper) 110.7; learned blocks on the helper 133.5; mode 1 as it is now (the wait left out only for captures
+// whose late pages the write-back never changes: 185 pages learned) 127.2. So the steps do not come from what the captures
+// hold: the wait at the frame's first submit is what keeps the game from reading the GPU's results of the frame before
+// (the exposure meter's sums, in no capture's late pages) before their write-back lands. Leaving it out needs every such read
+// held instead (pages no-access until written back), and those pages are known only once the replay has recorded that
+// frame, often after the game read them: not done. Default 0, as before; 1 and 2 are kept to measure
+int late_helper_mode() {   // (0: the game's thread waits (default); 1: needless waits left out; 2: whole pages on the helper)
+    static const int m = getenv("RX_VK_LATE_HELPER") ? std::clamp(atoi(getenv("RX_VK_LATE_HELPER")), 0, 2) : 0;
+    return m;
+}
+/// (late_mask_mu) the learned blocks of every late page of a capture, or false when one is not learned yet
+bool late_masks_known(const uint32_t* pages, const std::vector<uint32_t>& late, std::vector<uint64_t>& out) {
+    out.clear();
+    for (uint32_t i : late) {
+        auto it = late_masks.find(pages[i]);
+        if (it == late_masks.end() || it->second.seen < kLateLearn) return false;
+        out.push_back(it->second.blocks);
+    }
+    return true;
+}
+/// (late_mask_mu) learns from one wait: the capture's copy of a page (before) against guest memory now (after)
+void late_mask_learn(uint32_t page, const uint8_t* before, const uint8_t* after) {
+    LateMask& m = late_masks[page];
+    for (int b = 0; b < 64; b++)
+        if (std::memcmp(before + b * 64, after + b * 64, 64)) m.blocks |= 1ull << b;
+    if (++m.seen == kLateLearn) st_late_learned++;
+}
+std::mutex late_mu;
+std::condition_variable late_cv, late_done_cv;
+std::deque<std::shared_ptr<LateJob>> late_q;
+bool late_started = false;
+std::atomic<int64_t> st_late_jobs{0}, st_late_waited{0};
+void late_helper_main() {
+    SetThreadDescription(GetCurrentThread(), L"mkw_vk late pages");
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);   // (it holds the replay up when it is late)
+    for (;;) {
+        std::shared_ptr<LateJob> j;
+        {
+            std::unique_lock lk(late_mu);
+            late_cv.wait(lk, [] { return !late_q.empty(); });
+            j = std::move(late_q.front());
+            late_q.pop_front();
+        }
+        vk_timeline_wait(j->value);
+        uint8_t* const base = (uint8_t*)host->guest_base();
+        alignas(64) static thread_local uint8_t now[4096];
+        for (size_t k = 0; k < j->pages.size(); k++) {
+            const auto [page, slot] = j->pages[k];
+            uint8_t* const dst = (uint8_t*)j->map + (uint64_t)slot * 4096;
+            if (j->masks.empty()) {   // (RX_VK_LATE_HELPER=2: the whole page, as the game's thread did)
+                guarded_copy(dst, base + ((uint64_t)page << kPageShift), 4096);
+                continue;
+            }
+            // (only the blocks the write-back writes: the rest stays as the CPU had it when the capture was made)
+            const uint64_t m = j->masks[k];
+            if (!m) continue;
+            guarded_copy(now, base + ((uint64_t)page << kPageShift), 4096);
+            for (int b = 0; b < 64; b++)
+                if (m >> b & 1) std::memcpy(dst + b * 64, now + b * 64, 64);
+        }
+        flush_mapped(j->alloc, j->nbytes);
+        {
+            std::lock_guard lk(late_mu);
+            j->done.store(true);
+        }
+        late_done_cv.notify_all();
+    }
+}
+bool late_helper_on() {
+    return late_helper_mode() != 0;
+}
+void late_push(std::shared_ptr<LateJob> j) {
+    std::lock_guard lk(late_mu);
+    if (!late_started) {
+        late_started = true;
+        std::thread(late_helper_main).detach();
+        logf("vk: captures' late pages copied again on a thread of their own, not the game's (%s; RX_VK_LATE_HELPER=0: as before)",
+             late_helper_mode() == 2 ? "whole pages" : "the blocks the write-back writes");
+    }
+    late_q.push_back(std::move(j));
+    late_cv.notify_one();
+}
+/// waits for a job up to ms (0: for good); whether it is done
+bool late_wait(const std::shared_ptr<LateJob>& j, uint32_t ms) {
+    if (j->done.load()) return true;
+    st_late_waited++;
+    std::unique_lock lk(late_mu);
+    if (!ms) {
+        late_done_cv.wait(lk, [&] { return j->done.load(); });
+        return true;
+    }
+    return late_done_cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return j->done.load(); });
+}
 void capture_late_fix(CapBuf& b) {
+    if (b.job) {   // (relink, 15/11: the helper's copy; 50 ms at most, as the replay's own wait was, then as it is)
+        if (late_wait(b.job, 50)) b.job.reset();
+    }
     if (!b.late_value) return;
     static int64_t st_n, st_late_pages, st_timeouts;
     static double st_ms;
@@ -1839,12 +1970,59 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     // later state of the game's memory. At the take by default again; RX_VK_CAPTURE_LATE_LAZY=1: at the first use)
     static const bool late_eager = getenv("RX_VK_CAPTURE_LATE_LAZY") == nullptr;
     const bool late_now = late_eager || tex_capture_on();   // (RX_VK_CAPTURE=1 reads the copies below, for its texture shadow)
-    if (c->late_value && c->map && late_now) {   // (the pages a submission still on the GPU writes back: see capture_make)
+    // (relink, 15/11) a kept capture whose late pages are not written back yet: their copy is the helper's job (late_helper_main)
+    std::shared_ptr<LateJob> late_job;
+    static thread_local std::vector<uint64_t> masks;
+    bool helper = c->late_value && c->map && late_now && late_helper_on() && !tex_capture_on() && !c->pages.empty() &&
+                  !c->copied.empty() && vk_timeline_completed() < c->late_value;
+    bool skip = false;   // (relink, 15/11: no late page of this capture is one the write-back changes: its copy is right as taken)
+    if (helper && late_helper_mode() == 1) {   // (every late page's blocks learned, or the game's thread waits and learns)
+        std::lock_guard ml(late_mask_mu);
+        helper = late_masks_known(c->pages.data(), c->late, masks);
+        // (and one capture in 32 waits anyway, to go on learning: a block the GPU writes now and then joins its page's mask)
+        static uint32_t late_caps;
+        if (helper && ++late_caps % 32 == 0) helper = false;
+        if (helper && late_helper_mode() == 1) {
+            skip = std::all_of(masks.begin(), masks.end(), [](uint64_t m) { return m == 0; });
+            helper = false;   // (mode 1: skip the wait when it is needless, wait as before when it is not)
+            static std::atomic<int64_t> st_skip{0}, st_need{0};
+            if (((skip ? st_skip : st_need)++ + (skip ? st_need : st_skip).load()) % 3600 == 0)
+                logf("vk: captures' late pages: %lld waits left out (no late page the write-back changes), %lld waits kept; %lld "
+                     "pages learned", (long long)st_skip.load(), (long long)st_need.load(), (long long)st_late_learned.load());
+        }
+    }
+    if (skip) {
+        // (nothing: the copy taken in capture_make is the page as the write-back will leave it)
+    } else if (helper) {
+        late_job = std::make_shared<LateJob>();
+        late_job->value = c->late_value, late_job->map = c->map, late_job->alloc = c->alloc, late_job->nbytes = c->nbytes;
+        late_job->pages.reserve(c->late.size());
+        for (uint32_t i : c->late) late_job->pages.push_back({c->pages[i], i});
+        if (late_helper_mode() == 1) late_job->masks = masks;
+        late_push(late_job);
+        if (++st_late_jobs % 3600 == 0)
+            logf("vk: captures' late pages: %lld copies on the helper thread, %lld of them waited for by the replay; %lld pages "
+                 "learned", (long long)st_late_jobs.load(), (long long)st_late_waited.load(), (long long)st_late_learned.load());
+    } else if (c->late_value && c->map && late_now) {   // (the pages a submission still on the GPU writes back: see capture_make)
         // (relink, RX_VK_LOG_CAPWAIT=1, diagnostic: who waits here, for whose work and how long, every 1200 such captures)
         static const bool log_wait = getenv("RX_VK_LOG_CAPWAIT") != nullptr;
         const bool pending = log_wait && vk_timeline_completed() < c->late_value;
         const auto w0 = std::chrono::steady_clock::now();
         vk_timeline_wait(c->late_value);
+        if (log_wait) {   // (each wait over 1 ms: how long, which pages; 300 lines at most)
+            const double wms1 = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+            static std::atomic<int> told{0};
+            if (wms1 > 1.0 && told++ < 300) {
+                char pg[160];
+                int k = 0;
+                for (size_t j = 0; j < c->late.size() && j < 4 && k < 120; j++)
+                    k += snprintf(pg + k, sizeof pg - k, " %#llx", (unsigned long long)c->pages[c->late[j]] << 12);
+                pg[k] = 0;
+                logf("vk: late wait %.2f ms on %s thread (value %llu, done %llu now), %zu late pages:%s", wms1,
+                     vk_on_present_thread() ? "the presenting" : "another", (unsigned long long)c->late_value,
+                     (unsigned long long)vk_timeline_completed(), c->late.size(), pg);
+            }
+        }
         if (log_wait) {
             static std::mutex wmu;
             static int64_t wn[4], takes;
@@ -1856,17 +2034,31 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                 wn[k]++;
                 wms[k] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
             }
-            if (++takes % 1200 == 0) {
-                logf("vk: capture waits (1200 captures with late pages): the presenting thread for its own work %lld (%.2f ms in "
+            static const int64_t every = getenv("RX_VK_LOG_LATE_EVERY") ? std::max(1, atoi(getenv("RX_VK_LOG_LATE_EVERY"))) : 1200;
+            if (++takes % every == 0) {
+                logf("vk: capture waits (%lld captures with late pages): the presenting thread for its own work %lld (%.2f ms in "
                      "all), for another thread's %lld (%.2f ms); other threads for their own work %lld (%.2f ms), for another "
-                     "thread's %lld (%.2f ms)", (long long)wn[0], wms[0], (long long)wn[1], wms[1], (long long)wn[2], wms[2],
+                     "thread's %lld (%.2f ms)", (long long)every, (long long)wn[0], wms[0], (long long)wn[1], wms[1], (long long)wn[2], wms[2],
                      (long long)wn[3], wms[3]);
                 for (int i = 0; i < 4; i++) wn[i] = 0, wms[i] = 0;
             }
         }
         uint8_t* const base = (uint8_t*)host->guest_base();
-        for (uint32_t i : c->late)
-            guarded_copy((uint8_t*)c->map + (uint64_t)i * 4096, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
+        const bool learn = late_helper_mode() == 1 && !tex_capture_on();
+        alignas(64) static thread_local uint8_t after[4096];
+        for (uint32_t i : c->late) {
+            uint8_t* const dst = (uint8_t*)c->map + (uint64_t)i * 4096;
+            if (!learn) {
+                guarded_copy(dst, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
+                continue;
+            }
+            guarded_copy(after, base + ((uint64_t)c->pages[i] << kPageShift), 4096);
+            {   // (relink, 15/11: what the write-back changed in it, for the helper: late_mask_learn)
+                std::lock_guard ml(late_mask_mu);
+                late_mask_learn(c->pages[i], dst, after);
+            }
+            std::memcpy(dst, after, 4096);
+        }
         flush_mapped(c->alloc, c->nbytes);
     }
     std::lock_guard lk(pools_mu);
@@ -1877,6 +2069,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         auto oldest = cap_bufs.begin();
         const bool over = cap_bufs.size() > kKeep || cap_bytes > kCapBytesMax;
         if (!over || std::max(oldest->second.value, oldest->second.last_use) > completed) break;
+        if (oldest->second.job && !oldest->second.job->done.load()) break;   // (the helper still writes into its buffer)
         cap_buf_retire(oldest);
     }
     uint32_t g = 0;
@@ -1933,6 +2126,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
     const auto tk1 = std::chrono::steady_clock::now();
     if (!c->copied.empty() && g && c->map) {   // (its buffer kept with the captures, for the mirror syncs)
         CapBuf b{value, c->buffer, c->alloc, c->bsize, c->map};
+        b.job = std::move(late_job);
         if (c->late_value && !late_now) {   // (relink: copied again at the capture's first use, capture_late_fix)
             b.late_value = c->late_value;
             b.late.reserve(c->late.size());
@@ -1945,6 +2139,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         for (size_t i = 0; i < c->copied.size(); i++) cap_entry_set(c->copied[i], CapEntry{g, c->slots[i]});
     }
     cap_view_bump();
+    if (late_job) late_wait(late_job, 0);   // (relink: a capture not kept after all: the helper is done with its buffer first)
     if (c->map) cap_buf_free(c->buffer, c->alloc, c->map, c->bsize), c->buffer = VK_NULL_HANDLE, c->map = nullptr;
     {
         std::lock_guard lk(cap_mu);
