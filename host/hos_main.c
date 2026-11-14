@@ -1246,7 +1246,7 @@ static int game_main(int argc, char **argv) {
     const char *protect_hearts = getenv("HOS_OOT_PROTECT_HEARTS");
     hos_oot_protect_hearts = protect_hearts && !strcmp(protect_hearts, "1");
     {   // (the whole process, not only the window's thread: the renderer asks the window's size from its own, and on a 4K screen at 150%
-        // Windows answered such a thread 2560 x 1440: the picture was that size, in the corner of the window. upstream issues 15, 18, 20)
+        // Windows answered such a thread 2560 x 1440: the picture was that size, in the corner of the window. Hookshot issues 15, 18, 20)
         typedef BOOL(WINAPI * SetAware)(void *);
         SetAware set = (SetAware)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetProcessDpiAwarenessContext");
         if (set && !getenv("HOS_DPI_UNAWARE")) set((void *)(intptr_t)-4);

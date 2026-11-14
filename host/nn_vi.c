@@ -114,7 +114,7 @@ static int fps_max(void) {
     int rx_option(int id, int otherwise);
     static int env = -1;
     if (env < 0) env = getenv("HOS_FPS_MAX") ? atoi(getenv("HOS_FPS_MAX")) : 0;
-    static int unlocked = -1;   /* (relink, on upstream: HOS_FPS_UNLOCKED=1 only; option 4 is the pads' row there) */
+    static int unlocked = -1;   /* (relink, on Longshot: HOS_FPS_UNLOCKED=1 only; option 4 is the pads' row there) */
     if (unlocked < 0) unlocked = getenv("HOS_FPS_UNLOCKED") && atoi(getenv("HOS_FPS_UNLOCKED")) != 0;
     (void)rx_option;
     if (!unlocked && env <= 60) return 60;

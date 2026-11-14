@@ -953,7 +953,7 @@ void refresh_pool_ranges_locked() {   // (cap_ranges_mu held)
     }
     pool_cap_ranges.swap(m);
 }
-/// (relink) 0: no capture; 1: all, as upstream (RX_VK_CAPTURE=1); 2, the default: the 2D pass's small buffers only
+/// (relink) 0: no capture; 1: all, as Longshot (RX_VK_CAPTURE=1); 2, the default: the 2D pass's small buffers only
 int capture_mode() {
     static const int m = [] {
         const char* e = getenv("RX_VK_CAPTURE");
@@ -1043,7 +1043,7 @@ void shadow_drop_range(uint64_t lo, uint64_t hi) {   // (shadow_mu held)
 /// (the spans unused for 1800 presents dropped with their shadow pages; the rest published for the capture)
 void publish_tex_spans(uint64_t frame) {
     std::lock_guard lk(shadow_mu);
-    // (relink, from upstream PR 2420) a span ages by the present: looked over once a present, not at each of its ~20 submissions,
+    // (relink, from Hookshot PR 2420) a span ages by the present: looked over once a present, not at each of its ~20 submissions,
     // which walked the ~300 spans every time. A span noted between two submissions of one present is still merged below
     static uint64_t swept = ~0ull;
     if (frame != swept) {
@@ -2835,7 +2835,7 @@ void mirror_sync(Pool& p) {
     // (relink) the write-back diff's shadow as the mirror's baseline, with the submit-time capture off: the pages just copied
     // into the mirror go into the shadow too, so after the GPU's work the two differ exactly where the GPU wrote, and only
     // those words are written back: never the mirror's older words over what the game wrote since (see shadow_written).
-    // RX_VK_SHADOW_BASELINE=0: off (upstream's scheme alone, which needs the capture)
+    // RX_VK_SHADOW_BASELINE=0: off (Longshot's scheme alone, which needs the capture)
     static const bool baseline = !getenv("RX_VK_SHADOW_BASELINE") || atoi(getenv("RX_VK_SHADOW_BASELINE")) != 0;
     if (p.shadow && baseline && !p.shadow_known.empty()) {
         GprofSpan gs(upload_command_buffer(), "msync copies (the synced pages, mirror -> shadow)");
@@ -3032,7 +3032,7 @@ void publish_cap_ranges() {
     cap_ranges_ver++;
 }
 // (EvilOOT, 11-07) the game's own memory pool holding a GPU address (below 1 TB, where the address is the guest's), not the
-// import that happens to cover it: imports are 16 MB chunks around what was bound, and since upstream 1c7c9c7 only around
+// import that happens to cover it: imports are 16 MB chunks around what was bound, and since Longshot 1c7c9c7 only around
 // the bound range, so the pool's end was a chunk's end: the pointer tables of the task and mesh stages (whole pools) and the
 // bare entries stopped there, the grass's programs read their records 12-18 MB further on as 0 and culled every blade
 static bool game_pool_of(uint64_t gpu, uint64_t& lo, uint64_t& hi) {   // (pools_mu held)
@@ -3564,7 +3564,7 @@ void imports_give_back() {   // (pools_mu held)
              (long long)st_imports_evicted, (unsigned long long)(st_import_bytes_evicted >> 20));
 }
 
-// ---- (relink, after upstream's pull request 2825) an import trimmed back to the game's live pools (mirror_trim.h) ----
+// ---- (relink, after Hookshot's pull request 2825) an import trimmed back to the game's live pools (mirror_trim.h) ----
 // Every 64 submissions, while VRAM is short: the mirrored import that has been mostly outside every game pool the longest
 // (mirror_trim::wait) is retired, and each of its live parts imported again on its own, with a mirror wanted at once: made in
 // this same submission's uploads (memory_begin_submission, right after), each takes what the GPU wrote from the old mirror
@@ -3574,7 +3574,7 @@ void imports_give_back() {   // (pools_mu held)
 // the deferred write-back (RX_VK_WB_LAZY) in its mirror alone. The old one goes once every part has its own mirror and the
 // GPU is done with it (trims_settle).
 // MEASURED HERE (13/11, hs2110, Hyrule Field then the Market at 75 % on an RTX 3060 Ti, two pairs): the same two trims
-// upstream reports (0x108c000000 224 -> 48 MB, 0x1178000000 160 -> 112 MB), and no gain: Market 53.2 / 53.5 without, 51.7
+// Longshot reports (0x108c000000 224 -> 48 MB, 0x1178000000 160 -> 112 MB), and no gain: Market 53.2 / 53.5 without, 51.7
 // and 45.9 with (the 45.9 is the run whose trims fell in the arrival). The Market alone, with nothing left from the Field,
 // runs the same (52.8 to 55.0, hs2111 / hs2112): what bounds it is the game's own threads, not VRAM. OPT-IN:
 // RX_VK_MIRROR_TRIM=1
@@ -3807,7 +3807,7 @@ bool mirror_make(Pool& pool) {
                     barrier_done = true;
                 }
                 const uint64_t a = std::max(r.lo, p->lo), b = std::min(r.hi, p->hi);
-                // (relink, upstream's pull request 1127) only the pages not stamped since its last sync: one the CPU wrote
+                // (relink, Hookshot's pull request 1127) only the pages not stamped since its last sync: one the CPU wrote
                 // after it has the game's newer data in the copy of guest memory above, and the old mirror's over it counted
                 // as synced, stale for good (mirror_inherit.h: OoT's light probes, written when an area comes in; after their
                 // pool was remade the fog read the area before's). As mirror_sync, a page a shader wrote through a bare entry

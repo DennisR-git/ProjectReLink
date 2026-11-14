@@ -437,7 +437,7 @@ public:
     }
     u32 SharedMemorySize() const override {
         // (what the program declares, from the control section: 48 KB for every one was past an RX 9070 XT's 32 KB, and its
-        // pipelines were invalid. klimovich008, upstream PR 91. RX_VK_SHARED_48K=1: as before)
+        // pipelines were invalid. klimovich008, Hookshot PR 91. RX_VK_SHARED_48K=1: as before)
         static const bool old = getenv("RX_VK_SHARED_48K") != nullptr;
         return old ? 48u << 10 : nvn.shared_memory;
     }
@@ -1495,7 +1495,7 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                      t->program.workgroup_size[0], t->program.workgroup_size[1], t->program.workgroup_size[2],
                      t->program.shared_memory_size, t->program.local_memory_size);
             // (relink) The movie upscaler's dozen networks, on a card that cannot run them as the console does: their software matrix multiplies
-            // took minutes each for AMD's compiler (the black screen with sound, upstream issue 26: JaredEzz's analysis) and the movies ran at 10 fps
+            // took minutes each for AMD's compiler (the black screen with sound, Hookshot issue 26: JaredEzz's analysis) and the movies ran at 10 fps
             // (issues 38, 43). Left out, the last pass becomes a linear upscale of the movie (upscale_stub in vk_draw.cpp): the same picture at 60
             // fps, a little softer. The gameplay TAAU network stays. RX_VK_NETWORK_KEEP=<key prefixes>, "all": every one runs
             if (t->program.info.uses_cooperative_matrix) {
@@ -1634,7 +1634,7 @@ std::array<u32, 3> mesh_registers_of(const Code* task, const Code& mesh) {
     // (the control section's topology in GL's numbers: 3 triangles; 1 points, not lines. OoT's four mesh programs with a 1 (the grass
     // drawn into the 2400 x 2400 shadow map around Link) write one index byte per primitive, the primitive count = their vertex
     // count, and a point size. Read as lines, each joined vertex 2i to 2i + 1 of its meshlet: a mesh of long thin dark stripes on
-    // the ground, the water and Link around him, on AMD; upstream issue 302)
+    // the ground, the water and Link around him, on AMD; Hookshot issue 302)
     const uint32_t topology = mesh.topology == 3 ? 4 : mesh.topology == 1 ? 0 : mesh.topology;
     const uint32_t lines = task ? (task->payload_bytes + 127) / 128 : 0;
     // (the larger of the two for both: the control section's pair is not always vertices and primitives in that order. The door's

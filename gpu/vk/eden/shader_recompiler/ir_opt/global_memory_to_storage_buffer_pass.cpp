@@ -1489,7 +1489,7 @@ void CollectStorageBuffers(IR::Block& block, IR::Inst& inst, StorageInfo& info, 
         LOG_DEBUG(Shader, "Storage buffer tracked without bias, index {} offset {}",
                     storage_buffer->index, storage_buffer->offset);
     }
-    {   // (sharkiix, from BernabeCR93 in upstream issue 667) A graphics stage's address tracked to another constant buffer than
+    {   // (sharkiix, from BernabeCR93 in Hookshot issue 667) A graphics stage's address tracked to another constant buffer than
         // c0 while part of it comes from memory: the far-foliage and mesh programs (95db514a35353e28, d905f52b7517c681,
         // 51183fe750d5d0c8...) took float constants for a buffer address ("storage buffer NOT bound (reads zeros)", c5+0x60),
         // read zeros and drew the plants without colour (white/sky-blue "mirror" ferns, glowing flowers). Left to the run-time

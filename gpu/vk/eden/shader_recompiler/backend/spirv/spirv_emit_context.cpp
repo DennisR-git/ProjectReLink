@@ -1357,7 +1357,7 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                                               : spv::FunctionControlMask::DontInline};
     const auto define_load{[&](DefPtr ssbo_member, Id element_pointer, Id type, u32 shift) {
         const Id function_type{TypeFunction(type, U64)};
-        // (upstream f78c1757, PR 1334, tracker 994: the floating trees; brought here 11/11 after the player saw pines in the
+        // (Longshot f78c1757, PR 1334, tracker 994: the floating trees; brought here 11/11 after the player saw pines in the
         // sky at Hyrule Castle, there in our builds since night8 at least) the task and mesh stages' load helpers are
         // inlined (EDEN_NX2_GM_INLINE=0: not; an EDEN_ switch, so in the program cache's stamp). Not inlined, NVIDIA's
         // compiler (RTX 3070, Windows) gave OoT's tree task 3cb76827 a wrong address for its third load:

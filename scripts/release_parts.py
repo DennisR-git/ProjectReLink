@@ -297,6 +297,7 @@ def package(a):
     shutil.copytree(a.publish, out)
     copy(a.setup, os.path.join(out, "ReLink-Setup.exe"))   # (the builder's Repair runs it)
     copy(os.path.join(ROOT, "LICENSE"), os.path.join(out, "LICENSE"))
+    copy(os.path.join(ROOT, "NOTICE.md"), os.path.join(out, "NOTICE.md"))   # (the copyright notices of Hookshot and Longshot)
     tools = os.path.join(out, "tools")
     for f in tracked("assets", "gpu", "host", "nx2", "scripts", "third_party"):
         copy(os.path.join(ROOT, f), os.path.join(tools, *f.split("/")))

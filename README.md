@@ -203,15 +203,6 @@ described in [docs/releasing.md](docs/releasing.md).
 2. `nx2/build.py` compiles that C together with `host/`, which plays the part of the console's system.
 3. `host/nvn_native.c` records the game's graphics calls, and `gpu/vk/` replays them on Vulkan.
 
-## License
-
-Project ReLink is free software under the [GNU General Public License, version 3 or later](LICENSE) (GPL-3.0-or-later). It
-reuses and modifies code published under the GPL by other projects (modified in November 2026); each part keeps its
-copyright notices and licenses in its files and folders.
-
-Project ReLink is an unofficial fan project, not affiliated with or endorsed by Nintendo. The Legend of Zelda and Ocarina
-of Time are trademarks of Nintendo.
-
 ---
 
 ## Français
@@ -267,8 +258,48 @@ nettoyage du pilote a quitté le fil qui dessine. Le même build avec et sans, t
 plus de 25 ms en tournant au lieu de 59,5 en moyenne, et 17 % de temps perdu en moins à l'arrivée sur la place du
 marché. Le premier démarrage après cette mise à jour prépare les shaders une nouvelle fois.
 
-### Licence
+---
 
-GPL-3.0-or-later ([LICENSE](LICENSE)). Le projet reprend et modifie du code publié sous GPL par d'autres projets
-(modifications de novembre 2026) ; chaque partie garde ses mentions de droits d'auteur et ses licences dans ses fichiers.
+## License
+
+Project ReLink is free software under the [GNU General Public License, version 3 or later](LICENSE) (GPL-3.0-or-later).
+
+Project ReLink is a modified version of [Longshot](https://git.magicbean.dev/MagicBeanDev/Longshot), which is itself a fork
+of [Hookshot](https://github.com/NotRexed/Hookshot) by NotRexed; both are released under the GPL-3.0-or-later. ReLink's
+changes to their code were made in November 2026.
+
+    Hookshot: Copyright (C) 2026 NotRexed and the Hookshot contributors
+    Longshot: Copyright (C) 2026 the Longshot contributors
+
+In ReLink's source comments, "Hookshot issue N" and "Hookshot pull request N" are Hookshot's tracker on GitHub, and
+"Longshot <commit>" is a commit in Longshot's history, which continues Hookshot's.
+
+Through them it also includes code from other projects under the GPL (Eden, suyu, TOTKPort's renderer) and parts under
+licenses that work with the GPL (Sirit, the Vulkan Memory Allocator, SDL, Opus, stb, zbic and the a64-kit tools); each
+keeps its copyright notices and license in its files and folders. The same notices are in [NOTICE.md](NOTICE.md), which
+every release ships.
+
+Project ReLink is an unofficial fan project, not affiliated with or endorsed by Nintendo. The Legend of Zelda and Ocarina
+of Time are trademarks of Nintendo.
+
+### Licence (français)
+
+Project ReLink est un logiciel libre sous [licence publique générale GNU, version 3 ou ultérieure](LICENSE)
+(GPL-3.0-or-later).
+
+Project ReLink est une version modifiée de [Longshot](https://git.magicbean.dev/MagicBeanDev/Longshot), lui-même un fork de
+[Hookshot](https://github.com/NotRexed/Hookshot) de NotRexed ; tous deux sont publiés sous GPL-3.0-or-later. Les
+modifications de ReLink à leur code datent de novembre 2026.
+
+    Hookshot: Copyright (C) 2026 NotRexed and the Hookshot contributors
+    Longshot: Copyright (C) 2026 the Longshot contributors
+
+Dans les commentaires du code de ReLink, « Hookshot issue N » et « Hookshot pull request N » renvoient au suivi de Hookshot
+sur GitHub, et « Longshot <commit> » à un commit de l'historique de Longshot, qui prolonge celui de Hookshot.
+
+Par eux, il contient aussi du code d'autres projets sous GPL (Eden, suyu, le moteur de rendu de TOTKPort) et des parties
+sous des licences compatibles avec la GPL (Sirit, Vulkan Memory Allocator, SDL, Opus, stb, zbic et les outils a64-kit) ;
+chacune garde ses mentions de droits d'auteur et sa licence dans ses fichiers et dossiers. Les mêmes mentions sont dans
+[NOTICE.md](NOTICE.md), livré avec chaque version.
+
 Projet de fans non officiel, sans lien avec Nintendo ; The Legend of Zelda et Ocarina of Time sont des marques de Nintendo.

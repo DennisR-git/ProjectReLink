@@ -888,7 +888,7 @@ bool depth_aspect(VkFormat f) {
     return is_depth_format(f) && f != VK_FORMAT_S8_UINT;
 }
 
-// (relink) A driver's compiler that faults on a shader (amdvlk64.dll on a mesh program, upstream issue 26) costs that one draw, not the game
+// (relink) A driver's compiler that faults on a shader (amdvlk64.dll on a mesh program, Hookshot issue 26) costs that one draw, not the game
 #ifdef _WIN32
 __declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     __try {
@@ -1921,7 +1921,7 @@ bool handle_is_storage_pointer(const Shader::Info& info, const Shader::TextureDe
     return false;
 }
 
-/// (relink, after Fritchii 8193f926f / Lichii #351 via upstream 3858629) how far a read-only pointer window reaches: its pool's
+/// (relink, after Fritchii 8193f926f / Lichii #351 via Longshot 3858629) how far a read-only pointer window reaches: its pool's
 /// end, as far as a storage buffer does (1 GB at most). OoT's froxel fog finds its light probes up to ~130 MB past the pointer:
 /// past a 64 MB window they read 0 and the fog took an overbright constant from them (white haze, zones too bright or too dark).
 /// Written windows keep their small caps. RX_VK_BARE_READ_MB=<MB> caps it (64: as before)
@@ -3306,7 +3306,7 @@ Targets targets(NvnState& s) {
         const uint32_t level = image_level(tex, view_level(v));
         at.color_level[i] = level, at.color_layer[i] = v ? view_layer(v) : 0;
         uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
-        // (upstream 9928d74d, PR 1338: a raw view of a compressed target is one texel a block: its extent in blocks. The texels'
+        // (Longshot 9928d74d, PR 1338: a raw view of a compressed target is one texel a block: its extent in blocks. The texels'
         // 64 x 64 over the 16 x 16 view of OoT's noise volumes put the render area past the attachment)
         const auto bc = [](VkFormat x) { return x >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && x <= VK_FORMAT_BC7_SRGB_BLOCK; };
         if (bc(tex->format) && !bc(f)) w = (w + 3) / 4, h = (h + 3) / 4;
@@ -5028,7 +5028,7 @@ bool mesh_indirect_convert(VkCommandBuffer cmd, const DrawArgs& d) {
     static const bool raw = getenv("RX_VK_MESH_IND_RAW") && atoi(getenv("RX_VK_MESH_IND_RAW")) != 0;
     static const uint32_t word = getenv("RX_VK_MESH_IND_COUNT_WORD") ? (uint32_t)atoi(getenv("RX_VK_MESH_IND_COUNT_WORD")) & 3 : 0;
     // (amd-fix: the rewrite with the firsts in the draw does it, RX_VK_MESH_ARGS; this one drew every draw from its first 0)
-    static const bool rewrite = getenv("RX_VK_MESH_ARGS") && atoi(getenv("RX_VK_MESH_ARGS")) != 0;   // (sharkiix version: off, as upstream)
+    static const bool rewrite = getenv("RX_VK_MESH_ARGS") && atoi(getenv("RX_VK_MESH_ARGS")) != 0;   // (sharkiix version: off, as Longshot)
     if (raw || rewrite || !d.mesh || !d.indirect) return false;
     PROF_EXACT();   // (a pass ended and three barriers: not one of the cheap per-draw steps PROF_DRAW samples)
     const uint32_t n = (uint32_t)std::clamp(d.max, 1, 4096);
@@ -5626,7 +5626,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     if (skip_live(cp->key)) return;   // (EvilOOT, RX_VK_SKIP_FILE)
     {   // (relink, RX_VK_SKIP_PROG=<key prefix,...>: draws too, their native code keys logged once; =-: none)
-        // (upstream 9928d74d, PR 1338: OoT's 53509044401d78d2, by default only while its targets have no view: 128 draws, once
+        // (Longshot 9928d74d, PR 1338: OoT's 53509044401d78d2, by default only while its targets have no view: 128 draws, once
         // while an area loads, that render the slices of two 64^3 BC4 noise volumes through raw RGBA16UI views. Those views were
         // not made (no attachment usage) and the pass ran over no target at the texels' 64 x 64: on about half the first starts
         // the device was lost (7 of 14), and it was left out always. Left out, the volumes stayed zero and the foliage's LOD
@@ -5863,7 +5863,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // (RX_VK_MESH_ARGS=1: rewritten {count, 1, 1, first}. Off: it did not bring the canopies back, and it ends the pass at each draw)
     // (amd-fix, 11-07: on by default with the firsts (RX_VK_MESH_FIRST), the canopies back; RX_VK_MESH_ARGS=0: off. A single indirect
     // draw has no stride of its own: its entry is NVN's 16 bytes, taken as 8 the first was never copied)
-    static const bool mesh_rewrite = getenv("RX_VK_MESH_ARGS") && atoi(getenv("RX_VK_MESH_ARGS")) != 0;   // (sharkiix version: off, as upstream)
+    static const bool mesh_rewrite = getenv("RX_VK_MESH_ARGS") && atoi(getenv("RX_VK_MESH_ARGS")) != 0;   // (sharkiix version: off, as Longshot)
     if (mesh_rewrite && d.mesh && d.indirect) {   // (out of the pass: a copy cannot be made in one)
         const uint32_t n = (uint32_t)std::clamp(d.max, 1, (int)kMeshArgs), stride = d.stride ? (uint32_t)d.stride : 16u;
         BufferRef src = gpu_buffer_bind(d.indirect, (uint64_t)n * stride, false);
@@ -5928,7 +5928,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_SCOPE(FT_HAZARD);
         begin_pass(cmd, at);
     }
-    // (upstream cd906265) the draw's occlusion query (vk_replay.cpp, RX_VK_OCC_QUERIES): begun in its pass and ended as draw()
+    // (Longshot cd906265) the draw's occlusion query (vk_replay.cpp, RX_VK_OCC_QUERIES): begun in its pass and ended as draw()
     // returns, before each_guard can end the pass. A draw that returns before this point leaves its query unused: its report
     // stays "visible"
     struct OccGuard {
@@ -6541,7 +6541,7 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
 /// RX_VK_TAAU_KEYS=<program key prefixes,...> (default fd029a317a9a4b94; "-": none, the network runs)
 bool taau_key(uint64_t key) {
     // (the real network where the card runs it as the console does; on the software multiplies it cost most of a frame on AMD's cards, and a
-    // locked 60 with this in its place: upstream issue 52)
+    // locked 60 with this in its place: Hookshot issue 52)
     static const char* keys = getenv("RX_VK_TAAU_KEYS") ? getenv("RX_VK_TAAU_KEYS")
                               : Shader::Backend::SPIRV::mma_software || getenv("RX_VK_NO_F16")
                                     ? "fd029a317a9a4b94" : "-";   // (RX_VK_NO_F16: vk_shader.cpp leaves the network out)
