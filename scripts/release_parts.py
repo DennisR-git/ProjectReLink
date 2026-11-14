@@ -280,6 +280,31 @@ def sdl_libraries(dest):
     return n
 
 
+# (relink, 0.7) AMD FidelityFX Super Resolution 3.1 (gpu/vk/vk_dlss.cpp's FSR choice): AMD's prebuilt, signed Vulkan library from
+# the FidelityFX SDK v1.1.4 (MIT), with its license, beside the game (nx2/build.py copies them from third_party/ffx). Taken here
+# from AMD's own repository by size and SHA-256, as the SDL files above: (file, SHA-256, size, address)
+FFX = (
+    ("amd_fidelityfx_vk.dll", "a1624cc4238fef046f30c4d80ce3f47be63fc5f5373f49e3ee9edb9960f54c78", 9332432,
+     "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v1.1.4/PrebuiltSignedDLL/amd_fidelityfx_vk.dll"),
+    ("LICENSE-FidelityFX.txt", "82cf74fc23885107c7f69249ac3f1dac55898ff68320eb2c753984cae6b2d78a", 1115,
+     "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v1.1.4/LICENSE.txt"),
+)
+
+
+def ffx_library(dest):
+    """AMD's FSR library and its license into dest (tools/third_party/ffx) where they are not there already; how many were added"""
+    n = 0
+    for name, sha, size, url in FFX:
+        out = os.path.join(dest, name)
+        if os.path.isfile(out) and os.path.getsize(out) == size and sha256(out) == sha:
+            continue
+        os.makedirs(dest, exist_ok=True)
+        shutil.copyfile(fetch_part(sha, size, url), out)
+        print("%s (%d KB) from AMD's FidelityFX SDK v1.1.4" % (name, size >> 10))
+        n += 1
+    return n
+
+
 def tracked(*paths):
     r = subprocess.run(["git", "ls-files", "-z", "--"] + list(paths), cwd=ROOT, check=True, stdout=subprocess.PIPE)
     return [f for f in r.stdout.decode("utf-8").split("\0") if f]
@@ -313,6 +338,7 @@ def package(a):
     else:
         print("no setup list: the package has no play profile and no prebuilt third_party files")
     sdl_libraries(os.path.join(tools, "third_party", "sdl2"))
+    ffx_library(os.path.join(tools, "third_party", "ffx"))
     print("package folder: %s" % out)
     return 0
 

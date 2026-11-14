@@ -996,6 +996,14 @@ def main():
         if os.path.exists(sdl3) and (not os.path.exists(sdl3_dst) or os.path.getsize(sdl3_dst) != os.path.getsize(sdl3)):
             import shutil
             shutil.copyfile(sdl3, sdl3_dst)
+        # (relink, 0.7) AMD's FSR library and its license beside it: gpu/vk's FSR choice loads it from there
+        # (scripts/release_parts.py takes them from AMD's FidelityFX SDK into third_party/ffx)
+        for name in ("amd_fidelityfx_vk.dll", "LICENSE-FidelityFX.txt"):
+            src = os.path.join(kit.HERE, "..", "third_party", "ffx", name)
+            dst = os.path.join(out, name)
+            if os.path.exists(src) and (not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src)):
+                import shutil
+                shutil.copyfile(src, dst)
     if vk_prebuilt and a.standalone and not a.only:
         import shutil
         shutil.copyfile(vk_prebuilt, os.path.join(out, VK_LIB))

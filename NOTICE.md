@@ -14,7 +14,7 @@ In ReLink's source comments, "Hookshot issue N" and "Hookshot pull request N" ar
 "Longshot <commit>" is a commit in Longshot's history, which continues Hookshot's.
 
 Through them it also includes code from other projects under the GPL (Eden, suyu, TOTKPort's renderer) and parts under
-licenses that work with the GPL (Sirit, the Vulkan Memory Allocator, SDL, Opus, stb, zbic and the a64-kit tools); each
+licenses that work with the GPL (Sirit, the Vulkan Memory Allocator, SDL, Opus, stb, zbic, the a64-kit tools, and AMD FidelityFX's FSR library shipped with its license); each
 keeps its copyright notices and license in its files and folders.
 
 Project ReLink is an unofficial fan project, not affiliated with or endorsed by Nintendo. The Legend of Zelda and Ocarina

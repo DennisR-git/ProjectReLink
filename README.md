@@ -275,7 +275,7 @@ In ReLink's source comments, "Hookshot issue N" and "Hookshot pull request N" ar
 "Longshot <commit>" is a commit in Longshot's history, which continues Hookshot's.
 
 Through them it also includes code from other projects under the GPL (Eden, suyu, TOTKPort's renderer) and parts under
-licenses that work with the GPL (Sirit, the Vulkan Memory Allocator, SDL, Opus, stb, zbic and the a64-kit tools); each
+licenses that work with the GPL (Sirit, the Vulkan Memory Allocator, SDL, Opus, stb, zbic, the a64-kit tools, and AMD FidelityFX's FSR library shipped with its license); each
 keeps its copyright notices and license in its files and folders. The same notices are in [NOTICE.md](NOTICE.md), which
 every release ships.
 
@@ -298,7 +298,7 @@ Dans les commentaires du code de ReLink, « Hookshot issue N » et « Hookshot p
 sur GitHub, et « Longshot <commit> » à un commit de l'historique de Longshot, qui prolonge celui de Hookshot.
 
 Par eux, il contient aussi du code d'autres projets sous GPL (Eden, suyu, le moteur de rendu de TOTKPort) et des parties
-sous des licences compatibles avec la GPL (Sirit, Vulkan Memory Allocator, SDL, Opus, stb, zbic et les outils a64-kit) ;
+sous des licences compatibles avec la GPL (Sirit, Vulkan Memory Allocator, SDL, Opus, stb, zbic, les outils a64-kit, et la bibliothèque FSR d'AMD FidelityFX livrée avec sa licence) ;
 chacune garde ses mentions de droits d'auteur et sa licence dans ses fichiers et dossiers. Les mêmes mentions sont dans
 [NOTICE.md](NOTICE.md), livré avec chaque version.
 
