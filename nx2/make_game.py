@@ -1115,8 +1115,9 @@ def main(a=None):
     if os.path.exists(os.path.join(work, "relink_pieces.prof")) and profile_readable(os.path.join(work, "relink_pieces.prof")):
         env["RX_PGO"] = os.path.join(work, "relink_pieces.prof")
 
-    if ngx_built():   # (NVIDIA DLSS's camera jitter: only in a build with it, nx2/oot_jitter.py)
-        env["OOT_DLSS_JITTER"] = "1"
+    # (relink) the camera jitter DLSS and AMD FSR need (nx2/oot_jitter.py), in every build: FSR needs no SDK. It does
+    # nothing unless one of them draws (the renderer gives the host no size to jitter by otherwise)
+    env["OOT_DLSS_JITTER"] = "1"
     say("stage", "lift", "Translating the game to PC code")
     # (the same game, tools and settings as the lift before: its C is what this lift would write, and nothing recompiles from it. A
     # rebuild after a change to host/ alone skips the minutes of the lift)
@@ -1243,9 +1244,13 @@ def main(a=None):
     game_dir = os.path.join(out, "bin") if launcher else out
     os.makedirs(game_dir, exist_ok=True)
     ffmpeg_dlls = [] if LINUX else sorted(f for f in os.listdir(built) if f.endswith(".dll") and f.startswith(("av", "sw")))
-    for n in BESIDE + ffmpeg_dlls:
+    # (relink, 0.7) Microsoft's Visual C++ runtime for AMD's FSR library, in vcrt beside it: taken only where the PC has none
+    # (gpu/vk/vk_fsr.cpp), so it is never in the way of the runtime Windows has
+    vcrt = [] if LINUX else ["vcrt/" + f for f in ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")]
+    for n in BESIDE + ffmpeg_dlls + vcrt:
         src = os.path.join(built, n)
         if os.path.exists(src):
+            os.makedirs(os.path.dirname(os.path.join(game_dir, n)), exist_ok=True)
             staged.append((src, os.path.join(game_dir, n)))
     staged.append((os.path.join(work, "sa", "image", "image.bin"), os.path.join(out, "image.bin")))
     if launcher:

@@ -30,10 +30,12 @@ GitHub's API is read with $GH_TOKEN when it is set. Downloads are retried (GitHu
 stderr: what a command prints on stdout is its answer.
 """
 import argparse
+import glob
 import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -305,6 +307,41 @@ def ffx_library(dest):
     return n
 
 
+def vc_runtime(dest):
+    """Microsoft's Visual C++ 2015-2022 runtime (msvcp140, vcruntime140, vcruntime140_1), which AMD's FSR library imports, into
+    dest (tools/third_party/ffx/vcrt) from the newest Visual Studio's Redist folder on this machine (the CI runner has one):
+    the files Microsoft provides for an application to carry beside itself. The game takes them only on a PC without the
+    runtime (gpu/vk/vk_fsr.cpp). How many were added; none, said, where no Visual Studio is found"""
+    if os.name != "nt":
+        return 0
+    names = ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+    vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    roots = []
+    if os.path.isfile(vswhere):
+        r = subprocess.run([vswhere, "-all", "-products", "*", "-property", "installationPath"], capture_output=True, text=True)
+        roots = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    found = []
+    for root in roots:
+        for crt in glob.glob(os.path.join(root, "VC", "Redist", "MSVC", "*", "x64", "Microsoft.VC14*.CRT")):
+            if all(os.path.isfile(os.path.join(crt, n)) for n in names):
+                ver = tuple(int(p) for p in re.findall(r"\d+", os.path.basename(os.path.dirname(os.path.dirname(crt)))))
+                found.append((ver, crt))
+    if not found:
+        print("no Visual Studio Redist folder here: the package has no Visual C++ runtime for AMD's FSR library")
+        return 0
+    crt = max(found)[1]
+    os.makedirs(dest, exist_ok=True)
+    n = 0
+    for name in names:
+        out = os.path.join(dest, name)
+        if os.path.isfile(out) and os.path.getsize(out) == os.path.getsize(os.path.join(crt, name)):
+            continue
+        shutil.copyfile(os.path.join(crt, name), out)
+        n += 1
+    print("Visual C++ runtime (%d files) from %s" % (n, crt))
+    return n
+
+
 def tracked(*paths):
     r = subprocess.run(["git", "ls-files", "-z", "--"] + list(paths), cwd=ROOT, check=True, stdout=subprocess.PIPE)
     return [f for f in r.stdout.decode("utf-8").split("\0") if f]
@@ -339,6 +376,7 @@ def package(a):
         print("no setup list: the package has no play profile and no prebuilt third_party files")
     sdl_libraries(os.path.join(tools, "third_party", "sdl2"))
     ffx_library(os.path.join(tools, "third_party", "ffx"))
+    vc_runtime(os.path.join(tools, "third_party", "ffx", "vcrt"))
     print("package folder: %s" % out)
     return 0
 

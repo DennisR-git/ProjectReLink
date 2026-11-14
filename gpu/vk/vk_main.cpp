@@ -21,6 +21,7 @@
 #include "gpu_choice.h"
 #include "vk_menu.h"
 #include "vk_dlss.h"
+#include "vk_fsr.h"
 #include "vk_reflex.h"
 #include "vk_progress.h"
 
@@ -249,6 +250,7 @@ bool create_device() {
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
     dlss_device_extensions(want, exts);   // (relink: NVIDIA DLSS's, vk_dlss.cpp)
+    fsr_device_extensions(want, exts);    // (relink: what AMD FSR's runtime takes by name, vk_fsr.cpp)
     reflex_device_extensions(want, exts);   // (relink: NVIDIA Reflex's, vk_reflex.cpp)
     optional(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME, dev.float_atomic_add);   // (relink: native float adds, emit_spirv_atomic.cpp)
     // (relink) EDEN_NX2_MAXRECONV=1: maximal reconvergence for programs with subgroup operations (emit_spirv.cpp). It needs
@@ -454,6 +456,7 @@ bool create_device() {
     if (dev.buffer_marker) buffer_markers_init();
     coopmat_init();
     reflex_device_created();
+    fsr_start();   // (relink: whether AMD FSR runs here, in the log at once, vk_fsr.cpp)
     if (dev.push_descriptor) {
         VkPhysicalDevicePushDescriptorPropertiesKHR pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
