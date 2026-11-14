@@ -383,7 +383,7 @@ bool create_device() {
     pv.transformFeedbackPreservesProvokingVertex = VK_FALSE;
     dev.provoking_vertex = dev.provoking_vertex && pv.provokingVertexLast;
     dev.conditional_rendering = dev.conditional_rendering && cond.conditionalRendering;
-    // (Longshot cd906265) the occlusion queries' real counts (vk_replay.cpp, RX_VK_OCC_QUERIES): a sample count, not only "any", and
+    // the occlusion queries' real counts (vk_replay.cpp, RX_VK_OCC_QUERIES): a sample count, not only "any", and
     // their reset from the CPU once read (both on when the device has them: the queried chain is what it is created with)
     dev.occlusion_precise = f.features.occlusionQueryPrecise == VK_TRUE;
     dev.host_query_reset = f12.hostQueryReset == VK_TRUE;
@@ -406,7 +406,7 @@ bool create_device() {
     dev.vk13 = f13;
     {   // (relink, after TotK Recomp's vk_caps.c) NVN's programs are written for 32 lanes: the translator is told 32, and the lane
         // shuffles of OoT's networks and the lane masks of its mesh programs depend on it. NVIDIA's GPUs have no other size; AMD's
-        // default to 64 where they like, and the networks' output came out as coloured noise (Hookshot issues 10 and 14)
+        // default to 64 where they like, and the networks' output came out as coloured noise
         VkPhysicalDeviceSubgroupSizeControlProperties sc{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
         VkPhysicalDeviceSubgroupProperties sg{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
         sg.pNext = &sc;

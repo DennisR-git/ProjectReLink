@@ -394,7 +394,7 @@ void gpu_time_end(Recording& r) {
     ts_pending[r.slot] = true;
 }
 
-// (Longshot cd906265) Real occlusion counts (on unless RX_VK_OCC_QUERIES=0; from Hookshot's draft by jordanella). Ocarina of Time
+// Real occlusion counts (on unless RX_VK_OCC_QUERIES=0; from jordanella's draft). Ocarina of Time
 // reads its z-prepass samples-passed reports back on the CPU a frame or two later and leaves out of its draw lists the
 // objects whose count was 0; with every report reading 4096 nothing was ever left out. Each draw from
 // a samples-passed reset to its report gets an occlusion query, numbered in the replay state (NvnState::occ_next), so a
@@ -402,7 +402,7 @@ void gpu_time_end(Recording& r) {
 // once its queries have all ended on the GPU, the replay thread writes their sum over it, unless the game has reported into
 // that slot again since (its timestamp word moved on). A report whose draws did not all run, or that took more than
 // kOccRun, stays "visible": a late or unknown count costs culling, never a missing object.
-// (relink) three things Longshot's code below asks of its own base, as this one has them: the count of recordings begun so
+// (relink) three things the code below asks of its own base, as this one has them: the count of recordings begun so
 // far (the reports' lag, for the log), a switch that is set and not "0", and the replay's own write of guest memory by GPU
 // address (here the host's write: the report's words are already kept out of the mirrors' write-backs, memory_cpu_owned)
 uint64_t rec_part_next = 0;
@@ -467,7 +467,7 @@ bool occ_room(const NvnState& s) {
 /// The reports whose queries are done, written into the game's slots (the replay thread, as a recording begins). The
 /// queries of every waiting report are asked for at once, as one run of the ring (two calls where it wraps), without a wait;
 /// the reports from the oldest on whose queries have all ended (or whose submission the GPU has finished: a query never begun
-/// is unknown then) are written, and their queries reset with one call. (Hookshot's draft asked and reset each report's
+/// is unknown then) are written, and their queries reset with one call. (the first draft asked and reset each report's
 /// queries on their own, ~1,500 of each a frame in the Market; waiting for a whole submission instead wrote the counts 3-13
 /// recordings late, about two frames, often after the game had read the slot.)
 void occ_collect() {
@@ -1072,7 +1072,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         }
         case NOP_REPORT_COUNTER: {
             const auto c = payload<nvn_p_counter>(a, avail);
-            // (Longshot cd906265) the run of occlusion queries this report counts (RX_VK_OCC_QUERIES), closed in every mode: a worker
+            // the run of occlusion queries this report counts (RX_VK_OCC_QUERIES), closed in every mode: a worker
             // numbers its queries as the dry pass did
             const bool occ_run = (uint32_t)c.type == NVN_COUNTER_TYPE_SAMPLES_PASSED && s.occ_on;
             const uint64_t occ_first = s.occ_first, occ_n = occ_run ? s.occ_next - s.occ_first : 0;
@@ -1114,7 +1114,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             if (flag_written) host->gpu_write(c.addr + 8, rec + 1, 8);
             else host->gpu_write(c.addr, rec, sizeof rec);
             memory_cpu_owned(host->gpu_guest(c.addr), sizeof rec);   // (vk_memory.cpp: kept out of the mirrors' write-backs)
-            // (Longshot cd906265) the GPU's count over it once its queries are done (occ_collect); a run that overflowed is only freed
+            // the GPU's count over it once its queries are done (occ_collect); a run that overflowed is only freed
             if (occ_n)
                 occ_pending.push_back({occ_counted && !flag_written ? c.addr : 0, rec[1], occ_first, occ_n, occ_value, rec_part_next, occ_color});
             break;
@@ -1123,7 +1123,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             const auto c = payload<nvn_p_counter>(a, avail);
             if (c.type == NVN_COUNTER_TYPE_SAMPLES_PASSED) {
                 s.samples_passed = 0;
-                // (Longshot cd906265) a run of occlusion queries begins (RX_VK_OCC_QUERIES); one still open had no report: its queries are freed
+                // a run of occlusion queries begins (RX_VK_OCC_QUERIES); one still open had no report: its queries are freed
                 if (s.occ_on && s.occ_next > s.occ_first && !worker)
                     occ_pending.push_back({0, 0, s.occ_first, s.occ_next - s.occ_first, occ_value, rec_part_next});
                 s.occ_on = s.occ_next < s.occ_limit;
@@ -1505,7 +1505,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         case NOP_DRAW: {
             const auto d = payload<nvn_p_draw>(a, avail);
             DrawArgs da;
-            occ_take(s, da, dry);   // (Longshot cd906265: RX_VK_OCC_QUERIES, numbered in the dry pass too)
+            occ_take(s, da, dry);   // (RX_VK_OCC_QUERIES, numbered in the dry pass too)
             if (s.render_enabled && !s.raster_discard && !dry) {
                 da.prim = d.prim, da.first = d.first, da.count = d.count;
                 da.base_instance = d.base_instance, da.instances = d.instances;
@@ -1517,7 +1517,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         case NOP_DRAW_IDX: {
             const auto d = payload<nvn_p_draw_idx>(a, avail);
             DrawArgs da;
-            occ_take(s, da, dry);   // (Longshot cd906265: RX_VK_OCC_QUERIES, numbered in the dry pass too)
+            occ_take(s, da, dry);   // (RX_VK_OCC_QUERIES, numbered in the dry pass too)
             if (s.render_enabled && !s.raster_discard && !dry) {
                 da.prim = d.prim, da.indexed = true, da.itype = d.itype, da.count = d.count;
                 da.base_vertex = d.base_vertex, da.base_instance = d.base_instance, da.instances = d.instances;
@@ -1530,7 +1530,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         case NOP_DRAW_INDIRECT: {
             const auto d = payload<nvn_p_draw_indirect>(a, avail);
             DrawArgs da;
-            occ_take(s, da, dry);   // (Longshot cd906265: RX_VK_OCC_QUERIES, numbered in the dry pass too)
+            occ_take(s, da, dry);   // (RX_VK_OCC_QUERIES, numbered in the dry pass too)
             if (s.render_enabled && !s.raster_discard && !dry) {
                 da.prim = d.prim, da.indexed = d.indexed != 0, da.itype = d.itype;
                 da.indirect = d.indirect, da.count_addr = d.count_addr, da.max = d.max, da.stride = d.stride;
@@ -1547,7 +1547,7 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 logf("vk: mesh draw kind %d: %d %d %d, indirect %#llx count %#llx max %d stride %d", d.kind, d.x, d.y,
                      d.z, (unsigned long long)d.indirect, (unsigned long long)d.count_addr, d.max, d.stride);
             DrawArgs da;
-            occ_take(s, da, dry);   // (Longshot cd906265: RX_VK_OCC_QUERIES, numbered in the dry pass too)
+            occ_take(s, da, dry);   // (RX_VK_OCC_QUERIES, numbered in the dry pass too)
             if (s.render_enabled && !s.raster_discard && !dry) {
                 da.mesh = true;
                 // (DrawMeshTasks(first, count): the count of task workgroups, as Eden draws NVN2's mesh draws; a
@@ -1773,7 +1773,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     const int threads = par_threads();
     NvnState& state = *cur_state;
     suspend_at = nullptr;
-    // (Longshot cd906265) the occlusion queries this command buffer may take (RX_VK_OCC_QUERIES): set before its dry pass's start
+    // the occlusion queries this command buffer may take (RX_VK_OCC_QUERIES): set before its dry pass's start
     // state is copied, so the workers number theirs within the same limit
     state.occ_limit = occ_room(state) ? state.occ_next + kOccBuffer : 0;
     const uint64_t frame = texture_frame_no();
@@ -3357,9 +3357,9 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         }
         if (interpolated) framegen_queue(value);
         else menu_note_frame(true);   // (the FPS counter's, as frame generation's thread counts what it shows)
-        {   // (RX_VK_WAIT_GPU=<frames>: the replay no further ahead of the GPU than that; =0 (Longshot 768d930, 5d6e6ff): each
+        {   // (RX_VK_WAIT_GPU=<frames>: the replay no further ahead of the GPU than that; =0: each
             // present waits for its own frame's GPU work, against one-frame flashes from the CPU rewriting data a pass has yet to
-            // read. Not by default here (relink): measured first, it cost up to 10 fps Longshot on Windows)
+            // read. Not by default here (relink): measured first, it cost up to 10 fps on Windows)
             static const int ahead = getenv("RX_VK_WAIT_GPU") ? atoi(getenv("RX_VK_WAIT_GPU")) : -1;
             if (ahead == 0) wait_value(value);
             static uint64_t values[8];

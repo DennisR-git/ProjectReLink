@@ -800,12 +800,9 @@ def main():
         # keeps them)
         stamp = hashlib.sha1()
         translator = [os.path.join(d, f) for top in ("eden", "sirit", "compat") for d, _, fs in os.walk(os.path.join(vk, top)) for f in fs]
-        # (the comments' project names, Hookshot and Longshot, count as the word "upstream" they replaced on 2026-11-14: naming the
-        # projects in those files did not change what translates shaders, and players keep their prepared shaders)
         for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_bank.cpp", "vk_state.h", "vk_api.h")]:
             with open(f, "rb") as src:
-                text = src.read().replace(bytes((13, 10)), bytes((10,))).replace(b"Hookshot", b"upstream").replace(b"Longshot", b"upstream")
-                stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + text)
+                stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
         shader_stamp = "-DRELINK_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16]
         vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (relink: the replay is the frame's limit now)
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)

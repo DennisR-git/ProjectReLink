@@ -332,7 +332,7 @@ const char* hn_mic(int v, int variant) {
     return missing ? "Not plugged in: Default stands in until it is back." : "This microphone, by its name. A change applies at once.";
 }
 const char* tx_rumble(int v) { return v ? tx_percent(v) : "Off"; }
-// (relink, Longshot 48562589) Audio output: the speakers the game mixes for, read once at its start (host/nn_audio.c
+// (relink) Audio output: the speakers the game mixes for, read once at its start (host/nn_audio.c
 // au_menu_output). A player with no sound, or with sound from the wrong speakers, can say Stereo here (issue 1)
 const char* tx_audio_output(int v) {
     static const char* t[] = {"Auto", "Stereo", "5.1"};
