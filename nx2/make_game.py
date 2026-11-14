@@ -1010,6 +1010,18 @@ def main(a=None):
     if os.name == "nt":   # (the PC kept awake while this runs: a build is 45 minutes, and sleep stopped it)
         import ctypes
         ctypes.WinDLL("kernel32").SetThreadExecutionState(0x80000000 | 0x00000001)
+        # (relink, issue 6) normal priority for this process and the one-process steps it runs (reading the copy, the lift): started
+        # below normal by the launcher, they ran on an Intel CPU's efficiency cores for over an hour with the performance cores idle.
+        # The compilers are put below normal one by one (build.py below_normal): they fill every core, and the PC stays usable
+        k = ctypes.WinDLL("kernel32")
+        k.GetCurrentProcess.restype = ctypes.c_void_p
+        k.GetPriorityClass.argtypes = [ctypes.c_void_p]
+        k.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        try:
+            if k.GetPriorityClass(k.GetCurrentProcess()) in (0x40, 0x4000):   # (IDLE, BELOW_NORMAL)
+                k.SetPriorityClass(k.GetCurrentProcess(), 0x20)   # (NORMAL_PRIORITY_CLASS)
+        except (OSError, ValueError, TypeError):
+            pass
     if a.check:
         return check(a, a.work)
     if a.update:

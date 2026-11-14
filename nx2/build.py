@@ -124,6 +124,21 @@ def no_throttle(handle=None):
     except (OSError, ValueError, TypeError):
         pass
 
+
+def below_normal(handle):
+    """(relink, issue 6) A compiler process at below normal priority: the compile fills every core, and the PC stays usable.
+    make_game.py now runs at normal priority itself (its one-process steps went to an Intel CPU's efficiency cores below
+    normal), so the compilers no longer inherit the launcher's below normal and are given it here"""
+    if os.name != "nt" or not handle:
+        return
+    import ctypes
+    k = ctypes.WinDLL("kernel32")
+    k.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    try:
+        k.SetPriorityClass(ctypes.c_void_p(int(handle)), 0x4000)   # (BELOW_NORMAL_PRIORITY_CLASS)
+    except (OSError, ValueError, TypeError):
+        pass
+
 def HOT_ORDER():
     p = os.path.join(kit.WORK, "hot_order.txt")
     if not os.path.exists(p) or os.environ.get("RX_NO_ORDER"):
@@ -621,6 +636,7 @@ def compile_one(job):
     try:
         with subprocess.Popen([cc] + fl + ["-c", src, "-o", obj], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
             no_throttle(getattr(p, "_handle", None))
+            below_normal(getattr(p, "_handle", None))
             if GATE:
                 GATE.started(lease, p)
             out, err = p.communicate()
