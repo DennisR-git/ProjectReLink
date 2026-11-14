@@ -271,9 +271,6 @@ changes to their code were made in November 2026.
     Hookshot: Copyright (C) 2026 NotRexed and the Hookshot contributors
     Longshot: Copyright (C) 2026 the Longshot contributors
 
-In ReLink's source comments, "Hookshot issue N" and "Hookshot pull request N" are Hookshot's tracker on GitHub, and
-"Longshot <commit>" is a commit in Longshot's history, which continues Hookshot's.
-
 Through them it also includes code from other projects under the GPL (Eden, suyu, TOTKPort's renderer) and parts under
 licenses that work with the GPL (Sirit, the Vulkan Memory Allocator, SDL, Opus, stb, zbic, the a64-kit tools, and AMD FidelityFX's FSR library shipped with its license); each
 keeps its copyright notices and license in its files and folders. The same notices are in [NOTICE.md](NOTICE.md), which
@@ -293,9 +290,6 @@ modifications de ReLink à leur code datent de novembre 2026.
 
     Hookshot: Copyright (C) 2026 NotRexed and the Hookshot contributors
     Longshot: Copyright (C) 2026 the Longshot contributors
-
-Dans les commentaires du code de ReLink, « Hookshot issue N » et « Hookshot pull request N » renvoient au suivi de Hookshot
-sur GitHub, et « Longshot <commit> » à un commit de l'historique de Longshot, qui prolonge celui de Hookshot.
 
 Par eux, il contient aussi du code d'autres projets sous GPL (Eden, suyu, le moteur de rendu de TOTKPort) et des parties
 sous des licences compatibles avec la GPL (Sirit, Vulkan Memory Allocator, SDL, Opus, stb, zbic, les outils a64-kit, et la bibliothèque FSR d'AMD FidelityFX livrée avec sa licence) ;
