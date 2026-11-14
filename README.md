@@ -157,9 +157,10 @@ resolution), boss fights, sessions longer than half an hour, and AMD and Intel c
 
 ## If the game slows down with adult Link: check your dump
 
-Some dumps hold a few damaged textures. The game then loads the model that needs one again and again for ever, which keeps
-more than one CPU core busy as soon as Link is an adult. Two tools in this repository deal with it, from your own files
-(nothing of the game is in them):
+Some dumps hold a few damaged textures. The game then never finishes loading the model that needs one: the fairy fountains'
+floor and walls are not drawn, and as an adult the model is loaded again and again for ever, which keeps more than one CPU
+core busy. Since 0.7.2 every install and update does the repair below by itself (the mod `mods\00-dump-repair` in the game
+folder). Two tools in this repository deal with it, from your own files (nothing of the game is in them):
 
 ```powershell
 python -I tools/dump_check.py "C:\Games\ReLink\romfs\Tex"

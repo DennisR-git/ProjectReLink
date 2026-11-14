@@ -361,7 +361,8 @@ def package(a):
     copy(os.path.join(ROOT, "LICENSE"), os.path.join(out, "LICENSE"))
     copy(os.path.join(ROOT, "NOTICE.md"), os.path.join(out, "NOTICE.md"))   # (the copyright notices)
     tools = os.path.join(out, "tools")
-    for f in tracked("assets", "gpu", "host", "nx2", "scripts", "third_party"):
+    # (tools: dump_check.py and dump_repair.py, which make_game.py runs on the player's dump, issue 14)
+    for f in tracked("assets", "gpu", "host", "nx2", "scripts", "third_party", "tools"):
         copy(os.path.join(ROOT, f), os.path.join(tools, *f.split("/")))
     if a.list:
         if not profile(argparse.Namespace(list=a.list, work=os.path.join(tools, "work"))) == 0:
