@@ -2017,6 +2017,10 @@ bool trace_tex_wanted(const Texture* t) {
     return !want.empty() && trace_tex_mask == (1u << want.size()) - 1;   // (a draw with all of them)
 }
 thread_local VkFormat last_view_format = VK_FORMAT_UNDEFINED;   // (relink: RX_VK_LOG_IMG, the view last made)
+bool log_img_new() {   // (relink) RX_VK_LOG_IMG_NEW=1: RX_VK_LOG_IMG's lines for each new texture pairing, the whole run
+    static const bool on = getenv("RX_VK_LOG_IMG_NEW") != nullptr;
+    return on;
+}
 bool log_img_wanted(uint64_t key) {   // (relink) RX_VK_LOG_IMG=<key prefix,...>: its texture and image bindings, 8 times
     static const char* want = getenv("RX_VK_LOG_IMG");
     if (!want) return false;
@@ -2769,6 +2773,40 @@ void build_descriptors(const NvnState& s, const Program& p) {
                              tex ? tex->depth : 0, tex ? tex->layers : 0, tex ? tex->levels : 0, tex ? (int)tex->sparse : 0,
                              (void*)view);
                 }
+                static const bool log_3d = getenv("RX_VK_LOG_3D") != nullptr;   // (relink, diagnosis: who samples 3D textures)
+                if (log_3d && tex && tex->type == VK_IMAGE_TYPE_3D) {
+                    ParLock lk;
+                    static std::unordered_set<uint64_t> seen3;
+                    if (seen3.size() < 600 && seen3.insert(mix(p.key, tex->width << 16 | tex->depth)).second)
+                        logf("vk: 3d frame %llu prog %016llx samples #%u %ux%ux%u fmt %d (shader type %d)%s",
+                             (unsigned long long)texture_frame_no(), (unsigned long long)p.key, tex->id, tex->width, tex->height,
+                             tex->depth, (int)tex->format, (int)d.type, view ? "" : " DUMMY");
+                }
+                if (log_img_wanted(p.key) && log_img_new()) {
+                    // (RX_VK_LOG_IMG_NEW=1 with RX_VK_LOG_IMG: every new pairing of a program's texture slot with what it got,
+                    // at its first frame, for the whole run: what a program samples in one scene and not in another)
+                    const uint64_t sig = mix(mix(p.key, (uint64_t)k << 32 | (uint32_t)d.type),
+                                             tex ? ((uint64_t)tex->width << 40 | (uint64_t)tex->height << 20 | tex->depth) ^
+                                                       ((uint64_t)tex->layers << 56 | (uint64_t)tex->format << 48 | tex->type)
+                                                 : (view ? 1u : 2u));
+                    ParLock lk;
+                    static std::unordered_set<uint64_t> seen;
+                    nvn_samp_par sp{};
+                    const bool has_sp = sampler_of((int)(handle >> 20), &sp);
+                    if (seen.size() < 4000 && seen.insert(mix(sig, handle >> 20)).second)
+                        logf("vk: img new frame %llu prog %016llx tex %u: shader type %d depth %d, handle %#x -> %s #%d %ux%ux%u x%u "
+                             "levels %u fmt %d imgtype %d cube %d%s; sampler %d%s min %u mag %u wrap %u %u %u aniso %g "
+                             "reduction %u cmp %u/%u lod %g..%g bias %g border %g %g %g %g",
+                             (unsigned long long)texture_frame_no(),
+                             (unsigned long long)p.key, k, (int)d.type, (int)d.is_depth, handle, view ? "view" : "DUMMY",
+                             tex ? (int)tex->id : -1, tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->depth : 0,
+                             tex ? tex->layers : 0, tex ? tex->levels : 0, tex ? (int)tex->format : -1, tex ? (int)tex->type : -1,
+                             tex ? (int)tex->cube : -1, tex && tex->gpu_written ? " gpu-written" : "", (int)(handle >> 20),
+                             has_sp ? "" : " (none: default)", (unsigned)sp.minf, (unsigned)sp.magf, (unsigned)sp.ws,
+                             (unsigned)sp.wt, (unsigned)sp.wr, (double)sp.aniso, (unsigned)sp.reduction, (unsigned)sp.cmp_mode,
+                             (unsigned)sp.cmp_func, (double)sp.lod_min, (double)sp.lod_max, (double)sp.lod_bias,
+                             (double)sp.border[0], (double)sp.border[1], (double)sp.border[2], (double)sp.border[3]);
+                }
                 if (dump_on() && view && tex && dump_sampled_wanted(p.key)) {
                     static std::unordered_set<uint32_t> done;
                     static int last_seq = 0;
@@ -2800,6 +2838,16 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                           : VK_NULL_HANDLE;
                 if (view && tex && d.is_written) { ParLock lk; texture_written(tex); }
                 if (view && tex) draw_sampled().push_back(tex);
+                static const bool log_3d_w = getenv("RX_VK_LOG_3D") != nullptr;   // (relink, diagnosis: who stores into 3D)
+                if (log_3d_w && tex && tex->type == VK_IMAGE_TYPE_3D) {
+                    ParLock lk;
+                    static std::unordered_set<uint64_t> seen3w;
+                    if (seen3w.size() < 200 && seen3w.insert(mix(p.key, tex->width << 16 | tex->depth)).second)
+                        logf("vk: 3d frame %llu prog %016llx image %s #%u %ux%ux%u fmt %d as vk %d%s",
+                             (unsigned long long)texture_frame_no(), (unsigned long long)p.key,
+                             d.is_written ? "STORES" : "loads", tex->id, tex->width, tex->height, tex->depth, (int)tex->format,
+                             (int)image_format(d.format), view ? "" : " NO VIEW");
+                }
                 if (log_img_wanted(p.key)) {
                     static std::atomic<int> told{0};
                     if (told++ < 16)
@@ -5872,6 +5920,43 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     {
         FINE_SCOPE(FT_HAZARD);
         writes = draw_hazards(cmd, p, s, at);
+    }
+    static const bool log_self = getenv("RX_VK_LOG_SELF_SAMPLE") != nullptr;   // (relink, diagnosis: a draw sampling its own target)
+    if (log_self && log_img_wanted(p.key)) {   // (and RX_VK_LOG_IMG's programs: their targets, at each new pairing)
+        static std::mutex mu2;
+        static std::unordered_set<uint64_t> seen2;
+        std::lock_guard lk(mu2);
+        uint64_t sig = mix(p.key, at.depth ? at.depth->id : 0);
+        for (int i = 0; i < at.n; i++) sig = mix(sig, at.color[i] ? at.color[i]->id : 0);
+        sig = mix(sig, (uint64_t)s.ds.dt << 1 | s.ds.dw);
+        if (seen2.size() < 400 && seen2.insert(sig).second) {
+            char line[300];
+            int k = snprintf(line, sizeof line, "vk: targets frame %llu prog %016llx pass draw %d: depth #%d dt %d dw %d, colour",
+                             (unsigned long long)texture_frame_no(), (unsigned long long)p.key, pass().draws,
+                             at.depth ? (int)at.depth->id : -1, (int)s.ds.dt, (int)s.ds.dw);
+            for (int i = 0; i < at.n && k < 250; i++)
+                k += snprintf(line + k, sizeof line - k, " #%d", at.color[i] ? (int)at.color[i]->id : -1);
+            k += snprintf(line + k, sizeof line - k, "; pass first prog %016llx", (unsigned long long)pass().first_prog);
+            logf("%s", line);
+        }
+    }
+    if (log_self) {
+        for (const Texture* t : gfx_sampled()) {
+            int slot = -1;
+            for (int i = 0; i < at.n; i++)
+                if (at.color[i] == t) slot = i;
+            if (at.depth == t) slot = 8;
+            if (slot < 0) continue;
+            static std::mutex mu;
+            static std::unordered_set<uint64_t> seen;
+            std::lock_guard lk(mu);
+            const uint64_t sig = mix(p.key, (uint64_t)slot << 8 | (writes >> slot & 1));
+            if (seen.size() < 200 && seen.insert(sig).second)
+                logf("vk: self-sample frame %llu prog %016llx samples its own %s %u (#%u %ux%u fmt %d), %s it; depth test %d write %d",
+                     (unsigned long long)texture_frame_no(), (unsigned long long)p.key, slot == 8 ? "depth target" : "colour target",
+                     slot == 8 ? 0u : (unsigned)slot, t->id, t->width, t->height, (int)t->format,
+                     (writes >> slot & 1) ? "WRITES" : "does not write", (int)s.ds.dt, (int)s.ds.dw);
+        }
     }
     BufferRef mesh_args{};
     uint32_t mesh_args_at = 0;
