@@ -303,6 +303,23 @@ void vk_timeline_wait(uint64_t v) {
     if (vkWaitSemaphores(dev.device, &wi, 250000000ull) == VK_TIMEOUT) {
         static std::atomic<int> logged{0};
         if (logged++ < 8) logf("vk: a capture's wait for write-back %llu timed out (done %llu)", (unsigned long long)v, (unsigned long long)completed());
+        // (relink, issue 7) the GPU finished nothing since the last timed-out wait, for RX_VK_STALL_REPORT_MS (default 2000) in
+        // all: it stopped, the device not lost. The report names what it ran (buffer markers), once a run
+        static std::mutex stall_mu;
+        static uint64_t stall_value = UINT64_MAX;
+        static int64_t stall_since = 0;
+        static const int64_t stall_ms = getenv("RX_VK_STALL_REPORT_MS") ? atoll(getenv("RX_VK_STALL_REPORT_MS")) : 2000;
+        const uint64_t done = completed();
+        const int64_t now = tl_now_us() / 1000;
+        bool report = false;
+        int64_t for_ms = 0;
+        {
+            std::lock_guard lk(stall_mu);
+            if (done != stall_value) stall_value = done, stall_since = now - 250;
+            for_ms = now - stall_since;
+            report = stall_ms > 0 && for_ms >= stall_ms;
+        }
+        if (report) gpu_stall_report(for_ms / 1000.0, done, v);
     }
     if (t0) {   // (RX_VK_LOG_TLWAIT: see tl_ring)
         const int64_t t1 = tl_now_us();

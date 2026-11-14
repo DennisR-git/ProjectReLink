@@ -3135,7 +3135,7 @@ void buffer_markers_init() {
 
 namespace {
 // (the markers the GPU reached whose earlier work never finished: the hang is in the work after the last marker that did)
-void buffer_markers_report() {
+void buffer_markers_report(const char* why = "device lost") {
     const uint32_t n = checkpoint_n.load(), first = n > 0xFFFF ? n - 0xFFFF : 1;
     uint32_t reached = 0, last_done = 0;
     std::vector<uint32_t> stuck;
@@ -3146,7 +3146,7 @@ void buffer_markers_report() {
         if (d) last_done = s;
         else if (r) stuck.push_back(s);
     }
-    logf("vk: device lost: %u markers set, %u reached; the last whose earlier work all finished: %u", n, reached, last_done);
+    logf("vk: %s: %u markers set, %u reached; the last whose earlier work all finished: %u", why, n, reached, last_done);
     const auto line = [](const char* what, uint32_t s) {
         const Checkpoint& k = checkpoints[(s - 1) & 0xFFFF];
         logf("vk:   %s: marker %u (%s %016llx, frame %llu)", what, s, checkpoint_kind(k.kind), (unsigned long long)k.prog,
@@ -3162,6 +3162,27 @@ void buffer_markers_report() {
 } // namespace
 
 void draw_records_log(uint64_t lo, uint64_t hi);
+// (relink, issue 7) the GPU finished nothing for `seconds` while work waited on it, the device not lost (yet): an RTX 5070 Ti
+// stopped this way in the water and never reported a loss, so neither report above ever ran. Once a run: with the buffer
+// markers (RX_VK_CHECKPOINTS=marker) what the GPU was running; without them, the hint that turns them on
+void gpu_stall_report(double seconds, uint64_t done, uint64_t waited) {
+    static std::atomic<bool> done_once{false};
+    if (done_once.exchange(true)) return;
+    logf("vk: GPU STALLED: no work finished for %.1f s (finished %llu, waiting for %llu)", seconds, (unsigned long long)done,
+         (unsigned long long)waited);
+    {
+        const uint64_t f = texture_frame_no();
+        draw_records_log(f > 6 ? f - 6 : 0, f);
+    }
+    if (marker_words) {
+        buffer_markers_report("GPU stalled");
+        std::lock_guard lk(watch_mu);
+        for (int i = 0; i < 40; i++)
+            if (!watch_ring[(watch_at + i) % 40].empty()) logf("%s", watch_ring[(watch_at + i) % 40].c_str());
+    } else {
+        logf("vk: GPU stalled: no markers to read (RX_VK_CHECKPOINTS=marker in relink_env.txt names the work that hung)");
+    }
+}
 void checkpoints_report() {
     static bool done;
     if (done) return;
