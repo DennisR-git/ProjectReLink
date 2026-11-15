@@ -126,10 +126,11 @@ def no_throttle(handle=None):
 
 
 def below_normal(handle):
-    """(relink, issue 6) A compiler process at below normal priority: the compile fills every core, and the PC stays usable.
-    make_game.py now runs at normal priority itself (its one-process steps went to an Intel CPU's efficiency cores below
-    normal), so the compilers no longer inherit the launcher's below normal and are given it here"""
-    if os.name != "nt" or not handle:
+    """(relink, issue 6) A compiler process at below normal priority, only with RELINK_LOW_PRIORITY=1: the PC stays more
+    responsive while the game compiles, and the build can take longer. Off by default: on an Intel CPU with efficiency cores,
+    Windows kept the below-normal compilers on those cores with most performance cores idle, and the compile used far more
+    of the CPU once they were set to normal. make_game.py runs at normal priority itself, so the compilers start at normal"""
+    if os.name != "nt" or not handle or os.environ.get("RELINK_LOW_PRIORITY", "0") in ("", "0"):
         return
     import ctypes
     k = ctypes.WinDLL("kernel32")

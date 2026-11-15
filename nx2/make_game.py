@@ -1012,7 +1012,7 @@ def main(a=None):
         ctypes.WinDLL("kernel32").SetThreadExecutionState(0x80000000 | 0x00000001)
         # (relink, issue 6) normal priority for this process and the one-process steps it runs (reading the copy, the lift): started
         # below normal by the launcher, they ran on an Intel CPU's efficiency cores for over an hour with the performance cores idle.
-        # The compilers are put below normal one by one (build.py below_normal): they fill every core, and the PC stays usable
+        # The compilers stay at normal too, for the same reason; RELINK_LOW_PRIORITY=1 puts them below normal (build.py below_normal)
         k = ctypes.WinDLL("kernel32")
         k.GetCurrentProcess.restype = ctypes.c_void_p
         k.GetPriorityClass.argtypes = [ctypes.c_void_p]

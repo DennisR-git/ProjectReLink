@@ -188,7 +188,8 @@ python -I nx2/make_game.py --romfs "C:\path\romfs" --exefs "C:\path\exefs" --out
 
 `--game <path>` takes either one (a `.nup`, or a folder holding `exefs` and `romfs`) in place of those options.
 `--check` with your `.nup` only checks the game's version. `--log file` keeps the output. `RELINK_JOBS=<n>` limits how many
-files compile at once.
+files compile at once. `RELINK_LOW_PRIORITY=1` runs the compilers below normal priority: the PC stays more responsive
+while the game compiles, and the build can take longer.
 
 You need:
 
