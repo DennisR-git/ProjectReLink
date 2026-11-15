@@ -7032,10 +7032,61 @@ std::string warm_marker_now() {
              (unsigned)dev.props.deviceID, (unsigned long long)program_cache_stamp(), (int)n, exe);
     return line;
 }
+// (relink, 15/11) The marker says the driver's cache was warmed for this driver, build and program, but the cache itself can go
+// meanwhile, the marker unchanged: NVIDIA's emptied itself on the bench between two runs (hs2988 -> hs2989: the start's 5030
+// compute pipelines 2.7 s -> 76.6 s), nothing warmed it again, and play made each graphics pipeline at its first draw (the Market
+// turned at 34 fps, nvgpucomp64.dll in nearly every long frame's samples, hs2991). So a start the marker says is warm probes the
+// cache first: kProbe notes spread over the file, at an offset that changes from start to start (the same ones each time were
+// in the cache from the probe before: a warm-up stopped halfway then probed warm, hs2994), are built for the driver's cache one
+// by one and timed. A quarter of them over RX_VK_WARM_PROBE_MS (12) means the driver compiles them: the cache lost them, and the
+// start warms it again (the marker removed first, so that a warm-up cut short goes on at the next start). Measured on the bench
+// (RTX 3060 Ti): from the cache, a median of 1.5 to 2.7 ms and 8.5 ms at most; compiled, a median of 63 ms (3 ms called a warm
+// cache cold once, hs2997: 5 s of warm-up for nothing). Warm, the probe costs kProbe pipelines from the cache and their programs
+// read (0.1 s). RX_VK_WARM_PROBE_MS=0: no probe (the marker alone, as before)
+bool driver_cache_lost(const std::vector<std::unique_ptr<PipeNote>>& notes) {
+    static const double limit_ms = getenv("RX_VK_WARM_PROBE_MS") ? atof(getenv("RX_VK_WARM_PROBE_MS")) : 12.0;
+    if (limit_ms <= 0 || notes.empty()) return false;
+    constexpr size_t kProbe = 16;
+    const size_t n = notes.size(), step = std::max<size_t>(1, n / kProbe),
+                 off = (size_t)(std::chrono::steady_clock::now().time_since_epoch().count() / 1000) % step;
+    std::vector<const PipeNote*> pick;
+    for (size_t k = 0; k < kProbe && k < n; k++) pick.push_back(notes[(k * step + off) % n].get());
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<double> ms;
+    std::thread([&] {   // (as warm_run's workers: a thread of its own, its pipelines for the driver's cache only)
+        ub_thread_off();
+        driver_cache_only = true;
+        std::unordered_set<uint64_t> wanted;
+        for (const PipeNote* n : pick) wanted.insert(n->prog);
+        program_cache_load_some(wanted, [](Program& p) { ensure_layout(p); }, false);
+        for (const PipeNote* n : pick) {
+            const Program* p = program_find(n->prog, n->variant);
+            if (!p) continue;
+            const auto b0 = std::chrono::steady_clock::now();
+            const VkPipeline pl = build_graphics(*p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo);
+            if (!pl) continue;
+            ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - b0).count());
+            vkDestroyPipeline(dev.device, pl, nullptr);
+        }
+    }).join();
+    if (ms.size() < kProbe / 2) {   // (too few built to tell: the marker decides, as before)
+        logf("vk: the driver's cache not probed: %zu of %zu pipelines built", ms.size(), pick.size());
+        return false;
+    }
+    std::sort(ms.begin(), ms.end());
+    const double med = ms[ms.size() / 2];
+    const size_t cold = (size_t)(ms.end() - std::upper_bound(ms.begin(), ms.end(), limit_ms));
+    const bool lost = cold * 4 >= ms.size();
+    logf("vk: the driver's cache probed: %zu pipelines in %.2f s, median %.2f ms, longest %.2f ms, %zu over %.1f ms: %s", ms.size(),
+         std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), med, ms.back(), cold, limit_ms,
+         lost ? "it no longer has them, warmed again" : "warm");
+    return lost;
+}
 void warm_run(void (*progress)(size_t done, size_t total)) {
     static const char* const sw = getenv("RX_VK_WARM");
     if (sw && !atoi(sw)) return;
     const std::string now = warm_marker_now(), path = warm_marker_path();
+    bool marked = false;
     if (!sw) {
         char had[MAX_PATH + 128] = "";
         if (FILE* f = fopen(path.c_str(), "rb")) {
@@ -7044,11 +7095,15 @@ void warm_run(void (*progress)(size_t done, size_t total)) {
             had[n] = 0;
             if (char* end = strpbrk(had, "\r\n")) *end = 0;
         }
-        if (now == had) return;
+        marked = now == had;
     }
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
     if (notes.empty()) return;   // (nothing noted yet: play notes them, and the driver's cache has them from their first draw)
+    if (marked) {
+        if (!driver_cache_lost(notes)) return;
+        remove(path.c_str());   // (a warm-up cut short is not marked: the next start warms again without a probe)
+    }
     // (the notes' programs read in one pass, as the full precompile reads them: borrowing each from the file for its pipelines,
     // as predict_run does, made 8535 pipelines in 370 s cold and still 310 s with the driver's cache warm, one program at a time;
     // play asks for these programs anyway, the notes being what it drew before)
