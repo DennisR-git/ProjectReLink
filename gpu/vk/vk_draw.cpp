@@ -2151,6 +2151,20 @@ TLS_OBJECT(bank_cache, std::array<std::array<BankCache, kNvnStages>, 2>)   // [c
 thread_local bool grid_patch_want = false;
 thread_local uint64_t grid_patch_at = UINT64_MAX;
 thread_local VkBuffer grid_patch_buf = VK_NULL_HANDLE;   // (the stream c0 went to: PR 585's streams can move on)
+// (relink, issues 6 and 7, 15/11, a diagnosis; RX_VK_CHECKPOINTS=marker only) Every hung draw in the water reports is a forward-lit
+// program whose one loop runs min(light grid word, uniform c15 word 452) + 1 times. What the marker report could not say: that
+// word, and where the fragment stage's storage buffers (the light grid among them) were bound. Noted as the descriptors are
+// built (c15[452] from guest memory as it is then, not an inline update of the buffer), kept with the draw's marker
+struct LightProbe {
+    uint32_t c15_452 = UINT32_MAX;   // (or c6's: the scenery's programs keep the same constants there)
+    uint32_t cbuf = 0, nb = 0;
+    struct { uint64_t addr, n; bool bound; } b[3];
+};
+thread_local LightProbe light_probe_now, light_probe_draw;
+bool light_probe_on() {
+    static const bool on = getenv("RX_VK_CHECKPOINTS") && !strcmp(getenv("RX_VK_CHECKPOINTS"), "marker");
+    return on;
+}
 
 VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_t index) {
     VkDescriptorBufferInfo bi{VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
@@ -2232,6 +2246,12 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
         FINE_N(FC_UBO_CALLS, 1);
         const nvn_p_bind_buf& u = s.ubo[std::clamp(st.nvn_stage, 0, kNvnStages - 1)][index - 3];
         if (!u.addr) return bi;
+        if ((index == 15 || index == 6) && st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT && light_probe_on() &&
+            used >= 453 * 4 && used < 0x10000) {   // (the marker report's c15[452], or c6[452])
+            uint32_t v = 0;
+            if ((!u.size || u.size >= 453 * 4) && host->gpu_read(u.addr + 452 * 4, &v, 4))
+                light_probe_now.c15_452 = v, light_probe_now.cbuf = index;
+        }
         const uint64_t want = used ? std::max<uint64_t>(used, 16) : std::max<uint64_t>(u.size, 16);
         const uint64_t n = std::min<uint64_t>(std::min<uint64_t>(want, u.size ? std::max<uint64_t>(u.size, 16) : want),
                                               dev.props.limits.maxUniformBufferRange);
@@ -2516,6 +2536,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
     if (p.key == kSkySumsProgram || p.key == kSkyRgblProgram) sky_sums = {};   // (relink: bound again below)
     dw().reset();
     draw_sampled().clear();
+    light_probe_now = LightProbe{};
     dump_written().clear();
     dump_inputs().clear();
     size_t nbuf = 0, nimg = 0, nview = 0;
@@ -2626,6 +2647,8 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 // end are whatever the constant buffer holds there, bound only when they look like a buffer
                 const bool plausible = d.count == 1 || (size && size <= (256ull << 20) && host->gpu_guest(base));
                 BufferRef b = addr && plausible ? gpu_buffer_bind(base, n, d.is_written && !bare) : BufferRef{};
+                if (light_probe_on() && st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT && light_probe_now.nb < 3)   // (the marker report's)
+                    light_probe_now.b[light_probe_now.nb++] = {addr, n, b.buffer != VK_NULL_HANDLE};
                 if ((ui_draw_now || compute_now) && b && d.count == 1) memory_note_ui_buffer(base, n);   // (relink: the HUD's records, a compute pass's blocks)
                 // (relink) OoT's sky light accumulators: where they were bound, for the dispatch's reset (kSkySumsProgram)
                 if (((p.key == kSkySumsProgram && d.cbuf_offset == 0x20) || (p.key == kSkyRgblProgram && d.cbuf_offset == 0x30)) &&
@@ -3118,6 +3141,7 @@ std::atomic<uint32_t> checkpoint_n{0};
 struct CheckpointDraw {
     uint32_t width = 0, height = 0, c0 = 0, c0_format = 0, depth = 0, depth_format = 0, n = 0;
     struct { uint32_t id, format; uint16_t w, h, d; uint8_t type, layers; } s[6];
+    LightProbe light;   // (relink, 15/11: its fragment stage's c15[452] and storage buffers, as bound)
 };
 std::unique_ptr<CheckpointDraw[]> checkpoint_draws;
 
@@ -3158,6 +3182,7 @@ void checkpoint(VkCommandBuffer cmd, const Program& p, char kind, const Targets*
                 c.s[c.n++] = {t->id, (uint32_t)t->format, (uint16_t)t->width, (uint16_t)t->height, (uint16_t)t->depth,
                               (uint8_t)t->type, (uint8_t)std::min<uint32_t>(t->layers, 255)};
             }
+            c.light = light_probe_draw;   // (this draw's: set with gfx_sampled)
         }
     }
     set_checkpoint(cmd, i, seq);
@@ -3304,7 +3329,7 @@ void buffer_markers_report(const char* why = "device lost") {
         const uint32_t i = (s - 1) & 0xFFFF;
         const Checkpoint& k = checkpoints[i];
         static const char* const states[] = {"not reached", "reached, earlier work NOT done", "earlier work done"};
-        char extra[480] = "";
+        char extra[720] = "";
         if (checkpoint_draws && k.kind == 'd' && checkpoint_draws[i].width) {
             const CheckpointDraw& c = checkpoint_draws[i];
             int m = snprintf(extra, sizeof extra, "; into %ux%u, colour #%u (vk %u), depth #%u (vk %u)", c.width, c.height, c.c0,
@@ -3314,6 +3339,14 @@ void buffer_markers_report(const char* why = "device lost") {
                               (unsigned)c.s[j].w, (unsigned)c.s[j].h, c.s[j].type == VK_IMAGE_TYPE_3D ? (unsigned)c.s[j].d
                                                                                                    : (unsigned)c.s[j].layers,
                               c.s[j].type == VK_IMAGE_TYPE_3D ? " 3D" : "", c.s[j].format);
+            // (relink, 15/11) the forward-lit programs' loop bound and light grid: a c15[452] in the thousands would make the
+            // loop run to its 8192-turn guard on every pixel; a storage buffer "not bound" reads 0 (robust access)
+            if (c.light.c15_452 != UINT32_MAX && m > 0 && m < 560)
+                m += snprintf(extra + m, sizeof extra - m, "; c%u[452] %u", c.light.cbuf, c.light.c15_452);
+            for (uint32_t j = 0; j < c.light.nb && m > 0 && m < 640; j++)
+                m += snprintf(extra + m, sizeof extra - m, "%s %#llx+%#llx%s", j ? "," : "; storage",
+                              (unsigned long long)c.light.b[j].addr, (unsigned long long)c.light.b[j].n,
+                              c.light.b[j].bound ? "" : " (not bound)");
         }
         logf("vk:   %s: marker %u [%s] (%s %016llx, frame %llu)%s", what, s, states[state(s)], checkpoint_kind(k.kind),
              (unsigned long long)k.prog, (unsigned long long)k.frame, extra);
@@ -6161,7 +6194,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (dump_on()) log_dump_draw(s, p, d);
     PROF_HOT(PROF_CMDS);
     texture_watch_prog(p.key);
-    if (!same_desc) gfx_sampled() = draw_sampled();
+    if (!same_desc) gfx_sampled() = draw_sampled(), light_probe_draw = light_probe_now;
     static const bool barrier_every = getenv("RX_VK_BARRIER_EVERY_DRAW") != nullptr;   // (an experiment: a pass each)
     if (barrier_every) end_pass(cmd);
     uint16_t writes;
