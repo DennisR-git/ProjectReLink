@@ -167,6 +167,22 @@ def patch_text_speed(s):
     return s.replace('#include "a64.h"\n', '#include "a64.h"\n' + TEXT_DECL, 1)
 
 
+# (relink, 15/11) The game's zstd sequence loop (f_801102e0, ZSTD_decompressSequences_body of its zstd 1.4) natively: most of
+# the loading threads' time arriving in Hyrule Castle (host/zstd_native.c says what was measured). At the head of the lifted
+# function, inside it (split_hot cuts the file at function heads: the call has to travel with the function): the host runs the
+# loop and the function returns, or (HOS_ZSTD_NATIVE=0) the lifted body runs as before
+ZSTD_HEAD = "void f_801102e0(Ctx *__restrict A64_NOESC c) {\n"
+ZSTD_CALL = ("    { extern int hos_zstd_seq(Ctx *, void (*)(Ctx *));   /* (nx2/oot_patches.py: host/zstd_native.c) */\n"
+             "      if (hos_zstd_seq(c, f_801102e0)) return; }\n")
+
+
+def patch_zstd(s):
+    """The native zstd sequence loop's call at the head of f_801102e0 (the supported build's: its address is that build's)"""
+    if ZSTD_HEAD not in s or ZSTD_CALL in s:
+        return None
+    return s.replace(ZSTD_HEAD, ZSTD_HEAD + ZSTD_CALL, 1)
+
+
 def apply(gen, *, protect_hearts=False, required=False):
     """required: the lift of the supported build (LIFE_BUILD_ID), whole: a missing output-size edit stops it (apply_output_size).
     The other patches only warn when their place is not found once."""
@@ -178,6 +194,7 @@ def apply(gen, *, protect_hearts=False, required=False):
         done["player flight"] = 0
         done["player flight rotation"] = 0
         done["free camera"] = 0
+        done["zstd sequence loop"] = 0
     for path in sorted(glob.glob(os.path.join(gen, "code_*.c"))):
         with open(path, encoding="utf-8", newline="") as f:
             s = f.read()
@@ -216,6 +233,11 @@ def apply(gen, *, protect_hearts=False, required=False):
             out = view
             done["free camera"] += 1
             print("oot_patches: free camera in", os.path.basename(path))
+        zstd = patch_zstd(out) if protect_hearts else None
+        if zstd is not None:
+            out = zstd
+            done["zstd sequence loop"] += 1
+            print("oot_patches: native zstd sequence loop in", os.path.basename(path))
         if out != s:
             with open(path, "w", encoding="utf-8", newline="") as f:
                 f.write(out)
