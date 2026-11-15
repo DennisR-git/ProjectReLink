@@ -42,12 +42,29 @@ static void mount(const char *name, const char *root, int writable) {
         WIN32_FIND_DATAA fd;
         snprintf(pattern, sizeof pattern, "%s\\System\\Resource\\ResourceSizeTable*", root);
         HANDLE f = FindFirstFileA(pattern, &fd);
+        /* (relink, issue 26) and said to the player: the game reads that table first and dies in its first second without it
+           (a null from its allocator), and a romfs from another PC port's install (a few packed .bin files) had none. Not
+           stopped here: only said, the game goes on as before */
+        const char *expected = "ResourceSizeTable.Product.111.Nin_Ounce_NVN2.rsizetable.zs";
+        char text[1024] = "";
         if (f == INVALID_HANDLE_VALUE) {
             hos_log("fs: the RomFS has no System\\Resource\\ResourceSizeTable file: the game files are incomplete");
+            snprintf(text, sizeof text, "The game files in %s are not the game's own RomFS: its System\\Resource folder has no "
+                     "ResourceSizeTable file, and the game will most likely close at once.\n\nA romfs folder taken from another PC "
+                     "port or tool holds the game in its own format and does not work with ReLink. Install again from your own dump "
+                     "of the game (the .nup file, or the romfs and exefs folders dumped from it).", root);
         } else {
             hos_log("fs: RomFS resource table %s (%lu bytes)", fd.cFileName, (unsigned long)fd.nFileSizeLow);
             FindClose(f);
+            if (_stricmp(fd.cFileName, expected)) {
+                hos_log("fs: that is not the supported version's (%s): the game files are from another version", expected);
+                snprintf(text, sizeof text, "The game files in %s are from another version of the game (%s; ReLink supports the "
+                         "one with %s), and the game may close or misbehave.\n\nInstall again from a dump of the game with its "
+                         "update applied, its romfs and exefs from the same dump.", root, fd.cFileName, expected);
+            }
         }
+        if (text[0] && !getenv("HOS_HEADLESS"))
+            MessageBoxA(NULL, text, "Project ReLink: game files", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
     }
 #endif
 }
