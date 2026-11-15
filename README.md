@@ -7,6 +7,10 @@ remake) into a native Windows game: the game's code is translated to PC code and
 
 [Français plus bas](#français)
 
+**Discord:** [join the Project ReLink server](https://discord.gg/RFNUtCQk8j) to ask questions, get help and follow new
+versions. Bugs are still best reported as [issues](https://github.com/pixl27/ProjectReLink/issues) with `relink_log.txt`
+attached, so they don't get lost.
+
 ![The Project ReLink launcher](docs/launcher.png)
 
 **No game files are in this repository.** ReLink builds the game on your PC from your own copy.
@@ -217,6 +221,10 @@ described in [docs/releasing.md](docs/releasing.md).
 **Project ReLink** est une recompilation statique, non officielle, de *The Legend of Zelda: Ocarina of Time* (le remake
 Switch 2) en jeu Windows natif : le code du jeu est traduit en code PC et compilé sur votre machine, sans émulateur.
 **Ce dépôt ne contient aucun fichier du jeu** : ReLink fabrique le jeu sur votre PC à partir de votre propre copie.
+
+**Discord :** [rejoignez le serveur Project ReLink](https://discord.gg/RFNUtCQk8j) pour poser vos questions, trouver de
+l'aide et suivre les nouvelles versions. Pour un bug, une [issue](https://github.com/pixl27/ProjectReLink/issues) avec
+`relink_log.txt` en pièce jointe reste le meilleur moyen qu'il ne se perde pas.
 
 ### La version du jeu qu'il vous faut
 
