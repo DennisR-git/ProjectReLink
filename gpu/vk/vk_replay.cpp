@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <thread>
 #include <string>
@@ -2000,7 +2001,9 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         queue_flush_locked();
         const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, j->r->fence);
         j->r->submitted = res == VK_SUCCESS;
-        if (res != VK_SUCCESS) logf("vk: segment submit %llu failed (%d)", (unsigned long long)j->r->value, (int)res);
+        static std::atomic<int> failures{0};   // (relink: once lost, every segment failed: thousands of lines, issue 21's log)
+        if (res != VK_SUCCESS && failures++ < 8)
+            logf("vk: segment submit %llu failed (%d)", (unsigned long long)j->r->value, (int)res);
         if (res == VK_ERROR_DEVICE_LOST) checkpoints_report();
         submit_ms += ms_since(ts0, std::chrono::steady_clock::now());
     }
@@ -4397,18 +4400,37 @@ bool replay_start() {
     return true;
 }
 
+// (relink, issue 23) A C++ exception thrown in the replay goes up into the game's thread, whose C frames have no handler: the
+// process died with "exception 0x20474343" (a C++ throw nothing caught, then 0xc00000ff while unwinding) and the log never
+// said what was thrown. At the entries the game's threads call most, its type and message are logged first, then it goes on
+// up as before (the crash report flushes the log)
+template <auto F> struct Guarded;
+template <typename R, typename... A, R (*F)(A...)> struct Guarded<F> {
+    static R call(A... a) {
+        try {
+            return F(a...);
+        } catch (const std::exception& e) {
+            logf("vk: C++ exception in the renderer, not caught: %s", e.what());
+            throw;
+        } catch (...) {
+            logf("vk: C++ exception in the renderer, not caught (not a std::exception)");
+            throw;
+        }
+    }
+};
+
 void fill_replay_table(MkwVkRenderer& t) {
     t.stats = stats;
-    t.nvn_submit = submit;
-    t.nvn_submit_q = submit_q;
+    t.nvn_submit = Guarded<&submit>::call;
+    t.nvn_submit_q = Guarded<&submit_q>::call;
     t.nvn_fence_q = fence_q;
     t.nvn_fence = fence;
     t.nvn_pushed = get_pushed;
     t.nvn_replayed = get_replayed;
-    t.nvn_wait = wait;
+    t.nvn_wait = Guarded<static_cast<int (*)(uint64_t, uint64_t)>(&wait)>::call;
     t.wait_writebacks_reading = wait_writebacks_reading;
-    t.nvn_finish = finish;
-    t.nvn_present = present;
+    t.nvn_finish = Guarded<static_cast<void (*)()>(&finish)>::call;
+    t.nvn_present = Guarded<&present>::call;
     t.nvn_register_texture = register_texture_queued;
     t.nvn_event_signal = event_signal_queued;
     t.option = [](int id) -> int {   // (3: the fixed path's scale in 1/10000, vk_menu.cpp; DLAA: full scale, vk_dlss.cpp)

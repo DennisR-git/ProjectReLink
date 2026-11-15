@@ -2439,6 +2439,43 @@ bool peek_prog(uint64_t key) {   // (RX_VK_PEEK_PROG=<key prefix>,... or *; RX_V
     }
     return false;
 }
+// (relink, issues 6, 7 and 27, a diagnosis) RX_VK_NULL_TEX=<kinds>: the textures of those kinds that draws sample read as the
+// null texture (zeros; the dummy where the device has no null descriptors) instead of their images. Kinds, comma-separated: 3d,
+// cube, shadow (a depth compare), 2d, array, all. Dispatches keep theirs: what the compute passes produce stays as it is. On
+// RTX 50 cards the GPU hangs in draws that read the 128 x 72 x 96 volumes, a cube and the full-size depth; if an image of one
+// kind is what hangs it, the freeze stops when that kind is left out (the picture is wrong then: only a test)
+int null_tex_kinds() {
+    static const int kinds = [] {
+        const char* e = getenv("RX_VK_NULL_TEX");
+        if (!e || !*e) return 0;
+        int k = 0;
+        static const struct { const char* name; int bit; } names[] = {
+            {"3d", 1}, {"cube", 2}, {"shadow", 4}, {"2d", 8}, {"array", 16}, {"all", 31}};
+        for (const char* q = e; *q;) {
+            const char* end = q;
+            while (*end && *end != ',') end++;
+            for (const auto& n : names)
+                if ((size_t)(end - q) == strlen(n.name) && !strncmp(q, n.name, end - q)) k |= n.bit;
+            q = *end ? end + 1 : end;
+        }
+        logf("vk: RX_VK_NULL_TEX=%s: draws sample the null texture in place of%s%s%s%s%s (a diagnosis: the picture will be wrong)",
+             e, k & 1 ? " 3D textures" : "", k & 2 ? " cubes" : "", k & 4 ? " depth compares" : "", k & 8 ? " 2D textures" : "",
+             k & 16 ? " arrays" : "");
+        return k;
+    }();
+    return kinds;
+}
+bool null_tex_wanted(const Stage& st, const Shader::TextureDescriptor& d) {
+    const int kinds = null_tex_kinds();
+    if (!kinds || st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT) return false;
+    if (d.is_depth) return (kinds & 4) != 0;
+    switch (d.type) {
+    case Shader::TextureType::Color3D: return (kinds & 1) != 0;
+    case Shader::TextureType::ColorCube: case Shader::TextureType::ColorArrayCube: return (kinds & 2) != 0;
+    case Shader::TextureType::ColorArray1D: case Shader::TextureType::ColorArray2D: return (kinds & 16) != 0;
+    default: return (kinds & 8) != 0;
+    }
+}
 void build_descriptors(const NvnState& s, const Program& p) {
     if (peek_prog(p.key)) peek_binds.clear();
     if (p.key == kSkySumsProgram || p.key == kSkyRgblProgram) sky_sums = {};   // (relink: bound again below)
@@ -2761,6 +2798,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 Texture* tex = nullptr;
                 VkImageView view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex)
                                           : VK_NULL_HANDLE;
+                if (view && null_tex_wanted(st, d)) view = VK_NULL_HANDLE, tex = nullptr;   // (RX_VK_NULL_TEX)
                 if (dump_on()) dump_input('t', (uint32_t)(dw().imgs.size() - 0), handle, view ? tex : nullptr);
                 if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
                 if (log_img_wanted(p.key)) {
@@ -3038,6 +3076,15 @@ bool bind_descriptors(VkCommandBuffer cmd, VkPipelineBindPoint bp, const Program
 struct Checkpoint { uint64_t prog; uint64_t frame; uint32_t seq; char kind; };
 Checkpoint checkpoints[1 << 16];
 std::atomic<uint32_t> checkpoint_n{0};
+// (relink, issues 6, 7 and 27) with the buffer markers, each draw's targets and the GPU-written textures it samples, kept beside
+// its marker: the report then says which pass the hung draw was in and what it read, which a program key alone did not (the
+// same program draws in several passes, and the RTX 50 reports named a different program almost every time).
+// Made only when the buffer markers are (RX_VK_CHECKPOINTS=marker): 8 MB
+struct CheckpointDraw {
+    uint32_t width = 0, height = 0, c0 = 0, c0_format = 0, depth = 0, depth_format = 0, n = 0;
+    struct { uint32_t id, format; uint16_t w, h, d; uint8_t type, layers; } s[6];
+};
+std::unique_ptr<CheckpointDraw[]> checkpoint_draws;
 
 // (VK_AMD_buffer_marker, where the NV checkpoints are missing: marker i's sequence number goes to word 2i when the GPU
 // reaches it and to word 2i + 1 once all the work before it is done. Host memory, not VRAM: a GPU reset loses VRAM.)
@@ -3060,10 +3107,24 @@ void set_checkpoint(VkCommandBuffer cmd, uint32_t i, uint32_t seq) {
         vkCmdSetCheckpointNV(cmd, (void*)(uintptr_t)(i + 1));
     }
 }
-void checkpoint(VkCommandBuffer cmd, const Program& p, char kind) {
+void checkpoint(VkCommandBuffer cmd, const Program& p, char kind, const Targets* at = nullptr) {
     if (!checkpoints_on()) return;
     const uint32_t seq = ++checkpoint_n, i = (seq - 1) & 0xFFFF;
     checkpoints[i] = {p.key, texture_frame_no(), seq, kind};
+    if (checkpoint_draws) {   // (the slot is this marker's alone: no lock)
+        CheckpointDraw& c = checkpoint_draws[i];
+        c = CheckpointDraw{};
+        if (at) {
+            c.width = at->width, c.height = at->height, c.c0_format = at->n ? (uint32_t)at->color_format[0] : 0;
+            c.c0 = at->n && at->color[0] ? at->color[0]->id : 0;
+            c.depth = at->depth ? at->depth->id : 0, c.depth_format = (uint32_t)at->depth_format;
+            for (const Texture* t : gfx_sampled()) {   // (this draw's: set from its descriptors just before)
+                if (c.n == 6) break;
+                c.s[c.n++] = {t->id, (uint32_t)t->format, (uint16_t)t->width, (uint16_t)t->height, (uint16_t)t->depth,
+                              (uint8_t)t->type, (uint8_t)std::min<uint32_t>(t->layers, 255)};
+            }
+        }
+    }
     set_checkpoint(cmd, i, seq);
 }
 const char* checkpoint_kind(char c) {
@@ -3076,7 +3137,7 @@ const char* checkpoint_kind(char c) {
 thread_local uint64_t fallback_payload_address = 0, fallback_records_address = 0;   // (the draw's fallback buffers)
 
 void push_constants(VkCommandBuffer cmd, const Program& p, const Targets* at) {
-    checkpoint(cmd, p, at ? 'd' : 'c');
+    checkpoint(cmd, p, at ? 'd' : 'c', at);
     if (!p.uses_push) return;   // (most programs read none: a push a draw was ~5% of the replay's commands)
     FINE_N(FC_PUSHC, 1);
     uint8_t data[kPushSize]{};
@@ -3138,6 +3199,7 @@ void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind) {
     if (!checkpoints_on()) return;
     const uint32_t seq = ++checkpoint_n, i = (seq - 1) & 0xFFFF;
     checkpoints[i] = {key, texture_frame_no(), seq, kind};
+    if (checkpoint_draws) checkpoint_draws[i] = CheckpointDraw{};
     set_checkpoint(cmd, i, seq);
 }
 
@@ -3176,6 +3238,7 @@ void buffer_markers_init() {
         return;
     }
     std::memset(words, 0, size);
+    checkpoint_draws.reset(new CheckpointDraw[1 << 16]);
     marker_buffer = buffer;
     marker_words = (volatile uint32_t*)words;
     logf("vk: RX_VK_CHECKPOINTS: VK_AMD_buffer_marker, a marker before each draw and dispatch (memory type %u)", type);
@@ -3187,25 +3250,64 @@ void buffer_markers_report(const char* why = "device lost") {
     const uint32_t n = checkpoint_n.load(), first = n > 0xFFFF ? n - 0xFFFF : 1;
     uint32_t reached = 0, last_done = 0;
     std::vector<uint32_t> stuck;
-    for (uint32_t s = first; s && s <= n; s++) {
+    // (0: not reached; 1: reached, the work before it not finished; 2: the work before it finished)
+    const auto state = [](uint32_t s) -> int {
         const uint32_t i = (s - 1) & 0xFFFF;
-        const bool r = marker_words[2 * i] == s, d = marker_words[2 * i + 1] == s;
-        reached += r;
-        if (d) last_done = s;
-        else if (r) stuck.push_back(s);
+        return marker_words[2 * i + 1] == s ? 2 : marker_words[2 * i] == s ? 1 : 0;
+    };
+    for (uint32_t s = first; s && s <= n; s++) {
+        const int st = state(s);
+        reached += st != 0;
+        if (st == 2) last_done = s;
+        else if (st == 1) stuck.push_back(s);
     }
     logf("vk: %s: %u markers set, %u reached; the last whose earlier work all finished: %u", why, n, reached, last_done);
-    const auto line = [](const char* what, uint32_t s) {
-        const Checkpoint& k = checkpoints[(s - 1) & 0xFFFF];
-        logf("vk:   %s: marker %u (%s %016llx, frame %llu)", what, s, checkpoint_kind(k.kind), (unsigned long long)k.prog,
-             (unsigned long long)k.frame);
+    // (relink, issue 7: a report listed the markers after the last finished one as "running" though none was reached, and
+    // read as if the two dispatches after the hung draw were running too. Each line now says what its marker's words say, and
+    // a draw's line its targets and the GPU-written textures it samples (#id, as RX_VK_LOG_IMG and the pass traces name them))
+    const auto line = [&state](const char* what, uint32_t s) {
+        const uint32_t i = (s - 1) & 0xFFFF;
+        const Checkpoint& k = checkpoints[i];
+        static const char* const states[] = {"not reached", "reached, earlier work NOT done", "earlier work done"};
+        char extra[480] = "";
+        if (checkpoint_draws && k.kind == 'd' && checkpoint_draws[i].width) {
+            const CheckpointDraw& c = checkpoint_draws[i];
+            int m = snprintf(extra, sizeof extra, "; into %ux%u, colour #%u (vk %u), depth #%u (vk %u)", c.width, c.height, c.c0,
+                             c.c0_format, c.depth, c.depth_format);
+            for (uint32_t j = 0; j < c.n && m > 0 && m < 400; j++)
+                m += snprintf(extra + m, sizeof extra - m, "%s #%u %ux%ux%u%s vk %u", j ? "," : "; samples", c.s[j].id,
+                              (unsigned)c.s[j].w, (unsigned)c.s[j].h, c.s[j].type == VK_IMAGE_TYPE_3D ? (unsigned)c.s[j].d
+                                                                                                   : (unsigned)c.s[j].layers,
+                              c.s[j].type == VK_IMAGE_TYPE_3D ? " 3D" : "", c.s[j].format);
+        }
+        logf("vk:   %s: marker %u [%s] (%s %016llx, frame %llu)%s", what, s, states[state(s)], checkpoint_kind(k.kind),
+             (unsigned long long)k.prog, (unsigned long long)k.frame, extra);
     };
-    for (uint32_t s = last_done > 6 ? last_done - 6 : 1; last_done && s < last_done; s++) line("finished before", s);
+    for (uint32_t s = last_done > 6 ? last_done - 6 : 1; last_done && s < last_done; s++) line("before", s);
     // (from the last finished marker to the first reached one whose earlier work did not finish: what the GPU was running)
     const uint32_t start = last_done ? last_done : first;
     const uint32_t end = std::max(start, stuck.empty() ? start + 8 : std::min(stuck.front(), start + 16));
-    for (uint32_t s = start; s && s <= end && s <= n; s++) line(s == last_done ? "RUNNING after" : "running", s);
+    for (uint32_t s = start; s && s <= end && s <= n; s++) line(s == last_done ? "RUNNING after" : "after", s);
     for (size_t j = 0; j < stuck.size() && j < 12; j++) line("reached, earlier work unfinished", stuck[j]);
+    if (stuck.empty() && last_done)
+        logf("vk:   no marker was reached with its earlier work unfinished: the GPU stopped in the work recorded right after marker "
+             "%u in its command buffer (the draw or dispatch it names, then any barrier, copy or end of pass before the next "
+             "marker)", last_done);
+    {   // (markers numbered below the last finished one and never reached. With the parallel replay the workers number their
+        // segments' markers side by side, so the highest finished marker can be a segment the GPU ran before the one that hung:
+        // the hang may then be just before the lowest of these, in a segment of its own (the draws of one pass share their
+        // targets: the #ids tell the segments apart). In a serial replay: another command buffer, submitted later)
+        uint32_t below = 0;
+        std::vector<uint32_t> lowest;
+        for (uint32_t s = first; s && s < last_done; s++)
+            if (!state(s) && below++ < 4) lowest.push_back(s);
+        if (below) {
+            logf("vk:   %u markers numbered below %u were never reached (RX_VK_PARALLEL=0 numbers them in the order the GPU runs "
+                 "them); the six before the lowest, then the lowest:", below, last_done);
+            for (uint32_t s = lowest[0] > 6 ? lowest[0] - 6 : 1; s < lowest[0]; s++) line("before the lowest never reached", s);
+            for (const uint32_t s : lowest) line("never reached", s);
+        }
+    }
     // (relink, 15/11) With the parallel replay the markers are numbered as each worker records, so "the last whose earlier work
     // all finished" can be another command buffer's (an RTX 5080's report: the last done 1710626, reached and unfinished from
     // 1709970). Within one command buffer the numbers do run in order: the lowest marker reached and not finished is the most
@@ -3223,6 +3325,20 @@ void buffer_markers_report(const char* why = "device lost") {
 } // namespace
 
 void draw_records_log(uint64_t lo, uint64_t hi);
+// (relink, issues 6, 7 and 27) RX_VK_PASS_TRACE=1: when the GPU hangs, the last frames' passes and dispatches in stream order go to
+// relink_passes_hang.txt beside the game, once: the pass the hung draw was in, and what wrote the textures it read
+static void hang_pass_trace() {
+    static std::atomic<bool> written{false};
+    if (!pass_trace_on() || written.exchange(true)) return;
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    std::string path(exe, n);
+    path = path.substr(0, path.find_last_of("\\/") + 1) + "relink_passes_hang.txt";
+    const uint64_t f = texture_frame_no();
+    pass_traces_write(path.c_str(), f > 7 ? f - 7 : 0, f);
+    logf("vk: the passes of frames %llu to %llu written to relink_passes_hang.txt (RX_VK_PASS_TRACE)",
+         (unsigned long long)(f > 7 ? f - 7 : 0), (unsigned long long)f);
+}
 // (relink, issue 7) the GPU finished nothing for `seconds` while work waited on it, the device not lost (yet): an RTX 5070 Ti
 // stopped this way in the water and never reported a loss, so neither report above ever ran. Once a run: with the buffer
 // markers (RX_VK_CHECKPOINTS=marker) what the GPU was running; without them, the hint that turns them on
@@ -3235,6 +3351,7 @@ void gpu_stall_report(double seconds, uint64_t done, uint64_t waited) {
         const uint64_t f = texture_frame_no();
         draw_records_log(f > 6 ? f - 6 : 0, f);
     }
+    hang_pass_trace();
     if (marker_words) {
         buffer_markers_report("GPU stalled");
         std::lock_guard lk(watch_mu);
@@ -3244,15 +3361,18 @@ void gpu_stall_report(double seconds, uint64_t done, uint64_t waited) {
         logf("vk: GPU stalled: no markers to read (RX_VK_CHECKPOINTS=marker in relink_env.txt names the work that hung)");
     }
 }
+void device_lost_notice();   // (vk_main.cpp)
 void checkpoints_report() {
     static bool done;
     if (done) return;
     done = true;
+    device_lost_notice();
     if (getenv("RX_VK_FAULT_INFO")) device_fault_report();   // (now, while the process is still alive: the faulting address)
     {   // (RX_VK_FLASH_RECORD=<program,...>: those programs' last draws, sizes and all)
         const uint64_t f = texture_frame_no();
         draw_records_log(f > 6 ? f - 6 : 0, f);
     }
+    hang_pass_trace();
     // (checkpoints first: on NVIDIA vkGetDeviceFaultInfoEXT has not come back after a fault, which lost the report)
     logf("vk: device lost: reading %s", dev.checkpoints ? "the checkpoints"
                                         : marker_words ? "the buffer markers"
@@ -5741,6 +5861,47 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                                      program_code_keys(s).c_str());
                 return;
             }
+        // (relink, issues 6, 7 and 27, a diagnosis) RX_VK_SKIP_3D_DRAWS=1: every draw whose program samples a 3D texture left out.
+        // The RTX 50 hangs moved from program to program as programs were left out, always to another draw that reads the
+        // volumes; this leaves them all out at once (much of the lighting goes with them: only a test)
+        static const bool skip_3d = getenv("RX_VK_SKIP_3D_DRAWS") && atoi(getenv("RX_VK_SKIP_3D_DRAWS")) != 0;
+        if (skip_3d) {
+            bool reads_3d = false;
+            for (const Stage& st : cp->stages)
+                for (const auto& td : st.info.texture_descriptors) reads_3d |= td.type == Shader::TextureType::Color3D;
+            if (reads_3d) {
+                static std::atomic<int> told{0};
+                if (told++ < 8) logf("vk: draws of program %016llx left out (RX_VK_SKIP_3D_DRAWS: it samples a 3D texture)",
+                                     (unsigned long long)cp->key);
+                return;
+            }
+        }
+        // (relink, issues 6, 7 and 27, a workaround) RX_VK_SKIP_HALF_PASS=1: the draws of the game's half-resolution HDR pass that
+        // sample a 3D texture left out. Every RTX 50 report made with one recording thread put the hung draw in that pass (an
+        // R11G11B10F target with depth, half the size of the scene's: 768x432 at 1536x864, 960x540 at 1920x1080): Link's body
+        // under the water surface and the two volume boxes already left out. The scene's size is the widest R11G11B10F target
+        // with depth drawn this frame or the one before (the render scale and the upscalers change it)
+        static const bool skip_half = getenv("RX_VK_SKIP_HALF_PASS") && atoi(getenv("RX_VK_SKIP_HALF_PASS")) != 0;
+        if (skip_half && at.n == 1 && at.depth && at.color_format[0] == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+            static std::atomic<uint64_t> w_frame{0};
+            static std::atomic<uint32_t> w_now{0}, w_before{0};
+            const uint64_t f = texture_frame_no();
+            if (w_frame.load(std::memory_order_relaxed) != f && w_frame.exchange(f) != f)
+                w_before.store(w_now.exchange(0));
+            uint32_t seen = w_now.load(std::memory_order_relaxed);
+            while (at.width > seen && !w_now.compare_exchange_weak(seen, at.width)) {}
+            const uint32_t scene_w = std::max(w_now.load(std::memory_order_relaxed), w_before.load(std::memory_order_relaxed));
+            bool reads_3d = false;
+            for (const Stage& st : cp->stages)
+                for (const auto& td : st.info.texture_descriptors) reads_3d |= td.type == Shader::TextureType::Color3D;
+            if (reads_3d && at.width * 2 <= scene_w + 2 && at.width * 3 >= scene_w) {   // (half the scene's width, give or take
+                static std::atomic<int> told{0};                                            // a texel of rounding)
+                if (told++ < 8)
+                    logf("vk: draws of program %016llx left out (RX_VK_SKIP_HALF_PASS: the %ux%u pass, the scene %u wide)",
+                         (unsigned long long)cp->key, at.width, at.height, scene_w);
+                return;
+            }
+        }
     }
     {   // (relink, RX_VK_SKIP_CODE=<code key prefix,...>: the draws of every program with a stage of that native code left out,
         // decided once a program. RX_VK_SKIP_PROG names whole programs; a shared stage is in many. On the Steam Deck (RADV VANGOGH)
@@ -7948,6 +8109,30 @@ void record_draw(const NvnState& s, const Program& p, const DrawArgs& d, const T
                 for (uint64_t j = 0; j < k; j++) h = (h ^ b[j]) * 1099511628211ull;
             n += snprintf(line + n, sizeof line - n, " s%d.c%d %#llx+%#llx h%016llx", ns, i + 3, (unsigned long long)u.addr,
                           (unsigned long long)u.size, (unsigned long long)h);
+        }
+    }
+    {   // (relink, issues 6, 7 and 27) RX_VK_RECORD_WORDS=<cbuf>:<word>,...: those uniform words, as the draw's stages have them
+        // bound (c15:452 is the light count the hung RTX 50 draws' only loop is clamped to; c6:452 the same in the 3070's): a
+        // loop that ran to its 8192-turn guard would need such a word in the thousands
+        static const std::vector<std::pair<int, int>> words = [] {
+            std::vector<std::pair<int, int>> v;
+            if (const char* e = getenv("RX_VK_RECORD_WORDS"))
+                for (const char* q = e; *q;) {
+                    int c = 0, w = 0;
+                    if (sscanf(q, "%d:%d", &c, &w) == 2 && c >= 3 && c < 19 && w >= 0) v.push_back({c, w});
+                    while (*q && *q != ',') q++;
+                    if (*q) q++;
+                }
+            return v;
+        }();
+        for (const Stage& st : p.stages) {
+            const int ns = std::clamp(st.nvn_stage, 0, kNvnStages - 1);
+            for (const auto& [c, w] : words) {
+                const nvn_p_bind_buf& u = s.ubo[ns][c - 3];
+                uint32_t v = 0;
+                if (n < 960 && u.addr && (!u.size || 4ull * w + 4 <= u.size) && host->gpu_read(u.addr + 4ull * w, &v, 4))
+                    n += snprintf(line + n, sizeof line - n, " s%d.c%d[%d]=%u", ns, c, w, v);
+            }
         }
     }
     {
