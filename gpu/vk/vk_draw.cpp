@@ -753,23 +753,43 @@ bool pipelines_lean() {
 // every compute variant the program cache keeps, 10328 of them in OoT, most of them texture variants no area uses: 2.8 GB of
 // the driver's memory (lean with all of them: arenas 3.8 GB against 1.0 GB with none, hs1910). A program not in the list yet
 // is built at its first dispatch on a worker, the dispatch waiting 50 ms at most (dispatch(), below), and is in it from then on.
+//
+// (relink, 0.7.8) THE SHIPPED LIST. A new install has no list of its own, and neither has a PC that ran the full start until
+// 0.7.5 (it made every compute pipeline before the game, so play never noted one): their first minutes of play built each
+// compute program's pipeline at its first dispatch, cold on a driver whose cache lacks it (0.5 to 6 s each on NVIDIA), and
+// left its dispatches out meanwhile (lighting volumes, culling, exposure). The release ships the list of a play of the game,
+// relink_computes_shipped.bin beside the executable (nx2/make_game.py: work/computes.bin, a copy of a played folder's
+// relink_computes.bin, the same format), and a lean start builds the programs of both lists before the game. A key is the
+// compute stage's code key (vk_shader.cpp code_key, program_pick: a hash of the game's own control section and code), so it is
+// the same on every PC and in every build of the back end; the precompile builds every variant the program cache keeps of a
+// listed program (2406 keys made 5030 pipelines on the bench). A key the program cache does not hold (a program the seed does
+// not have, another version of the game) is passed over at no cost: that program is translated and built at its first
+// dispatch, as before. relink_computes.bin stays this PC's own: play notes in it what it builds, whatever the shipped list
+// says. RX_VK_NO_SHIPPED_COMPUTES=1: the shipped list is not read
 std::mutex computes_used_mu;
 std::unordered_set<uint64_t> computes_used;
 bool computes_used_read = false;
-std::string computes_used_path() {
+std::string computes_list_path(const char* name) {
     char exe[MAX_PATH];
     const DWORD n = game_module_path(exe, MAX_PATH);
     std::string dir(exe, n);
-    return dir.substr(0, dir.find_last_of("\\/") + 1) + "relink_computes.bin";
+    return dir.substr(0, dir.find_last_of("\\/") + 1) + name;
+}
+std::string computes_used_path() { return computes_list_path("relink_computes.bin"); }
+/// A compute list's keys (8 bytes each) into keys; how many the file held (0: none, or no file)
+size_t computes_list_add(const std::string& path, std::unordered_set<uint64_t>& keys) {
+    size_t n = 0;
+    if (FILE* f = fopen(path.c_str(), "rb")) {
+        uint64_t key = 0;
+        while (fread(&key, 8, 1, f) == 1) keys.insert(key), n++;
+        fclose(f);
+    }
+    return n;
 }
 void computes_used_load() {   // (computes_used_mu held)
     if (computes_used_read) return;
     computes_used_read = true;
-    if (FILE* f = fopen(computes_used_path().c_str(), "rb")) {
-        uint64_t key = 0;
-        while (fread(&key, 8, 1, f) == 1) computes_used.insert(key);
-        fclose(f);
-    }
+    computes_list_add(computes_used_path(), computes_used);
 }
 void compute_used_note(uint64_t key) {
     std::lock_guard lk(computes_used_mu);
@@ -7467,10 +7487,21 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     if (!lean) notes = pipe_notes_read();
     std::unordered_set<uint64_t> wanted;
     for (const auto& n : notes) wanted.insert(n->prog);
-    if (lean) {   // (the compute programs play has used, not every kept one: compute_used_note)
-        std::lock_guard lk(computes_used_mu);
-        computes_used_load();
-        wanted = computes_used;
+    size_t listed_here = 0, listed_shipped = 0;
+    if (lean) {   // (the compute programs play has used, not every kept one: compute_used_note; and the shipped list's)
+        {
+            std::lock_guard lk(computes_used_mu);
+            computes_used_load();
+            wanted = computes_used;
+        }
+        listed_here = wanted.size();
+        static const bool no_shipped = getenv("RX_VK_NO_SHIPPED_COMPUTES") != nullptr;
+        if (!no_shipped) {
+            std::unordered_set<uint64_t> shipped;
+            computes_list_add(computes_list_path("relink_computes_shipped.bin"), shipped);
+            listed_shipped = shipped.size();
+            wanted.insert(shipped.begin(), shipped.end());
+        }
     }
     std::vector<Program*> computes;
     const size_t programs_n = program_cache_load_some(wanted, [&](Program& p) {
@@ -7478,6 +7509,13 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         if (p.compute) computes.push_back(&p);
     }, !lean);
     const double read_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (lean) {
+        std::unordered_set<uint64_t> found;
+        for (const Program* p : computes) found.insert(p->key);
+        logf("vk: compute lists: %zu programs (%zu shipped, %zu from this PC's play), %zu of them in the program cache: their %zu "
+             "pipelines made before the game, the others' at their first dispatch%s", wanted.size(), listed_shipped, listed_here,
+             found.size(), computes.size(), getenv("RX_VK_NO_SHIPPED_COMPUTES") ? " (RX_VK_NO_SHIPPED_COMPUTES: the shipped list not read)" : "");
+    }
     const size_t total = notes.size() + computes.size();
     // (the workers' state on the heap: a start whose last pipelines never finish (two of 4926 on an RX 5700 XT, "stuck at
     // 99%", Discord 11-08) goes on to the game after PRE_STALL_S seconds with no progress, the stragglers left running; it is
