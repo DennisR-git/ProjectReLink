@@ -285,6 +285,32 @@ def check_supported_build(exefs):
         fail("This is build %s. ReLink supports build %s." % (bid[:8], BUILD_ID))
 
 
+ROMFS_TABLE = "ResourceSizeTable.Product.111.Nin_Ounce_NVN2.rsizetable.zs"   # (the supported version's, in System/Resource)
+
+
+def romfs_problem(romfs):
+    """(issue 26) Why a romfs folder chosen by hand is not the supported game's RomFS, or None. A romfs taken from another PC
+    port's folder (a few packed .bin files, no subfolders) was accepted, built for 40 minutes, and the game died in its first
+    second: its own allocator returned null. The game's RomFS has System/Resource/<the table above> and hundreds of folders"""
+    res = os.path.join(romfs, "System", "Resource")
+    if os.path.isfile(os.path.join(res, ROMFS_TABLE)):
+        return None
+    others = sorted(f for f in os.listdir(res) if f.startswith("ResourceSizeTable")) if os.path.isdir(res) else []
+    if others:
+        return ("The romfs folder %s is from another version of the game (%s). ReLink needs the version whose romfs has "
+                "System\\Resource\\%s: dump the game with its update applied, and use that romfs with the exefs from the same "
+                "dump." % (romfs, others[0], ROMFS_TABLE))
+    try:
+        top = os.listdir(romfs)
+    except OSError:
+        top = []
+    folders = sum(os.path.isdir(os.path.join(romfs, t)) for t in top)
+    return ("The romfs folder %s is not the game's own RomFS: it has no System\\Resource\\%s (at its top: %d files, %d folders; "
+            "the game's has hundreds of folders). Folders taken from another PC port or tool hold the game in their own format "
+            "and do not work here. Use your own dump of the game: the .nup file, or the romfs and exefs folders dumped from it."
+            % (romfs, ROMFS_TABLE, len(top) - folders, folders))
+
+
 def check_cache_paths(out, paths):
     """Resolve generated paths and reject symbolic links/reparse points before replacement."""
     root = os.path.realpath(out)
@@ -327,6 +353,10 @@ def check(a, work):
         shutil.rmtree(probe, ignore_errors=True)
     else:
         bid = build_id(os.path.join(a.exefs, "main"))
+        why = romfs_problem(a.romfs) if a.romfs else None
+        if why:
+            say("check", "bad", why)
+            return
     if bid.startswith(BUILD_ID):
         say("check", "ok", "This is the version ReLink supports (build %s)." % bid[:8])
     else:
@@ -1090,6 +1120,9 @@ def main(a=None):
                 f.write(stamp + chr(10))
         check_modules(exefs)
     else:
+        why = romfs_problem(a.romfs)   # (issue 26: said before anything is read or built)
+        if why:
+            fail(why)
         shutil.copytree(a.exefs, exefs)   # (unpacked in place: the user's copy stays as it is)
         run(PY + ["nx2/unpack.py", exefs])
         link_or_copy(a.romfs, romfs)
