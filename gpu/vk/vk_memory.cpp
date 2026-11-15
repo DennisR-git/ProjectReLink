@@ -2018,13 +2018,43 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
         // with 8 ms, 31.7 with 4: below ~20 ms the cut waits are the ones the exposure needs). Market while the camera turns: no
         // change (turn_waitmax_1115: waits over 20 ms are rare there)
         static const int wait_max_ms = getenv("RX_VK_CAPTURE_WAIT_MAX_MS") ? std::max(0, atoi(getenv("RX_VK_CAPTURE_WAIT_MAX_MS"))) : 20;
+        // (relink, issue 29) the cap follows the GPU. 20 ms was measured on an RTX 3060 Ti, whose waits here are a few ms; on a
+        // card whose frames take longer than the cap (a laptop RTX 3050 Ti near 20 fps) nearly every wait that the exposure
+        // needs would be cut, the game would read its exposure sums before the GPU wrote them, and the picture would flash
+        // white. The cap is the larger of RX_VK_CAPTURE_WAIT_MAX_MS and four times a running estimate of the long waits (over the
+        // waits that had to wait, from half the cap: up 0.9 ms when a wait takes longer than it, 2 ms when a wait is cut, down
+        // 0.1 ms otherwise), at most 250 ms. A stall of a few frames, as at Hyrule Castle's arrival, moves it a little; a card
+        // whose usual wait is over the cap raises it within a second or two. MEASURED (expo_ab, the player's save, the cap at
+        // 4 ms to stand for a card whose waits are over it): exposure steps 29.4 a thousand with the fixed cap, 6.4 with twice
+        // the estimate, 2.5 with four times (RX_VK_CAPTURE_WAIT_K; as with no cap: 1.7-2.5). Hyrule Castle's arrival (arrive_ab,
+        // castle_adapt_1115): time lost in frames of 40 ms and more 1011 / 872 ms fixed, 841 / 776 adaptive (the longest frame
+        // 191 / 169 -> 219 / 225 ms). RX_VK_CAPTURE_WAIT_ADAPT=0: the fixed cap, as in 0.7.4
+        static const bool adapt = !getenv("RX_VK_CAPTURE_WAIT_ADAPT") || atoi(getenv("RX_VK_CAPTURE_WAIT_ADAPT")) != 0;
+        static std::atomic<int64_t> p90_us{(int64_t)wait_max_ms * 500};
         if (wait_max_ms > 0) {
             static std::atomic<int64_t> st_waits{0}, st_cut{0};
-            const bool done = vk_timeline_wait_for(c->late_value, (uint32_t)wait_max_ms);
+            const int64_t p90 = p90_us.load(std::memory_order_relaxed);
+            static const int64_t k = getenv("RX_VK_CAPTURE_WAIT_K") ? std::clamp(atoi(getenv("RX_VK_CAPTURE_WAIT_K")), 1, 16) : 4;
+            const int cap_ms = adapt ? (int)std::clamp<int64_t>(k * p90 / 1000, wait_max_ms, std::max(wait_max_ms, 250)) : wait_max_ms;
+            const bool must_wait = adapt && vk_timeline_completed() < c->late_value;
+            const auto c0 = std::chrono::steady_clock::now();
+            const bool done = vk_timeline_wait_for(c->late_value, (uint32_t)cap_ms);
+            if (must_wait) {
+                const int64_t took = done ? std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - c0).count()
+                                          : (int64_t)cap_ms * 1000;
+                if (!done) p90_us.fetch_add(2000, std::memory_order_relaxed);
+                else if (took > p90) p90_us.fetch_add(900, std::memory_order_relaxed);
+                else if (p90_us.fetch_sub(100, std::memory_order_relaxed) < 100) p90_us.store(0, std::memory_order_relaxed);
+                static std::atomic<bool> told{false};   // (once: a card slower than the cap, for the players' logs)
+                if (cap_ms >= 2 * wait_max_ms && !told.exchange(true))
+                    logf("vk: captures' waits for late pages: the cap follows a slower GPU, now %d ms (RX_VK_CAPTURE_WAIT_MAX_MS %d)",
+                         cap_ms, wait_max_ms);
+            }
             st_cut += !done;
             if (++st_waits % 1200 == 0)
-                logf("vk: captures' waits for late pages: %lld, %lld of them cut at %d ms (RX_VK_CAPTURE_WAIT_MAX_MS)",
-                     (long long)st_waits.load(), (long long)st_cut.load(), wait_max_ms);
+                logf("vk: captures' waits for late pages: %lld, %lld of them cut; the cap now %d ms (RX_VK_CAPTURE_WAIT_MAX_MS %d%s, "
+                     "the waits' 90th percentile %.1f ms)", (long long)st_waits.load(), (long long)st_cut.load(), cap_ms,
+                     wait_max_ms, adapt ? "" : ", fixed", p90_us.load() / 1000.0);
         } else {
             vk_timeline_wait(c->late_value);
         }
