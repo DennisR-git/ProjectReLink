@@ -80,6 +80,73 @@ void logf(const char* fmt, ...) {
 
 namespace {
 
+// (relink, issue 43) A driver that faults in vkCreateShaderModule. On an RX 570 (Polaris, AMD's driver 2.0.220 and 2.0.279) the
+// game closed with no message during its first shader preparation: six "CRASH ... at amdvlk64.dll" lines at once, one per
+// preparation worker, after the step that builds pipelines had been left out ("the last start did not finish the driver's part"),
+// so the only driver call left there is vkCreateShaderModule (vk_shader.cpp make_module), which no guard covered (pipelines have
+// guarded_graphics / guarded_compute). Its pointer goes through this guard now: a fault is that shader failing (the translator
+// takes a null module for a failed program), logged with the SPIR-V kept beside the game for us (the first two), and said once in
+// a box, with what it likely means on a GPU below the minimum. RX_VK_NO_MODULE_GUARD=1: the driver's pointer as before
+bool amd_gcn = false;   // (an AMD GPU with only 64-lane subgroups and no mesh shaders: GCN, RX 400 / 500 / Vega; create_device)
+#ifdef _WIN32
+PFN_vkCreateShaderModule driver_create_shader_module = nullptr;
+std::atomic<int> module_faults{0};
+__declspec(noinline) VkResult module_call(VkDevice d, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* a,
+                                          VkShaderModule* m, int* faulted) {
+    __try {
+        return driver_create_shader_module(d, ci, a, m);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_ILLEGAL_INSTRUCTION ||
+                        GetExceptionCode() == EXCEPTION_INT_DIVIDE_BY_ZERO ? 1 : 0) {
+        *faulted = 1;
+        return VK_ERROR_UNKNOWN;
+    }
+}
+void module_fault(const VkShaderModuleCreateInfo* ci) {
+    const int n = ++module_faults;
+    char saved[MAX_PATH + 48] = "";
+    if (n <= 2 && ci && ci->pCode && ci->codeSize) {   // (the SPIR-V the driver could not take: spirv-val / spirv-dis it here)
+        char path[MAX_PATH];
+        std::string dir(path, game_module_path(path, MAX_PATH));
+        dir = dir.substr(0, dir.find_last_of("\\/") + 1);
+        snprintf(saved, sizeof saved, "%srelink_driver_fault_%d.spv", dir.c_str(), n);
+        if (FILE* f = fopen(saved, "wb")) fwrite(ci->pCode, 1, ci->codeSize, f), fclose(f);
+        else saved[0] = 0;
+    }
+    if (n <= 8 || (n & (n - 1)) == 0)
+        logf("vk: THE GRAPHICS DRIVER CRASHED reading a shader (vkCreateShaderModule, %zu bytes of SPIR-V%s%s): it is left out "
+             "(%d so far)", ci ? (size_t)ci->codeSize : 0, saved[0] ? ", kept as " : "", saved, n);
+    if (n != 1 || dev.offscreen || getenv("HOS_HEADLESS")) return;
+    std::thread([name = std::string(dev.props.deviceName), old = !dev.mesh_shader] {
+        std::string text = "The graphics driver of your " + name + " crashed while ReLink handed it one of the game's shaders. "
+            "ReLink leaves such shaders out and goes on, but parts of the picture may be missing, and the driver may fail again.";
+        if (old)
+            text += "\n\nThis card has no mesh shaders and is below what ReLink supports (NVIDIA GeForce RTX 20 series or newer, "
+                    "AMD Radeon RX 6000 series or newer, or Intel Arc). Updating its driver is worth a try, but it may not run "
+                    "the game.";
+        text += "\n\nIf you report it on ReLink's GitHub page, please attach relink_log.txt and the relink_driver_fault_1.spv file "
+                "from the game folder.";
+        MessageBoxA(nullptr, text.c_str(), "Project ReLink: graphics driver", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+    }).detach();
+}
+VKAPI_ATTR VkResult VKAPI_CALL guarded_create_shader_module(VkDevice d, const VkShaderModuleCreateInfo* ci,
+                                                            const VkAllocationCallbacks* a, VkShaderModule* m) {
+    int faulted = 0;
+    const VkResult r = module_call(d, ci, a, m, &faulted);
+    if (faulted) {
+        if (m) *m = VK_NULL_HANDLE;
+        module_fault(ci);
+    }
+    return r;
+}
+void guard_shader_modules() {
+    if (getenv("RX_VK_NO_MODULE_GUARD") || !vkx::vkCreateShaderModule) return;
+    driver_create_shader_module = vkx::vkCreateShaderModule;
+    vkx::vkCreateShaderModule = guarded_create_shader_module;
+}
+#else
+void guard_shader_modules() {}
+#endif
+
 bool has_extension(const std::vector<VkExtensionProperties>& all, const char* name) {
     for (const auto& e : all)
         if (!std::strcmp(e.extensionName, name)) return true;
@@ -417,6 +484,7 @@ bool create_device() {
         vkGetPhysicalDeviceProperties2(dev.physical, &p2);
         const bool pin = f13.subgroupSizeControl && sc.minSubgroupSize <= 32 && sc.maxSubgroupSize >= 32 && !getenv("RX_VK_NO_SUBGROUP_PIN");
         dev.sg32_stages = pin ? sc.requiredSubgroupSizeStages : 0;
+        amd_gcn = dev.props.vendorID == 0x1002 && sc.minSubgroupSize == 64 && sc.maxSubgroupSize == 64;   // (issue 43)
         logf("vk: subgroups: default %u lanes, %u-%u, pinned to 32 on stages %#x", sg.subgroupSize, sc.minSubgroupSize, sc.maxSubgroupSize,
              (unsigned)dev.sg32_stages);
     }
@@ -430,6 +498,9 @@ bool create_device() {
     // that write their vertices to buffers, drawn through an ordinary graphics pipeline. It needs buffer device addresses.
     dev.mesh_fallback = !dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
     if (dev.mesh_fallback) logf("vk: no mesh shaders: task and mesh programs run as compute shaders (issue 640 fallback)");
+    if (amd_gcn && !dev.mesh_shader)   // (relink, issue 43)
+        logf("vk: an AMD GCN GPU (Radeon RX 400 / 500 series or Vega: 64-lane subgroups only, no mesh shaders): below what ReLink "
+             "supports (an RX 570's driver closed the game during its shader preparation, issue 43)");
     if (robust) logf("vk: robust buffer access %s", robust_ok ? "on" : "not supported");
     f.features.robustBufferAccess = robust_ok ? VK_TRUE : VK_FALSE;   // (off by default: the game's accesses stay in their buffers)
     dev.features = f.features;
@@ -449,6 +520,7 @@ bool create_device() {
 
 
     load_device(dev.device);
+    guard_shader_modules();   // (relink, issue 43)
     vkGetDeviceQueue(dev.device, dev.queue_family, 0, &dev.queue);
     dev.present_queue = VK_NULL_HANDLE;
     dev.present_family = dev.queue_family;
