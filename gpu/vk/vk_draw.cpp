@@ -3798,6 +3798,24 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
             if (cu != 0 || cs != 0) d.bias[0] += cu, d.bias[2] += cs, d.bias_en = true;
         }
     }
+    {   // (relink, issue 48, a diagnosis) RX_VK_LOG_DEPTH_TARGETS=1: each depth-only target a program draws into, once per size,
+        // format, program and bias: the game's own depth bias and the one drawn with (the characters' shadow maps above). Which maps
+        // the broken pots' shards are drawn into, and whether the rule above takes them
+        static const bool on = getenv("RX_VK_LOG_DEPTH_TARGETS") && atoi(getenv("RX_VK_LOG_DEPTH_TARGETS")) != 0;
+        if (on && at.n == 0 && at.depth) {
+            const uint64_t prog = cur_program ? cur_program->key : 0;
+            const uint64_t k = prog * 0x9e3779b97f4a7c15ull ^ (uint64_t)at.width << 44 ^ (uint64_t)at.height << 24 ^
+                               (uint64_t)at.depth_format << 2 ^ (uint64_t)(s.poly.offset_en != 0) << 1 ^ (uint64_t)(d.bias_en != 0);
+            static std::mutex m;
+            static std::unordered_set<uint64_t> seen;
+            std::lock_guard lk(m);
+            if (seen.size() < 300 && seen.insert(k).second)
+                logf("vk: depth-only target %ux%u format %d, program %016llx: the game's bias %s (units %g clamp %g slope %g), "
+                     "drawn with bias %s (units %g slope %g)", at.width, at.height, (int)at.depth_format, (unsigned long long)prog,
+                     s.poly.offset_en ? "on" : "off", s.poly_offset[1], s.poly_offset[2], s.poly_offset[0], d.bias_en ? "on" : "off",
+                     d.bias[0], d.bias[2]);
+        }
+    }
     d.cull = sw().no_cull ? VK_CULL_MODE_NONE
            : s.poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT
            : s.poly.cull == NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT
