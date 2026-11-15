@@ -850,6 +850,7 @@ struct Targets {
     int n = 0;
     uint32_t width = 0, height = 0;
     VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    uint8_t stand_in = 0;   // (relink, issue 21: colour i bit i, the view a plain image's standing in for a compressed one)
 };
 
 /// A graphics pipeline: built on a worker (vk_jobs.h); ready once pipeline is set (null: it failed)
@@ -3471,6 +3472,7 @@ struct Pass {
     std::vector<const Texture*> sampled;   // (rendered textures its draws sampled: a target among them is a hazard)
     uint16_t sampled_targets = 0;          // (colour i bit i, depth bit 8: targets earlier draws sampled)
     uint16_t written = 0;                  // (its targets written so far: colour i bit i, depth bit 8)
+    uint8_t stand_in = 0;                  // (relink, issue 21: colour i bit i, a stand-in copied back at its end)
 };
 TLS_OBJECT(pass, Pass)
 thread_local bool work_since_barrier = false;   // (GPU work recorded since the last full barrier: a dispatch orders after it)
@@ -3524,7 +3526,11 @@ Targets targets(NvnState& s) {
         // (a raw view of a compressed target is one texel a block: its extent in blocks. The texels'
         // 64 x 64 over the 16 x 16 view of OoT's noise volumes put the render area past the attachment)
         const auto bc = [](VkFormat x) { return x >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && x <= VK_FORMAT_BC7_SRGB_BLOCK; };
-        if (bc(tex->format) && !bc(f)) w = (w + 3) / 4, h = (h + 3) / 4;
+        if (bc(tex->format) && !bc(f)) {
+            w = (w + 3) / 4, h = (h + 3) / 4;
+            // (relink, issue 21: a plain image of that size stands in for it, copied in and out around the pass)
+            if (texture_is_stand_in(tex, view)) at.stand_in |= (uint8_t)(1u << i);
+        }
         at.width = at.width ? std::min(at.width, w) : w;
         at.height = at.height ? std::min(at.height, h) : h;
         at.samples = tex->samples;
@@ -3534,6 +3540,7 @@ Targets targets(NvnState& s) {
         for (int j = 0; j < i; j++)
             if (at.color_view[i] && at.color_view[i] == at.color_view[j]) {
                 at.color[i] = nullptr, at.color_view[i] = VK_NULL_HANDLE, at.color_format[i] = VK_FORMAT_UNDEFINED;
+                at.stand_in &= (uint8_t)~(1u << i);
                 break;
             }
     while (at.n > 0 && !at.color[at.n - 1]) at.n--;   // (trailing empty targets)
@@ -3585,6 +3592,12 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     end_pass(cmd);
     full_barrier(cmd, "barrier (pass start)");   // (what the pass before wrote, and the transfers before it)
     work_since_barrier = true;
+    if (at.stand_in) {   // (relink, issue 21) what the compressed targets hold, into the images that stand in for them
+        for (int i = 0; i < at.n; i++)
+            if (at.stand_in >> i & 1) texture_stand_in_copy(cmd, at.color[i], at.color_view[i], true);
+        full_barrier(cmd, "barrier (stand-in in)");
+    }
+    pass().stand_in = at.stand_in;
     VkRenderingAttachmentInfo ca[8]{};
     bool marks = !texture_marked(at.depth);
     for (int i = 0; i < at.n && !marks; i++) marks = !texture_marked(at.color[i]);
@@ -4435,6 +4448,13 @@ void end_pass(VkCommandBuffer cmd) {
     if (!pass().open) return;
     vkCmdEndRendering(cmd);
     pass().open = false;
+    if (pass().stand_in) {   // (relink, issue 21) what the pass rendered into stand-ins, back into the compressed targets
+        full_barrier(cmd, "barrier (stand-in out)");
+        for (int i = 0; i < pass().n; i++)
+            if (pass().stand_in >> i & 1) texture_stand_in_copy(cmd, pass().tex[i], pass().color[i], false);
+        full_barrier(cmd, "barrier (stand-in out)");
+        pass().stand_in = 0;
+    }
     if (dump_on() && !dump_mesh_indirect().empty()) {
         for (const auto& [key, addr] : dump_mesh_indirect()) {
             const BufferRef r = gpu_buffer_bind(addr, 16, false);
@@ -5847,7 +5867,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         // the device was lost (7 of 14), and it was left out always. Left out, the volumes stayed zero and the foliage's LOD
         // crossfade, which is dithered by that noise, cut hard: trees bare at mid distance. Where the driver takes the usage
         // (vk_texture.cpp) the views are made and the pass is sized in blocks (targets()); it runs there, and is still left out
-        // where they are not)
+        // where they are not. (relink, issue 21) Those raw views lost the device on an RTX 4070 at every new game: plain images
+        // stand in for the volumes' slices now, copied into them after each pass (vk_texture.cpp stand_in_view), so the views
+        // are made on every driver and the pass runs; RX_VK_RAW_TARGET_VIEWS=1: the raw views as before)
         static const bool default_list = !getenv("RX_VK_SKIP_PROG");
         if (default_list && cp->key == 0x53509044401d78d2ull && !at.n) {
             static std::atomic<int> told{0};

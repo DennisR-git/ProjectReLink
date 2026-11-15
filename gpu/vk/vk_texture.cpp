@@ -1648,6 +1648,100 @@ bool texture_dirty(Texture& tex, uint32_t gen, Ranges& out) {
     return !out.empty();
 }
 
+// ---- (relink, issue 21, 2026-11-15) compressed images rendered into: a plain image stands in ----
+// OoT fills the slices of two 64^3 BC4 noise volumes (53509044401d78d2, while an area loads) by rendering into them as RGBA16UI
+// targets, one texel a block. Those were raw views of the compressed image itself as colour attachments: a usage the drivers
+// need not support (AMD's refuses it for 2D BC images; 3D ones were made with it on the driver's word for 2D), and on an RTX 4070
+// the device was lost in that pass at every new game (issue 21: the NV checkpoints of both stages in its draws, gone with the
+// program left out; this RTX 3060 Ti ran it without a loss). Now a plain 2D array image of the view's format, the level's size in
+// blocks, a layer per layer or 3D slice, is the attachment: the pass copies the level's layer into it before its draws and back
+// after (begin_pass / end_pass, vk_draw.cpp). Both are size-compatible copies between an uncompressed and a compressed format
+// (8 or 16 bytes a texel and a block, vkCmdCopyImage), 3D slices against 2D array layers (Vulkan 1.1): what every driver must do.
+// The compressed image needs no attachment usage then. Only levels of whole blocks (64 x 64: 16 x 16). RX_VK_RAW_TARGET_VIEWS=1:
+// the raw views as before
+bool stand_ins_on() {
+    static const bool on = !getenv("RX_VK_RAW_TARGET_VIEWS") || atoi(getenv("RX_VK_RAW_TARGET_VIEWS")) == 0;
+    return on;
+}
+std::mutex stand_in_mu;   // (a parallel replay's segments make and use them at once)
+/// The stand-in view of level `level`, layer (a 3D image's slice) `layer`, in format f; null where none is made (the raw view of
+/// the image itself is tried then)
+VkImageView stand_in_view(Texture* tex, VkFormat f, uint32_t level, uint32_t layer) {
+    const uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
+    const uint32_t layers = tex->type == VK_IMAGE_TYPE_3D ? std::max(1u, tex->depth >> level) : tex->layers;
+    if ((w & 3) || (h & 3) || layer >= layers || tex->sparse || tex->samples != VK_SAMPLE_COUNT_1_BIT ||
+        tex->aspect != VK_IMAGE_ASPECT_COLOR_BIT || !(format_props(f).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+        return VK_NULL_HANDLE;
+    std::lock_guard lk(stand_in_mu);
+    Texture::StandIn* s = nullptr;
+    for (Texture::StandIn& x : tex->stand_ins)
+        if (x.level == level && x.format == f) s = &x;
+    if (!s) {
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.format = f;
+        ci.extent = {w / 4, h / 4, 1};
+        ci.mipLevels = 1;
+        ci.arrayLayers = layers;
+        ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        Texture::StandIn n;
+        n.level = level, n.format = f;
+        if (!create_image(ci, n.image, n.allocation)) {
+            static int told;
+            if (told++ < 4) logf("vk: no stand-in image for texture #%u (vk %d as vk %d, level %u)", tex->id, (int)tex->format, (int)f, level);
+            return VK_NULL_HANDLE;
+        }
+        n.views.assign(layers, VK_NULL_HANDLE);
+        {   // (into GENERAL, as every image: in queue order, as a new texture's)
+            InitRedirect redirect;
+            VkCommandBuffer cmd = upload_cmd();
+            VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+            b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = n.image;
+            b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+            VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+            di.imageMemoryBarrierCount = 1;
+            di.pImageMemoryBarriers = &b;
+            vkCmdPipelineBarrier2(cmd, &di);
+            redirect.done();
+        }
+        tex->stand_ins.push_back(std::move(n));
+        s = &tex->stand_ins.back();
+        static int told;
+        if (told++ < 8)
+            logf("vk: texture #%u %ux%ux%u (vk %d) rendered as vk %d, level %u: a %ux%u x%u image stands in for it, copied in and "
+                 "out around each pass (RX_VK_RAW_TARGET_VIEWS=1: raw views of it as before)", tex->id, tex->width, tex->height,
+                 tex->depth, (int)tex->format, (int)f, level, w / 4, h / 4, layers);
+    }
+    VkImageView& v = s->views[layer];
+    if (!v) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = s->image;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = f;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1};
+        if (vkCreateImageView(dev.device, &vi, nullptr, &v) != VK_SUCCESS) v = VK_NULL_HANDLE;
+    }
+    return v;
+}
+/// The stand-in a view is of, and its layer (stand_in_mu held)
+Texture::StandIn* stand_in_of(Texture* tex, VkImageView view, uint32_t* layer) {
+    for (Texture::StandIn& s : tex->stand_ins)
+        for (uint32_t i = 0; i < (uint32_t)s.views.size(); i++)
+            if (s.views[i] == view) {
+                *layer = i;
+                return &s;
+            }
+    return nullptr;
+}
+
 uint64_t destroy_gen = 1;   // (bumped when textures go: what was resolved to them goes stale)
 
 void destroy_later(Texture& tex) {
@@ -1659,6 +1753,16 @@ void destroy_later(Texture& tex) {
     if (!tex.sparse && tex.image && tex.ci.sType == VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO) d.ci = tex.ci, d.bytes = tex.bytes;
     dead.push_back(std::move(d));
     total_bytes -= std::min(total_bytes, tex.bytes + tex.pad);
+    {   // (relink, issue 21: its stand-ins with it, never recycled)
+        std::lock_guard lk(stand_in_mu);
+        for (Texture::StandIn& s : tex.stand_ins) {
+            Dead sd{tex.last_value, s.image, s.allocation, {}, {}};
+            for (VkImageView v : s.views)
+                if (v) sd.views.push_back(v);
+            dead.push_back(std::move(sd));
+        }
+        tex.stand_ins.clear();
+    }
 }
 
 void vw_forget(const Texture& t);   // (below: a destroyed texture leaves the list of GPU-written ones)
@@ -1848,7 +1952,9 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         // made, the volumes stayed zero, and the foliage's dithered LOD crossfade, which reads them, left trees bare at mid
         // distance. 3D images take the usage on the driver's word for the 2D one: the query does not cover
         // 2D_ARRAY_COMPATIBLE's per-slice attachment views)
-        if (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
+        // (relink, issue 21: only for the raw views of before, RX_VK_RAW_TARGET_VIEWS=1: a plain image stands in for it as the
+        // attachment now, stand_in_view above)
+        if (!stand_ins_on() && (format_props(raw).optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) {
             // (asked with the flags a 3D image is made with below; a refused image is made again without the usage)
             const VkImageCreateFlags asked = flags | (x.type != VK_IMAGE_TYPE_3D ? 0u
                 : VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | (dev.view_2d_of_3d ? VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT : 0u));
@@ -2579,6 +2685,11 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
     default: break;
     }
     if (tex->type == VK_IMAGE_TYPE_3D && use == ViewUse::Attachment) type = VK_IMAGE_VIEW_TYPE_2D;
+    // (relink, issue 21) a compressed image as a raw colour target: a plain image stands in for it (stand_in_view)
+    if (use == ViewUse::Attachment && is_bc(tex->format) && !is_bc(f) && stand_ins_on()) {
+        if (format_out) *format_out = f;
+        if (const VkImageView sv = stand_in_view(tex, f, level0, layer0)) return sv;
+    }
     VkComponentMapping cm{};
     if (use == ViewUse::Sample) {
         const nvn_texdesc& d = t->d;
@@ -2626,6 +2737,41 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
     }
     tex->views[key] = view;
     return view;
+}
+
+bool texture_is_stand_in(Texture* tex, VkImageView view) {
+    if (!tex || !view) return false;
+    std::lock_guard lk(stand_in_mu);
+    uint32_t layer = 0;
+    return stand_in_of(tex, view, &layer) != nullptr;
+}
+
+bool texture_stand_in_copy(VkCommandBuffer cmd, Texture* tex, VkImageView view, bool into) {
+    if (!tex || !view) return false;
+    VkImage si = VK_NULL_HANDLE;
+    uint32_t level = 0, layer = 0;
+    {
+        std::lock_guard lk(stand_in_mu);
+        const Texture::StandIn* s = stand_in_of(tex, view, &layer);
+        if (!s) return false;
+        si = s->image, level = s->level;
+    }
+    const uint32_t w = std::max(1u, tex->width >> level), h = std::max(1u, tex->height >> level);
+    const bool vol = tex->type == VK_IMAGE_TYPE_3D;
+    // (the compressed image's level, its layer or slice; the stand-in's layer. Between an uncompressed and a compressed image the
+    // extent is the source's texels: the level's texels into the stand-in, its blocks back)
+    const VkImageSubresourceLayers bc_sub{VK_IMAGE_ASPECT_COLOR_BIT, level, vol ? 0u : layer, 1};
+    const VkImageSubresourceLayers si_sub{VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+    const VkOffset3D bc_at{0, 0, vol ? (int32_t)layer : 0};
+    VkImageCopy c{};
+    if (into) {
+        c.srcSubresource = bc_sub, c.srcOffset = bc_at, c.dstSubresource = si_sub, c.extent = {w, h, 1};
+        vkCmdCopyImage(cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, si, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    } else {
+        c.srcSubresource = si_sub, c.dstSubresource = bc_sub, c.dstOffset = bc_at, c.extent = {w / 4, h / 4, 1};
+        vkCmdCopyImage(cmd, si, VK_IMAGE_LAYOUT_GENERAL, tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    }
+    return true;
 }
 
 bool texture_copy_into_bc(VkCommandBuffer cmd, Texture* src, uint32_t src_level, uint32_t src_layer, int sx, int sy,
