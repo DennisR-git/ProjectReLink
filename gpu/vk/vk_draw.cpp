@@ -7391,9 +7391,11 @@ bool driver_cache_lost(const std::vector<std::unique_ptr<PipeNote>>& notes) {
          lost ? "it no longer has them, warmed again" : "warm");
     return lost;
 }
-void warm_run(void (*progress)(size_t done, size_t total)) {
+/// The warm-up; its progress counts after more items to come (the start's compute pipelines: precompile_run). How many it
+/// counted: its notes when it ran, 0 when it had nothing to do
+size_t warm_run(void (*progress)(size_t done, size_t total), size_t after) {
     static const char* const sw = getenv("RX_VK_WARM");
-    if (sw && !atoi(sw)) return;
+    if (sw && !atoi(sw)) return 0;
     const std::string now = warm_marker_now(), path = warm_marker_path();
     bool marked = false;
     if (!sw) {
@@ -7408,9 +7410,9 @@ void warm_run(void (*progress)(size_t done, size_t total)) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
-    if (notes.empty()) return;   // (nothing noted yet: play notes them, and the driver's cache has them from their first draw)
+    if (notes.empty()) return 0;   // (nothing noted yet: play notes them, and the driver's cache has them from their first draw)
     if (marked) {
-        if (!driver_cache_lost(notes)) return;
+        if (!driver_cache_lost(notes)) return 0;
         remove(path.c_str());   // (a warm-up cut short is not marked: the next start warms again without a probe)
     }
     // (the notes' programs read in one pass, as the full precompile reads them: borrowing each from the file for its pipelines,
@@ -7445,7 +7447,7 @@ void warm_run(void (*progress)(size_t done, size_t total)) {
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
     for (unsigned i = 0; i < std::min(cpus, 64u); i++) threads.emplace_back(worker);
     while (next.load() < notes.size() + threads.size() && !prepare_stopped() && !out_of_time.load()) {
-        if (progress) progress(done.load(), notes.size());
+        if (progress) progress(done.load(), notes.size() + after);
         Sleep(100);
     }
     for (std::thread& t : threads) t.join();
@@ -7455,6 +7457,7 @@ void warm_run(void (*progress)(size_t done, size_t total)) {
     logf("vk: warmed the driver's cache: %zu of %zu noted pipelines made in %.1f s (%.1f s of it %zu programs read)%s", made.load(),
          notes.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), read_s, programs_n,
          whole ? "" : " (stopped before the end: the rest are made in play, and the next start goes on)");
+    return notes.size();
 }
 
 void precompile_run(void (*progress)(size_t done, size_t total)) {
@@ -7482,7 +7485,6 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     // (relink, lean pipelines: the notes' graphics pipelines are left to their first draw; only the compute programs are read
     // and their pipelines made here)
     const bool lean = pipelines_lean();
-    if (lean) warm_run(progress);   // (once a driver, build and program: the noted pipelines into the driver's own cache)
     std::vector<std::unique_ptr<PipeNote>> notes;
     if (!lean) notes = pipe_notes_read();
     std::unordered_set<uint64_t> wanted;
@@ -7516,6 +7518,10 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
              "pipelines made before the game, the others' at their first dispatch%s", wanted.size(), listed_shipped, listed_here,
              found.size(), computes.size(), getenv("RX_VK_NO_SHIPPED_COMPUTES") ? " (RX_VK_NO_SHIPPED_COMPUTES: the shipped list not read)" : "");
     }
+    // (lean: the noted graphics pipelines into the driver's own cache first, once a driver, build and program. Its pipelines and
+    // the compute ones below are one count on the start-up screen and in the builder's progress: as two, the percentage went
+    // back from 99 to 0 between them, and a first start's dawn went back with it. The compute programs are read first for it)
+    const size_t warmed = lean ? warm_run(progress, computes.size()) : 0;
     const size_t total = notes.size() + computes.size();
     // (the workers' state on the heap: a start whose last pipelines never finish (two of 4926 on an RX 5700 XT, "stuck at
     // 99%", Discord 11-08) goes on to the game after PRE_STALL_S seconds with no progress, the stragglers left running; it is
@@ -7581,7 +7587,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
     auto last_change = std::chrono::steady_clock::now();
     bool gone_on = false;
     while (done.load() < total && !prepare_stopped()) {
-        if (progress) progress(done.load(), total);
+        if (progress) progress(warmed + done.load(), warmed + total);
         Sleep(100);
         if (next.load() >= total + threads.size()) break;
         const auto now = std::chrono::steady_clock::now();
