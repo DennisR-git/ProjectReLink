@@ -464,7 +464,8 @@ const char* hn_sharpness(int v, int variant) {
     return which == 1 ? dlss : which == 2 ? fsr : v == 0 ? "Off: the picture as it is." : nullptr;
 }
 MENU_HINTS(hn_handheld, 0, "Docked: the Output resolution's size.", "Lower resolutions, lighter on the GPU.")
-MENU_HINTS(hn_ultrawide, 0, "The game's own shape.", "The camera widens to fill the screen. The HUD is still stretched.")
+MENU_HINTS(hn_ultrawide, 0, "The game's own shape.",
+    "The camera widens to fill a screen wider than 16:9 (21:9, 32:9), the HUD in the middle. A 16:10 or 4:3 screen keeps 16:9.")
 MENU_HINTS(hn_robust, 0, "On, on every card.", "Can be faster on some NVIDIA cards.", "Always on.")
 MENU_HINTS(hn_fps, 0, nullptr, "With frame generation on, the game's own rate too.")
 MENU_HINTS(hn_speed, 0, "A step each frame: the game slows down whenever it runs below 60 fps.",
