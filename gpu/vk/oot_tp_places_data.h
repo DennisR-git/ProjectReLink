@@ -16,7 +16,7 @@ typedef struct {
 } OotTpPlaceData;
 
 /* data[OOT_TP_PLACES] from path ('TPP2', u32 count, then {char key[48]; float x, y, z; char event[64]; u8 story; u8 pad[3]}),
-   matched by key; the number of places it had */
+   matched by key; the number of places it gave data to */
 static int oot_tp_places_read(const char *path, OotTpPlaceData *data) {
     memset(data, 0, sizeof(OotTpPlaceData) * OOT_TP_PLACES);
     FILE *f = path && path[0] ? fopen(path, "rb") : NULL;
@@ -30,14 +30,13 @@ static int oot_tp_places_read(const char *path, OotTpPlaceData *data) {
             unsigned char e[128];
             if (fread(e, 1, sizeof e, f) != sizeof e) break;
             e[47] = 0, e[123] = 0;
-            for (int i = 0; i < OOT_TP_PLACES; i++)
+            for (int i = 0; i < OOT_TP_PLACES; i++)   /* (every place of that key: a dungeon is in both ages' lists) */
                 if (!strcmp(oot_tp_places[i].key, (const char *)e)) {
                     memcpy(data[i].pos, e + 48, 12);
                     memcpy(data[i].event, e + 60, 64);
                     data[i].story = e[124] != 0;
+                    found += !data[i].found;
                     data[i].found = 1;
-                    found++;
-                    break;
                 }
         }
     }
