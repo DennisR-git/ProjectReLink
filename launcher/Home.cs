@@ -322,6 +322,46 @@ public partial class MainWindow
         var version = s.Folder == "" ? null : Game.Version(s.Folder);
         StatusText.Text = version != null ? L($"Version {version}.", $"Version {version}.") : L("Jeu construit depuis les sources.", "Game built from the sources.");
         UpdateLink.Visibility = Visibility.Collapsed;
+        ShowMods();
+    }
+
+    /// Exefs mods (ExefsMods.cs): the code patches in the folder's mods take effect when the game is built. When they are not
+    /// the ones it was built with, a line under the version says so, with Build again (or, for a folder that keeps no game
+    /// files, install again). preview: the snapshot's (2 patch files)
+    void ShowMods(int preview = 0)
+    {
+        var folder = s.Folder;
+        var count = preview;
+        var changed = preview > 0 || (folder != "" && Game.Installed(folder) && ExefsMods.Changed(folder, out count));
+        ModsRow.Visibility = changed ? Visibility.Visible : Visibility.Collapsed;
+        if (!changed) return;
+        var rebuild = preview > 0 || Game.KeepsGameFiles(folder);
+        ModsText.Text = rebuild ? L("Mods exefs modifiés depuis la construction.", "Exefs mods changed since the last build.")
+                                : L("Mods exefs modifiés : installez de nouveau le jeu.", "Exefs mods changed: install the game again.");
+        RebuildLink.Visibility = rebuild ? Visibility.Visible : Visibility.Collapsed;
+        var what = count == 0 ? L("Il n'y a plus de patch de code dans mods : le jeu garde ceux avec lesquels il a été construit.",
+                                  "There are no code patches in mods now: the game keeps the ones it was built with.")
+                 : count == 1 ? L("1 patch de code (.ips, .pchtxt) dans mods.", "1 code patch (.ips, .pchtxt) in mods.")
+                 : L($"{count} patchs de code (.ips, .pchtxt) dans mods.", $"{count} code patches (.ips, .pchtxt) in mods.");
+        ModsText.ToolTip = new ToolTip
+        {
+            Style = St("Tip"),
+            Content = what + " " + L("ReLink traduit le code du jeu quand il le construit : un patch de code ne compte qu'une fois le jeu reconstruit.",
+                                     "ReLink translates the game's code when it builds the game: a code patch takes effect once the game is built again."),
+        };
+    }
+
+    void RebuildClick(object sender, RoutedEventArgs e)
+    {
+        if (game != null || !Game.Installed(s.Folder) || !Game.KeepsGameFiles(s.Folder)) return;
+        var tools = Tools.Find();
+        if (tools == null)
+        {
+            MainNote.Text = L("Les outils de construction de ReLink sont introuvables : installez de nouveau ReLink.",
+                              "ReLink's build tools were not found: install ReLink again.");
+            return;
+        }
+        Rebuild(tools, s.Folder, L("Reconstruction du jeu avec vos mods", "Building your game again with your mods"));
     }
 
     void ShowChecks()
