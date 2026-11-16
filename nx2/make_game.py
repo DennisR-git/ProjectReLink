@@ -808,6 +808,20 @@ def ship_state_list(out):
     print("the shipped pipeline state list: %d pipelines" % ((os.path.getsize(src) - 12) // 528), flush=True)
 
 
+def ship_compute_list(out):
+    """The compute programs a play of the game used on the development PC (work/computes.bin, a copy of a played game folder's
+    relink_computes.bin: 8 bytes a program, a hash of its code; no game code), as the folder's relink_computes_shipped.bin: a
+    lean start builds their pipelines before the title (gpu/vk/vk_draw.cpp precompile_run), from the player's own shaders,
+    instead of at their first dispatch in play. Good for any build: optional"""
+    src = os.path.join(ROOT, "work", "computes.bin")
+    dst = os.path.join(out, "relink_computes_shipped.bin")
+    if not os.path.isfile(src):
+        return
+    if not (os.path.isfile(dst) and filecmp.cmp(src, dst, shallow=False)):
+        shutil.copyfile(src, dst)
+    print("the shipped compute list: %d programs" % (os.path.getsize(src) // 8), flush=True)
+
+
 def folder_language(out):
     """the language a game folder was built in: the code line of its language.txt"""
     try:
@@ -1329,6 +1343,7 @@ def main(a=None):
         shutil.copy2(icon, os.path.join(out, "relink.png"))
     seed_pipelines(out)
     ship_state_list(out)
+    ship_compute_list(out)
     # (relink) the item wheel's icons, names and sounds (gpu/vk/vk_wheel.cpp, host/oot_wheel.c, host/nn_audio.c): the game's own,
     # from the RomFS, at every build (nx2/wheel_assets.py). Without them the wheel shows the items' names in English, silently
     wheel = os.path.join(out, "wheel")
