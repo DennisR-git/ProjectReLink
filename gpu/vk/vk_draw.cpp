@@ -7460,8 +7460,37 @@ size_t warm_run(void (*progress)(size_t done, size_t total), size_t after) {
     return notes.size();
 }
 
+// (relink, 0.7.8) The full start's pipeline cache files, mkw_vk_pipelines.bin and its .new (800 MB and more on the PCs that
+// had the full start until 0.7.5), are read by nothing in a lean start (pcache_init returns before) and written by nothing
+// either: a lean start removes them, said once in the log. Only the files beside the game, never RX_VK_PIPELINE_CACHE_PATH's,
+// and never in the full start (RX_VK_LEAN_PIPELINES=0, RX_VK_PRECOMPILE), which is the one that reads them. A player who
+// turns the full start on later loses nothing but time: pcache_init starts from an empty cache, as on a new install, that
+// start builds every noted pipeline from the driver's own cache (or compiles it), and the file is written again.
+// RX_VK_KEEP_OLD_PIPELINE_CACHE=1: kept (a test folder that goes from one start to the other)
+void old_pipeline_cache_drop() {
+    if (getenv("RX_VK_KEEP_OLD_PIPELINE_CACHE")) return;
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    std::string dir(exe, n);
+    const std::string base = dir.substr(0, dir.find_last_of("\\/") + 1) + "mkw_vk_pipelines.bin";
+    for (const std::string& path : {base, base + ".new"}) {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) continue;   // (not there: the usual case)
+        _fseeki64(f, 0, SEEK_END);
+        const int64_t size = _ftelli64(f);
+        fclose(f);
+        if (remove(path.c_str()) == 0)
+            logf("vk: lean pipelines: %s removed (%lld MB): only the full start reads it (RX_VK_LEAN_PIPELINES=0 makes it again)",
+                 path.c_str(), (long long)(size >> 20));
+        else
+            logf("vk: lean pipelines: %s, which only the full start reads, could not be removed (in use?): left for the next start",
+                 path.c_str());
+    }
+}
+
 void precompile_run(void (*progress)(size_t done, size_t total)) {
     const auto t0 = std::chrono::steady_clock::now();
+    if (pipelines_lean()) old_pipeline_cache_drop();
     // (a start that dies in here would die in here every time, the notes being what it builds from: a player saw the console reach
     // 542 of 543 and the game close. The file says this step began and did not end: the next start lets the notes go and plays)
     // (two starts in a row, not one: closing the window while it ran counted as a crash, and the next start then skipped the
