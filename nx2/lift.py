@@ -129,10 +129,12 @@ def exefs_sites():
     import oot_jitter
     import oot_occlusion
     import oot_fov
+    import oot_step_rate
     return {"widescreen": [oot_wide.MAIN + s[0] for s in oot_wide.SITES],
             "camera jitter (DLSS, FSR)": [oot_wide.MAIN + s[0] for s in oot_jitter.SITES],
             "Occlusion Off": [oot_occlusion.MAIN + o for o in oot_occlusion.OFFSETS],
-            "field of view": [oot_fov.MAIN + oot_fov.SITE]}
+            "field of view": [oot_fov.MAIN + oot_fov.SITE],
+            "the frame rate above 60 fps": [oot_step_rate.MAIN + oot_step_rate.SITE]}
 
 
 def main():
@@ -190,6 +192,8 @@ def main():
         oot_occlusion.install(L, img)
         import oot_fov   # (relink) the Insert menu's Field of view: the camera's angle scaled as it goes into the projection
         oot_fov.install(L, img)
+        import oot_step_rate   # (relink, issues 16 and 67) the time step follows the real frame rate above 60 fps too
+        oot_step_rate.install(L, img)
     L.discover(max_insns=a.max_func)
     print("discovered %d functions (%.0fs)" % (len(L.funcs), time.time() - t0))
     # (relink) exefs mods (nx2/exefs_mods.py, OOT_EXEFS_PATCHES: what make_game.py applied to this exefs): which functions

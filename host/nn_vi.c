@@ -312,6 +312,12 @@ volatile float hos_text_scale = 1.0f;   /* (the letters' clock of a text pane, f
 /* (relink) The camera's vertical angle is multiplied by this as it goes into the projection (nx2/oot_fov.py): the Insert menu's
    Field of view in percent (option 13), HOS_FOV=<percent> over it; 1 as the game has it */
 volatile float hos_fov_scale = 1.0f;
+/* (relink, issues 16 and 67) The frame rate the game's step is made from while the frame rate is unlocked, read by the main
+   loop in place of the graphics module's own (nx2/oot_step_rate.py); 0: the module's, as under 60 fps. The game's frame rate
+   controller writes 60 / <its display intervals> into the module every frame while the limiter is raised, after the write
+   below and never more than 60: unlocked, the step stayed 1/60 s and the whole game ran at fps / 60 times its speed (x1.77
+   at 102 fps, x1.24 at 75, measured with HOS_STEP_LOG=1). HOS_STEP_RATE_OLD=1: never set, as before */
+volatile int hos_step_fps = 0;
 /* The Insert menu's Text speed (0 Normal, 1 2x, 2 4x, 3 Instant), HOS_TEXT_SPEED=<0..3> over it: what the time of a letter
    animation's step is multiplied by. Instant: the page at once, as the game's own skip on A */
 static float text_scale(const char *env, int menu) {
@@ -392,6 +398,7 @@ static void realtime_step(int64_t now) {
     if (!rx_option(0, 1) && cap == 60) {   /* (the Insert menu: per frame. Not under HOS_FPS_CAP: at 30 the game ran at half speed) */
         int *slot = (int *)GP(mod + 0x2c8);
         if (*slot >= 15 && *slot <= 60) *slot = 60;
+        hos_step_fps = 0;
         return;
     }
     static int64_t last;
@@ -400,7 +407,7 @@ static void realtime_step(int64_t now) {
     static long long steps;
     const double dt = (now - last) / 1e9;
     last = now;
-    if (dt <= 0 || dt > 0.25) { count = next = 0; carry = 0; return; }   /* (a load: the average starts again) */
+    if (dt <= 0 || dt > 0.25) { count = next = 0; carry = 0; hos_step_fps = 0; return; }   /* (a load: the average starts again) */
     /* (HOS_REALTIME_WINDOW=<1-5>: frames averaged for the step; 1: each step the last frame's own time) */
     static int window = -1;
     if (window < 0) {
@@ -423,11 +430,43 @@ static void realtime_step(int64_t now) {
     if (*slot < 15 || *slot > 240) {
         static int logged;
         if (!logged++) hos_log("vi: the graphics module's frame rate reads %d: no real-time step", *slot);
+        hos_step_fps = 0;
         return;
     }
     carry = ratio - 60.0 / fps;
     carry = carry > 0.5 ? 0.5 : carry < -0.5 ? -0.5 : carry;
+    {   /* (relink, issues 16 and 67: "above 60 fps everything is faster") HOS_STEP_LOG=1: the game's own clock against the wall
+           clock, a line every 5 s. The engine's step object (*[0x84c9e890], what f_83b6e300 fills each frame from the rate
+           written here) keeps the step's ratio at +0x10 and its seconds at +0x18: the seconds are summed at each present, with
+           the slot's value as the game left it since the last present (what else writes it, if anything) */
+        static int on = -1;
+        if (on < 0) on = getenv("HOS_STEP_LOG") != NULL;
+        const uint64_t holder = on ? *(uint64_t *)GP(0x84c9e890ULL) : 0;
+        const uint64_t obj = holder ? *(uint64_t *)GP(holder) : 0;
+        if (obj) {
+            static double game_s, wall_s, lo = 1e9, hi;
+            static int n, slot_changed, last_written;
+            float r, s;
+            memcpy(&r, GP(obj + 0x10), 4);
+            memcpy(&s, GP(obj + 0x18), 4);
+            game_s += s, wall_s += dt, n++;
+            lo = r < lo ? r : lo, hi = r > hi ? r : hi;
+            if (last_written && *slot != last_written) slot_changed++;
+            last_written = fps;
+            if (wall_s >= 5.0) {
+                hos_log("vi: step log: the game's clock advanced %.3f s in %.3f s of wall clock (x%.3f), %d presents (%.1f fps); its "
+                        "step's ratio %.3f to %.3f (now %.3f, %.5f s); the rate written here read back changed %d times",
+                        game_s, wall_s, game_s / wall_s, n, n / wall_s, lo, hi, r, s, slot_changed);
+                game_s = wall_s = 0, n = slot_changed = 0, lo = 1e9, hi = 0;
+            }
+        }
+    }
     *slot = fps;
+    {   /* (issues 16 and 67) unlocked: the main loop takes the rate from here, whatever the game's controller writes after this */
+        static int old_way = -1;
+        if (old_way < 0) old_way = getenv("HOS_STEP_RATE_OLD") != NULL;
+        hos_step_fps = cap > 60 && !old_way ? fps : 0;
+    }
     if (!(steps++ % 3000)) hos_log("vi: real-time step on: ratio %.3f, game's frame rate %d", ratio, fps);
 }
 /* HOS_PRESENT_TRACE=<csv>: native game present-call returns, not GPU completion or display times.
