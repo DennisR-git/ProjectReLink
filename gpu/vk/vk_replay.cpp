@@ -3187,7 +3187,7 @@ void status_tick() {
 }
 
 uint64_t present_value = 0;   // (the present job's value, handed out as it came; 0: the next one)
-// (relink, from Longshot) the Travel page's own pictures, vk_menu.cpp: when the game side says Link has stayed at a place, the
+// (relink) the Travel page's own pictures, vk_menu.cpp: when the game side says Link has stayed at a place, the
 // middle 60% of the picture shown, away from the HUD's corners, at 480x270; recorded with one present and read at a later one
 // once the GPU has finished it (a present never waits for it), handed to the menu's picture worker
 struct TeleportShot {

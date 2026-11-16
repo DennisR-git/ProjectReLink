@@ -1181,7 +1181,7 @@ void fill(HDC dc, int x, int y, int w, int h, COLORREF c) {
     DeleteObject(b);
 }
 
-// ---- (relink, from Longshot) the Travel page: the places of Link's age, grouped by area (gpu/vk/oot_tp_places.h), with a
+// ---- (relink) the Travel page: the places of Link's age, grouped by area (gpu/vk/oot_tp_places.h), with a
 // picture of each, taken in play the first time Link stays a few seconds at the place (vk_replay.cpp teleport_capture). One
 // file a place in the game folder's teleport_pictures folder; nothing is shipped. The files are read and written by a worker
 // thread of their own (picture_worker), never by the replay's, the game's or the menu's: a picture is 389 KB, and a present
@@ -1218,7 +1218,7 @@ std::string teleport_picture_path(const std::string& key) {
     const std::string dir = game_folder_file("teleport_pictures");
     return dir.empty() ? "" : dir + "/" + key + ".bin";
 }
-// A picture file: 'FTP2', width, height, then its RGB (no alpha: a picture is opaque). 480x270: 389 KB (Longshot's files)
+// A picture file: 'FTP2', width, height, then its RGB (no alpha: a picture is opaque). 480x270: 389 KB
 constexpr char kPictureMagic[4] = {'F', 'T', 'P', '2'};
 bool read_picture_file(const std::string& path, TeleportPicture& p) {
     FILE* f = path.empty() ? nullptr : fopen(path.c_str(), "rb");
@@ -1326,7 +1326,7 @@ void picture_worker() {
                 count = (int)teleport_captures.size();
             }
             logf("menu: Travel picture of %s (%s) taken (%d in memory)%s", place.label, place.key, count, saved ? "" : "; not saved");
-            if (saved) {   // (the line over the game for 2.5 s: as Longshot's "Teleport picture saved")
+            if (saved) {   // (the line over the game for 2.5 s)
                 snprintf(notice_text, sizeof notice_text, "Travel picture saved: %s", place.label);
                 notice_new.store(true, std::memory_order_release);
                 notice_until.store(prof_now() + 2500000000LL, std::memory_order_relaxed);

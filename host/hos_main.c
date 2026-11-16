@@ -751,7 +751,7 @@ static struct {
 } teleport;
 
 static struct { const char *banc, *start, *boot; int carrier; } place_target;   /* (set: oot_teleport goes there instead;
-   carrier: by the empty DefaultParentEvent and the reserved next map, as the Fast Travel mod warps) */
+   carrier: by the empty DefaultParentEvent and the reserved next map, for a point no entrance leads to) */
 static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
     if (index >= sizeof oot_destinations / sizeof oot_destinations[0]) return 0;
     const int64_t now = hos_now_ns();
@@ -963,7 +963,7 @@ static int oot_travel_place(Ctx *c, uint64_t actor, unsigned index, int adult) {
     hos_log("cheats: place '%s' (%s), %s%s: map %s at %s, arriving with %s", p->label, p->key, adult ? "adult" : "child",
             switch_age ? " (age switched)" : "", p->banc, p->spawn, boot);
     place_target.banc = p->banc, place_target.start = p->spawn, place_target.boot = boot;
-    place_target.carrier = !boot[0];   /* (a warp's or a scene's point: arrived at as the Fast Travel mod does) */
+    place_target.carrier = !boot[0];   /* (a warp's or a scene's point: arrived at by the carrier warp) */
     if (place_target.carrier) boot = "", place_target.boot = "DefaultParentEvent";
     const int sent = oot_teleport(c, actor, 0);
     place_target.banc = NULL;

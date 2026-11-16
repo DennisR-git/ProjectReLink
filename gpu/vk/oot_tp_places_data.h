@@ -10,7 +10,7 @@
 
 typedef struct {
     float pos[3];
-    char event[64];   /* (the arrival event: "" for a place no entrance leads to, warped to as the Fast Travel mod does) */
+    char event[64];   /* (the arrival event: "" for a place no entrance leads to, warped to by the carrier warp) */
     int story;
     int found;   /* (the file had the place: its position is known) */
 } OotTpPlaceData;
