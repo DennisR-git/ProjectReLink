@@ -167,6 +167,11 @@ class Formats(unittest.TestCase):
             (0x140, b"\x01\x02"), (0x160, b"aA\n\t\\\"")])
         self.assertEqual(notes, [])
 
+    def test_pchtxt_shift_forms(self):
+        for shift in ("0x100", "256", "0100"):
+            parts, _ = parse_pchtxt("@nsobid-ab\n@flag offset_shift %s\n@enabled\n10 00\n" % shift)
+            self.assertEqual(parts["ab"], [(0x110, b"\0")], shift)
+
     def test_pchtxt_notes_and_bad_lines(self):
         _, notes = parse_pchtxt("@nsobid-ab\n@flag something_new\n@whatever\n@enabled\n10 00\n")
         self.assertEqual(len(notes), 2)

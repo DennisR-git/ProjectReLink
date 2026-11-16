@@ -233,7 +233,7 @@ def parse_pchtxt(text):
     """{module build id (as written): [(file offset, bytes)]} of a text patch, and notes (lines ignored, said in the report).
 
     Its rules, line by line: "@nsobid-<build id>" names the module the lines after it patch; "@flag offset_shift <n>" adds n
-    (0x... or decimal) to the offsets after it; "@flag be" makes each hex value's bytes go in reverse order (the value written
+    (0x..., decimal, or else hex) to the offsets after it; "@flag be" makes each hex value's bytes go in reverse order (the value written
     as a big-endian number), "@flag le" back to the bytes in the order written; "@enabled" starts lines that are applied,
     "@disabled" lines that are not (nothing before the first "@enabled" is applied); "@stop" ends the file. "//" starts a
     comment, and so does "#" at a line's start. A patch line is "<hex offset> <hex bytes>" or "<hex offset> "<string>"".
@@ -259,7 +259,10 @@ def parse_pchtxt(text):
                     try:
                         shift = int(words[2], 0)
                     except ValueError:
-                        raise PatchError("line %d: offset_shift %s is not a number" % (lineno, words[2])) from None
+                        try:   # (hex without 0x, as the offsets are written: "0100")
+                            shift = int(words[2], 16)
+                        except ValueError:
+                            raise PatchError("line %d: offset_shift %s is not a number" % (lineno, words[2])) from None
                 elif flag == "be":
                     reverse = True
                 elif flag == "le":

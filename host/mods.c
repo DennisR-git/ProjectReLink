@@ -238,9 +238,13 @@ static void exefs_check(void) {
                     "(relink_exefs_mods.txt)", n, now, applied[0] ? applied : "none", left_out, warnings);
         return;
     }
-    hos_log("mods: exefs: the patch files in %s (%d, hash %s: %s) are not the ones the game was built with (%s): they take "
-            "effect after the game is built again from the launcher", root, n, now, n ? names.text : "none",
-            have ? built : "no relink_exefs_mods.txt");
+    if (n)
+        hos_log("mods: exefs: the patch files in %s (%d, hash %s: %s) are not the ones the game was built with (%s): they take "
+                "effect after the game is built again from the launcher", root, n, now, names.text,
+                have ? built : "no relink_exefs_mods.txt");
+    else
+        hos_log("mods: exefs: no patch file in %s now, and the game was built with some (%s): it keeps them until it is built "
+                "again from the launcher", root, built);
     char told[64] = "";
     if ((f = open_utf8(told_path, "rb"))) {
         if (fgets(told, sizeof told, f)) told[strcspn(told, "\r\n")] = 0;
@@ -263,7 +267,9 @@ static void exefs_check(void) {
         snprintf(text, sizeof text, "The code patches (exefs) this game was built with are no longer in the mods folder.\n\n"
                  "ReLink translates the game's code when it builds the game, so the game keeps them until it is built again: "
                  "open ReLink and choose Build again on its first page. The game starts now as it was built.");
-    MessageBoxA(NULL, text, "Project ReLink: mods", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+    wchar_t wtext[2048];   /* (the mods' names are UTF-8) */
+    if (MultiByteToWideChar(CP_UTF8, 0, text, -1, wtext, 2048))
+        MessageBoxW(NULL, wtext, L"Project ReLink: mods", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
 #endif
 }
 
