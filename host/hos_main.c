@@ -1391,6 +1391,7 @@ static int game_main(int argc, char **argv) {
 #ifdef _WIN32
     if (!narrow_paths_ok(argc, argv)) return 1;
     load_relink_env();
+    oot_places_data();   /* (relink: the Travel places' file read here, before the game's code runs: the game's thread reads no file) */
 #endif
     occlusion_switch();
 #ifdef _WIN32
@@ -1633,7 +1634,6 @@ int main(int argc, char **argv) {
     int hos_display_init(void);
     void hos_display_loop(void);
     load_relink_env();
-    oot_places_data();   /* (relink: the Travel places' file read here, before the game's thread: it reads no file) */
     game_argc = argc, game_argv = argv;
     const int window = hos_display_init();
     HANDLE t = CreateThread(NULL, 64u << 20, game_thread, NULL, 0, NULL);
