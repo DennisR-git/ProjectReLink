@@ -772,7 +772,7 @@ static int cycle_level(void) {   /* 0 off, 1 the arrows, bottles and spells, 2 a
         forced = e ? atoi(e) : -1;
     }
     /* (the row's values, as the menu lists them: 0 Off, 1 Last used, 2 Basic, 3 +Bombs, 4 +Tools) */
-    const int v = forced >= 0 ? forced : rx_option(HOS_OPT_CYCLE_ITEMS, 2);
+    const int v = forced >= 0 ? forced : rx_option(HOS_OPT_CYCLE_ITEMS, 0);   /* (off by default: R and L reach the game at once) */
     static const int level[5] = {0, 4, 1, 2, 3};
     return v < 0 ? 0 : level[v > 4 ? 4 : v];
 }

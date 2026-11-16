@@ -97,9 +97,10 @@ item with either stick (or the mouse) and let go: it is on ZR at once. The items
 Link and one for adult Link; Left and Right (or the mouse wheel) turn the page, Y takes an item up to put it in another slot,
 B puts it back. The pages are kept in `wheel_layout.txt` beside `relink_options.ini`. The wheel shows the game's own icons,
 names (in the game's language) and sounds, which every build takes from your game files into the `wheel` folder.
-**Cycle items** (Gameplay): a tap of R or L changes the item on ZR without opening the row: Last used swaps with the item
-that was on ZR before, whatever it is; Basic puts the next or the previous arrow, bottle or spell on ZR; +Bombs the bombs
-too; +Tools the hookshot, hammer, slingshot and boomerang too. Holding R or L still opens the row (or the wheel).
+**Cycle items** (Gameplay, off by default): a tap of R or L changes the item on ZR without opening the row: Last used
+swaps with the item that was on ZR before, whatever it is; Basic puts the next or the previous arrow, bottle or spell on
+ZR; +Bombs the bombs too; +Tools the hookshot, hammer, slingshot and boomerang too. Holding R or L still opens the row
+(or the wheel), a quarter of a second later than without it.
 `HOS_ITEM_WHEEL=0` or `1` and `HOS_CYCLE_ITEMS=0` to `4` in `relink_env.txt` stand
 in for the two rows.
 
