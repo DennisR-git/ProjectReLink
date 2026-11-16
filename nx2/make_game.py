@@ -1356,6 +1356,12 @@ def main(a=None):
                                        ("wheel_sounds.py", "--out", "sounds.bin", "it is silent")):
         if run(PY + [os.path.join(HERE, script), "--romfs", romfs, opt, os.path.join(wheel, name)], check=False, output=sys.stderr):
             print("the item wheel's %s was not made: %s" % (name, without), flush=True)
+    # (relink, issues 34, 63, 68, 20) the button prompts' fonts: the game's own button font with ReLink's Xbox and PlayStation
+    # labels, and where the host patches them for the bindings (nx2/button_glyphs.py, host/prompts.c). Without them the game
+    # shows the Switch's buttons whatever the Button prompts row says
+    if run(PY + [os.path.join(HERE, "button_glyphs.py"), "--romfs", romfs, "--out", os.path.join(out, "prompts")], check=False,
+           output=sys.stderr):
+        print("the button prompts' fonts were not made: the game shows the Switch's buttons", flush=True)
     language = os.path.join(out, "language.txt")   # (the same text as host/nn_applet.c writes)
     with open(language, "w", encoding="utf-8", newline="\n") as f:
         f.write("# The game's language. Change the line below to one of the codes listed here, save, and start the game again.\n\n%s\n\n" % a.language)

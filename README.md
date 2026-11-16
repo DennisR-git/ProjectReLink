@@ -134,6 +134,15 @@ page, each place gets a picture taken from your own game the first time Link sta
 again at the next stay there. Link arrives through the game's own map change, as when he walks in. The places' positions
 and arrival events come from your game files at every build (`teleport_places.bin`, `nx2/teleport_places.py`).
 
+**Button prompts** (Controls, Nintendo by default): the buttons the game's prompts show, Nintendo's, Xbox's (A, B, X, Y, LB,
+RB, LT, RT, Menu, View) or PlayStation's (cross, circle, square, triangle, L1, R1, L2, R2, Options, Create). Each prompt
+shows the button that presses it, so the letters follow the **Layout preset** and your own bindings: with the Nintendo
+preset, the Switch's A is the right-hand button and shows Xbox's B. The labels are ReLink's own drawings, which every build
+adds to a copy of your game's button font in the `prompts` folder. It applies the next time the game starts. Not changed
+yet: the three faded letters around the HUD's action button and the ocarina's note buttons are pictures, not letters of
+the font, and keep the Switch's; and the font has one colour, so the prompts are not coloured. A mod that replaces the
+button font wins over this row. `HOS_BUTTON_PROMPTS=0`, `xbox` or `playstation` in `relink_env.txt` stands in for it.
+
 ## Measured frame rates
 
 On our PC: **Ryzen 5 5500, GeForce RTX 3060 Ti (8 GB), 16 GB of RAM, Windows 11**.
@@ -292,6 +301,11 @@ la licence de NVIDIA. Avec FSR ou DLSS, mettez la netteté vers 80 %.
 en roue au lieu de la rangée du jeu ; visez-en un au stick et relâchez pour le mettre sur ZR, Gauche et Droite tournent les
 pages, Y déplace un objet. **Cycle items** change l'objet de ZR d'un appui bref sur R ou L. Le même onglet a une ligne
 **Quit game**, qui demande confirmation puis ferme le jeu.
+
+**Button prompts** (onglet Controls du menu Insert) : les boutons affichés par le jeu sont ceux d'une manette Xbox ou
+PlayStation, dessinés par ReLink, et suivent le **Layout preset** et vos propres assignations ; le réglage s'applique au
+prochain démarrage du jeu. Les trois lettres pâles autour du bouton d'action du HUD et les notes de l'ocarina sont des
+images et gardent les lettres de la Switch, et la police n'a qu'une couleur.
 
 Il faut Windows 10 ou 11 en 64 bits, un processeur avec AVX2, une carte graphique avec Vulkan 1.3 et les mesh shaders
 (GeForce RTX 20 ou plus récente, Radeon RX 6000 ou plus récente, Intel Arc ; nous n'avons testé que sur NVIDIA), 16 Go de RAM
