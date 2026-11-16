@@ -589,8 +589,6 @@ Row rows[] = {
      "Which face button is which. Binding one yourself on the Controls page makes it Custom.", hn_pad_layout},
     {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (relink: opens its page)
      "Which gamepad button and which keys press each of the Switch's buttons."},
-    {TAB_GAMEPLAY, "Travel", nullptr, 0, 0, 0, nullptr,   // (relink: opens its page, page 6)
-     "Go to a place you know: villages, dungeons' entrances, shops, warps. Each with a picture from your own game."},
     {TAB_GAMEPLAY, "Quit game", nullptr, 0, 0, 0, nullptr,   // (relink, issue 32: asks first, then closes the game)
      "Closes the game, as closing its window does. Your settings are kept; progress since your last save is not."},
     {TAB_GAMEPLAY, "Cheats", nullptr, 0, 0, 0, nullptr,
@@ -598,7 +596,6 @@ Row rows[] = {
 };
 constexpr int kCheatsRow = sizeof rows / sizeof rows[0] - 1;
 constexpr int kQuitRow = kCheatsRow - 1;
-constexpr int kTravelRow = kCheatsRow - 2;   // (relink)
 bool cheats_enabled = false;
 std::atomic<int> protect_hearts{-1};
 // -1 disables the shortcut, 0 enables it on the ground, and 1 means flying.
@@ -683,7 +680,8 @@ constexpr ItemSections item_sections = make_item_sections();
 std::atomic<int> item_counts[kItems];   // (-1 until the game side reports: OOT_CHEAT_ITEM_BASE + i)
 std::atomic<int> link_age{-1};          // (relink) 0 child, 1 adult, -1 unknown (OOT_CHEAT_AGE_ID: the item wheel's pages)
 int item_choice = 0, item_scroll = 0;
-constexpr int kCheatRows = 11;
+constexpr int kCheatRows = 12;
+constexpr int kTravelCheat = 11;   // (relink) the Cheats page's Travel row: opens the Travel page, page 6
 constexpr int kRows = sizeof rows / sizeof rows[0];
 constexpr int kMenuWidth = menu_hit::kWidth;   // (at a scale of 1: 720 lines)
 
@@ -1708,13 +1706,13 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     if (page == 2) {
         const char* labels[] = {"Heart protection", "No-clip flight", "Mark position",
                                 "Return to mark", "Set time", "Inventory item", "Change quantity", "Free camera",
-                                "Teleport", "Switch age", "Inventory"};
+                                "Teleport", "Switch age", "Inventory", "Travel"};
         char clock_text[12], quantity[12];
         snprintf(clock_text, sizeof clock_text, "%02d:00", clock_hour);
         snprintf(quantity, sizeof quantity, "%+d", pouch_delta);
         const char* values[] = {tx_onoff(protect_hearts.load() == 1), tx_onoff(player_flight.load() >= 0),
                                 "", "", clock_text, pouch_items[pouch_item], quantity, tx_onoff(free_camera.load()),
-                                teleport_names[teleport_choice], "", ""};
+                                teleport_names[teleport_choice], "", "", ""};
         const char* help[] = {"Protects Link's hearts. Hits can still knock him back.",
             "Enable double-tap Jump for takeoff and landing. Hold Jump to climb or L to descend.",
             "Remember Link's position for this loaded scene.",
@@ -1725,7 +1723,8 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
             "Move and look with your usual controls. Page Up / Page Down or R / L changes height.",
             "Enter opens the map list (Left or Right also changes the map here). Link travels through the game's own map change, in his current age.",
             "Swaps Link between child and adult and reloads this map in the other age (the Market when this map has no match).",
-            "Enter opens the inventory editor: unlock or relock equipment, items, upgrades and quest items, and change amounts."};
+            "Enter opens the inventory editor: unlock or relock equipment, items, upgrades and quest items, and change amounts.",
+            "Go to a place you know: villages, dungeons' entrances, shops, warps. Each with a picture from your own game."};
         for (int i = 0; i < kCheatRows; i++) {
             const int y = (menu_hit::kCheatTop + i * menu_hit::kCheatRowH) * s;
             if (i == cheat_selected) startup_gdi::round_rect(dc, 8 * s, y, (int)w - 16 * s, menu_hit::kCheatRowH * s, 6 * s, RGB(44, 72, 54));
@@ -2082,7 +2081,8 @@ void menu_init() {
     bool has_options = false;
     const char* cheats = getenv("HOS_OOT_CHEATS");
     cheats_enabled = cheats && !strcmp(cheats, "1");
-    {   // (relink) the Travel page's pictures: taken when the page was opened before (its folder is there)
+    if (cheats_enabled) {   // (relink) the Travel page's pictures: taken when the page was opened before (its folder is there),
+        // and only while the page can be opened: it is on the Cheats page
         std::error_code ec;
         const std::string dir = game_folder_file("teleport_pictures");
         travel_pictures_on.store(!dir.empty() && std::filesystem::is_directory(dir, ec), std::memory_order_relaxed);
@@ -2575,6 +2575,14 @@ void menu_tick() {
             }
             if (press[7] && cheat_selected == 8) page = 3, teleport_reveal(), changed = true;
             if (press[7] && cheat_selected == 10) page = 4, item_reveal(), changed = true;
+            if (press[7] && cheat_selected == kTravelCheat) {   // (relink: the Travel page, Link's own age first)
+                page = 6, travel_pick = -1, travel_list(), travel_reveal(), changed = true;
+                if (!travel_pictures_on.exchange(true, std::memory_order_relaxed)) {   // (pictures are taken from now on)
+                    PictureJob j;
+                    j.kind = PictureJob::Begin;
+                    picture_job(std::move(j));
+                }
+            }
             if (press[7] && cheat_selected == 9) {
                 cheat_action.store(999);   // (host/hos_main.c OOT_AGE_ACTION)
                 open_now = false;
@@ -2660,7 +2668,7 @@ void menu_tick() {
                        changed);
         else if (mouse && (ptr.pressed & HOS_MOUSE_RIGHT))
             press[5] = true;
-        if (press[5]) page = 0, changed = true;
+        if (press[5]) page = 2, changed = true;   // (back to the Cheats page, as the teleport list)
         else if (press[7] && n) {
             cheat_action.store(OOT_PLACE_ACTION + travel.place[travel_choice] * 2 + travel.adult);
             open_now = false, page = 0;   // (back to the game: the map change starts with an event)
@@ -2758,15 +2766,7 @@ void menu_tick() {
         if (press[7] && &r == &rows[kCheatsRow]) page = 2, changed = true;
         else if (press[7] && &r == &rows[kQuitRow]) {   // (Quit game: asked first, Back the default)
             if (app_window()) page = 5, ask_sel = 0, ask_quit = true, changed = true;
-        } else if (press[7] && &r == &rows[kTravelRow]) {   // (relink: Link's own age first)
-            page = 6, travel_pick = -1, travel_list(), travel_reveal(), changed = true;
-            if (!travel_pictures_on.exchange(true, std::memory_order_relaxed)) {   // (pictures are taken from now on)
-                PictureJob j;
-                j.kind = PictureJob::Begin;
-                picture_job(std::move(j));
-            }
-        }
-        else if (press[7] && !r.value && &r != &rows[kTravelRow] && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
+        } else if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
         if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or the bottom face button, as Right)
             if (press[7]) press[4] = true;
             set_row(r, *r.value + (press[4] ? r.step : -r.step), press[4] ? 1 : -1);

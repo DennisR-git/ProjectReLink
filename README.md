@@ -107,7 +107,8 @@ ZR; +Bombs the bombs too; +Tools the hookshot, hammer, slingshot and boomerang t
 `HOS_ITEM_WHEEL=0` or `1` and `HOS_CYCLE_ITEMS=0` to `4` in `relink_env.txt` stand
 in for the two rows.
 
-**Travel** (Gameplay): a page of 190 places to go to, villages, dungeons' entrances, shops, warp points and story spots,
+**Travel** (on the Cheats page: `HOS_OOT_CHEATS=1` in `relink_env.txt` shows the Gameplay tab's **Cheats** row, and
+Travel is that page's last row): a page of 190 places to go to, villages, dungeons' entrances, shops, warp points and story spots,
 grouped by area, for Link's age (Tab or X shows the other age's: going there makes Link that age). Once you have opened the
 page, each place gets a picture taken from your own game the first time Link stays there a few seconds with the menu closed
 (in `teleport_pictures` in the game folder); Y or Backspace on the page takes a place's picture
