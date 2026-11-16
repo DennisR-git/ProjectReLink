@@ -501,7 +501,7 @@ static void wheel_sounds_read(void) {   /* (with the lock held) */
         memcpy(&rate, b + at + 48, 4);
         memcpy(&frames, b + at + 52, 4);
         memcpy(w->coefs, b + at + 56, 32);
-        if (at + 88 + (long)frames * 4 > size) break;
+        if ((int64_t)at + 88 + (int64_t)frames * 4 > (int64_t)size) break;   /* (64-bit: long is 32 bits on Windows) */
         w->frames = (int)frames;
         w->pcm = (const int16_t *)(b + at + 88);
         at += 88 + (long)frames * 4;
