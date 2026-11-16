@@ -264,8 +264,10 @@ game is never changed. `relink_exefs_mods.txt` in the game folder lists what the
 - Patches made for another version of the game (another build id) are left out, and so is a patch that writes outside the
   module's code and data. When two mods write different bytes at the same place, the one whose path sorts last wins.
 - Not supported: replacement module files (a whole `main` or `subsdk` in `exefs`), and patches of `rtld`.
-- Code a patch adds in unused space ("code caves") is translated when the game's code branches to it (`b` or `bl`); code
-  reached only through a pointer is not, and the build says so (*not translated* in `relink_exefs_mods.txt`).
+- Code a patch adds in unused space of the code ("code caves") is translated when the game's code branches to it (`b`,
+  `bl`, conditional branches), or when a pointer in the data or an `adr`/`adrp` outside the game's own functions holds its
+  address; code reached only through a pointer made some other way is not, and the build says so (*not translated* in
+  `relink_exefs_mods.txt`).
 - A patch changes the translated code, so one of ReLink's own fixes or options in the same function may not apply any more:
   the build says which (*warning* lines), and stops with a message naming the patch when it is in the way of the output
   resolution, which cannot be half applied. Where a patch changes one of the two game functions ReLink runs natively (its
