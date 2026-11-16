@@ -19,6 +19,7 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <shared_mutex>
 #include <condition_variable>
 #include <string>
 #include <unordered_map>
@@ -883,6 +884,23 @@ struct PipeEntry {
     std::atomic<const Program*> prog{nullptr};          // (the program object whose stages and layout it was built from)
 };
 std::unordered_map<uint64_t, std::unique_ptr<PipeEntry>> pipelines;   // (the replay thread's)
+// (relink, 0.7.8, RX_VK_PIPE_SHARED=1) A parallel replay's thread that meets a pipeline its own map lacks found it in `pipelines`
+// under the recording lock (par_mu), and that lock is held for whole texture uploads, image creations and pool imports by the
+// thread doing them: in Hyrule Castle's arrival (hs3052) "pipelines" summed 248 ms of the slow submits, for 390 new pipelines
+// that each of the five threads met once. With it, a pipeline another thread made is found under this reader lock, without
+// par_mu; making one still takes par_mu, and the insertion takes this one too. Lean pipelines only: the full start's precompile
+// inserts from its own threads without it
+std::shared_mutex pipes_rw;
+std::atomic<int64_t> st_pipe_shared_hits{0}, st_pipe_locked{0};
+bool pipe_shared_on() {
+    static const bool on = [] {
+        const bool v = getenv("RX_VK_PIPE_SHARED") && atoi(getenv("RX_VK_PIPE_SHARED")) != 0 && pipelines_lean();
+        if (v)
+            logf("vk: pipelines another replay thread made are found without the recording lock (RX_VK_PIPE_SHARED=1)");
+        return v;
+    }();
+    return on;
+}
 int64_t st_draws, st_skipped, st_dispatches, st_passes, st_mesh, st_pending_skips, st_waits;
 // (relink) skips by the line that made them, reported with the frame statistics (draw_skip_report)
 namespace {
@@ -1516,6 +1534,27 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     static thread_local std::unordered_map<uint64_t, PipeEntry*> mine;   // (entries live as long as the cache)
     if (auto m = mine.find(mkey); m != mine.end()) return FINE_X(FC_PIPE_MAP, 1), remember(m->second);
     PROF_EXACT();   // (new to this thread, or new: rare, and a pipeline made can take milliseconds)
+    const bool shared = pipe_shared_on() && par_active.load(std::memory_order_relaxed);
+    if (shared) {   // (RX_VK_PIPE_SHARED: one made already, by any thread, found without par_mu; the same choice as below)
+        PipeEntry* found = nullptr;
+        {
+            std::shared_lock rl(pipes_rw);
+            auto it = pipelines.find(key);
+            if (by_program && it != pipelines.end()) {
+                const Program* made_for = it->second->prog.load(std::memory_order_acquire);
+                if (made_for && made_for != &p) it = pipelines.find(own);
+            }
+            if (it != pipelines.end()) found = it->second.get();
+        }
+        const int64_t n = found ? ++st_pipe_shared_hits : ++st_pipe_locked;
+        if (n % 2000 == 0) {
+            static std::atomic<int> told{0};
+            if (told++ < 30)
+                logf("vk: pipelines (RX_VK_PIPE_SHARED): %lld found by a replay thread without the recording lock, %lld looked up "
+                     "or made under it", (long long)st_pipe_shared_hits.load(), (long long)st_pipe_locked.load());
+        }
+        if (found) return remember(mine[mkey] = found);
+    }
     ParLock lk;
     auto it = pipelines.find(key);
     bool own_key = false;
@@ -1532,7 +1571,14 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     }
     if (it != pipelines.end()) return remember(mine[mkey] = it->second.get());
     pcache_init();
-    PipeEntry* e = pipelines.emplace(key, std::make_unique<PipeEntry>()).first->second.get();
+    PipeEntry* e;
+    {   // (RX_VK_PIPE_SHARED: the map changes under the readers' lock too; the program is set before any reader sees the entry)
+        std::unique_lock wl(pipes_rw, std::defer_lock);
+        if (pipe_shared_on()) wl.lock();
+        auto made = std::make_unique<PipeEntry>();
+        made->prog.store(&p, std::memory_order_release);
+        e = pipelines.emplace(key, std::move(made)).first->second.get();
+    }
     e->prog.store(&p, std::memory_order_release);
     if (!own_key) pipeline_note(key, p, s, at, topo, color_types);   // (its own key holds an address: nothing to note)
     static const bool sync = getenv("RX_VK_SYNC_PIPELINES") != nullptr;
