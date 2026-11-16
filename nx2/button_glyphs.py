@@ -14,6 +14,13 @@ The font's empty glyphs that nothing maps to are left out to make room.
 
 prompts.txt: what the host (host/prompts.c) needs to patch the fonts and wrap them as the game's file is wrapped, one
 record a line (see write_sidecar).
+
+keytex.bin: the HUD cross's faded letters. The game draws them from four textures of its Common layout archive
+(KeyTexFontA_00, B, X, Y: BC4, 64 x 64, one level, a mask of the letter alone that the layout tints), not from the font.
+The file holds a hash of each of the four as the renderer has them once unswizzled, and ReLink's own masks of each
+family's four face labels (the label alone, drawn from the outlines above), which the renderer uploads in their place
+(gpu/vk/prompt_tex.h; see write_keytex for the layout). The game's letters are decoded here only to be measured: their
+ink box and stroke, which ours are scaled and placed to match; none of their pixels is written.
 """
 import argparse
 import hashlib
@@ -1125,8 +1132,244 @@ def write_sidecar(path, orig, infos, wrap, fonts):
         f.write("\n".join(lines) + "\n")
 
 
+# ---------------------------------------------------------------------------------------------------------------------
+# The HUD cross's letters: four BC4 textures of the Common layout archive, replaced by the renderer
+
+BNTX = "UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs"
+KEYTEX = (("A", "KeyTexFontA_00"), ("B", "KeyTexFontB_00"), ("X", "KeyTexFontX_00"), ("Y", "KeyTexFontY_00"))
+FACE = ("south", "east", "west", "north")   # (the order of the masks in keytex.bin: HOS_PAD_SOUTH .. HOS_PAD_NORTH)
+KEYTEX_SIZE = 64
+BC4_UNORM = 0x1D01                          # (the BNTX's format number for BC4 UNORM)
+FACE_CAP = 292                              # (the face labels' cap height in the fonts: the symbols are drawn to it)
+
+
+def bc4_palette(a0, a1):
+    """the eight values of a BC4 block with endpoints a0, a1 (rounded as a GPU's unorm interpolation)"""
+    if a0 > a1:
+        return [a0, a1] + [((7 - i) * a0 + i * a1 + 3) // 7 for i in range(1, 7)]
+    return [a0, a1] + [((5 - i) * a0 + i * a1 + 2) // 5 for i in range(1, 5)] + [0, 255]
+
+
+def bc4_decode(blocks, w, h):
+    """linear BC4 blocks (rows of 4 x 4 blocks, top down) into w x h 8-bit values"""
+    px = bytearray(w * h)
+    bw = (w + 3) // 4
+    for k in range(len(blocks) // 8):
+        blk = blocks[8 * k:8 * k + 8]
+        pal = bc4_palette(blk[0], blk[1])
+        bits = int.from_bytes(blk[2:8], "little")
+        bx, by = k % bw, k // bw
+        for i in range(16):
+            x, y = 4 * bx + i % 4, 4 * by + i // 4
+            if x < w and y < h:
+                px[y * w + x] = pal[(bits >> (3 * i)) & 7]
+    return bytes(px)
+
+
+def bc4_block(v):
+    """one 4 x 4 block of 16 values as BC4: both modes tried (eight values between the endpoints; six plus 0 and 255),
+    each with its endpoints moved around the block's extremes, each value given the nearest of the palette; the
+    smallest squared error wins"""
+    lo, hi = min(v), max(v)
+    if lo == hi:
+        return bytes([lo, lo]) + bytes(6)
+    best = None
+    inner = [x for x in v if 0 < x < 255]
+    tries = [(1, lo, hi)]
+    if inner:
+        tries.append((0, min(inner), max(inner)))
+    else:
+        tries.append((0, 0, 0))
+    for eight, l0, h0 in tries:
+        for dh in range(-3, 4):
+            for dl in range(-3, 4):
+                h1, l1 = min(255, max(0, h0 + dh)), min(255, max(0, l0 + dl))
+                if eight and h1 <= l1:
+                    continue
+                if not eight and l1 > h1:
+                    continue
+                a0, a1 = (h1, l1) if eight else (l1, h1)
+                pal = bc4_palette(a0, a1)
+                idx, err = [], 0
+                for x in v:
+                    k = min(range(8), key=lambda j: abs(pal[j] - x))
+                    idx.append(k)
+                    err += (pal[k] - x) ** 2
+                if best is None or err < best[0]:
+                    best = (err, a0, a1, idx)
+        if best[0] == 0:
+            break
+    _, a0, a1, idx = best
+    bits = sum(k << (3 * i) for i, k in enumerate(idx))
+    return bytes([a0, a1]) + bits.to_bytes(6, "little")
+
+
+def bc4_encode(px, w, h):
+    """w x h 8-bit values (w, h multiples of 4) as linear BC4 blocks"""
+    out = bytearray()
+    for by in range(h // 4):
+        for bx in range(w // 4):
+            out += bc4_block([px[(4 * by + i // 4) * w + 4 * bx + i % 4] for i in range(16)])
+    return bytes(out)
+
+
+def bntx_linear(b, t, bpe):
+    """a BNTX texture's first level as linear blocks: rows of blocks, top down (bpe bytes a block, 4 x 4 texels)"""
+    _, _, w, h, gobs, data = t
+    bw, bh = (w + 3) // 4, (h + 3) // 4
+    pitch = (bw * bpe + 63) // 64
+    return b"".join(b[data + o:data + o + bpe] for o in (pa.gob_offset(x * bpe, y, gobs, pitch)
+                                                          for y in range(bh) for x in range(bw)))
+
+
+def game_keytex(b):
+    """{Switch button: the game's KeyTexFont texture as linear BC4 blocks} out of the decompressed Common BNTX"""
+    tex = pa.bntx_textures(b)
+    out = {}
+    for button, name in KEYTEX:
+        if name not in tex:
+            raise Unfit(f"no {name} in {BNTX}")
+        p, fmt, w, h, _, _ = tex[name]
+        mips, = struct.unpack_from("<H", b, p + 0x16)
+        layers, = struct.unpack_from("<I", b, p + 0x30)
+        if (fmt, w, h, mips, layers) != (BC4_UNORM, KEYTEX_SIZE, KEYTEX_SIZE, 1, 1):
+            raise Unfit(f"{name} is format {fmt:#x}, {w} x {h}, {mips} levels, {layers} layers: not the BC4 64 x 64 mask "
+                        "known")
+        out[button] = bntx_linear(b, tex[name], 8)
+    if len({fnv1a64(v) for v in out.values()}) != len(out):   # (the renderer tells them apart by their hash alone)
+        raise Unfit("two of the KeyTexFont textures have the same blocks")
+    return out
+
+
+def ink(px, w, h, cut=128):
+    """the box of the values at cut or more (x0, y0, x1, y1: pixel edges), the coverage in pixels (the values' sum /
+    255) and the stroke (the median length of the runs of values at cut or more along the rows)"""
+    xs = [i % w for i, v in enumerate(px) if v >= cut]
+    ys = [i // w for i, v in enumerate(px) if v >= cut]
+    if not xs:
+        return None, 0.0, 0
+    runs = []
+    for y in range(h):
+        r = 0
+        for x in range(w + 1):
+            if x < w and px[y * w + x] >= cut:
+                r += 1
+            elif r:
+                runs.append(r)
+                r = 0
+    runs.sort()
+    return (min(xs), min(ys), max(xs) + 1, max(ys) + 1), sum(px) / 255, runs[len(runs) // 2]
+
+
+def raster(contours, w, h, f, sub=16):
+    """the contours (font units, y up) through f into w x h pixels (y down), as coverage 0..255: even-odd fill, sub rows
+    a pixel, each span's ends exact along x"""
+    edges = []
+    for c in contours:
+        pts = [f(p) for p in flatten(c, 24)]
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]):
+            if y0 != y1:
+                edges.append((x0, y0, x1, y1))
+    acc = [0.0] * (w * h)
+    for sy in range(h * sub):
+        y = (sy + 0.5) / sub
+        xs = sorted(x0 + (y - y0) * (x1 - x0) / (y1 - y0) for x0, y0, x1, y1 in edges if (y0 <= y) != (y1 <= y))
+        row = (sy // sub) * w
+        for a, b in zip(xs[0::2], xs[1::2]):
+            a, b = max(a, 0.0), min(b, float(w))
+            if b <= a:
+                continue
+            ia, ib = int(a), int(b)
+            if ia == ib:
+                acc[row + ia] += (b - a) / sub
+                continue
+            acc[row + ia] += (ia + 1 - a) / sub
+            for i in range(ia + 1, ib):
+                acc[row + i] += 1 / sub
+            if ib < w:
+                acc[row + ib] += (b - ib) / sub
+    return bytes(min(255, round(v * 255)) for v in acc)
+
+
+def keytex_target(game):
+    """where and how big the game's letters are, averaged over the four: (centre x, centre y, cap height, stroke) in
+    pixels"""
+    boxes, strokes = [], []
+    for button, _ in KEYTEX:
+        box, cov, stroke = ink(bc4_decode(game[button], KEYTEX_SIZE, KEYTEX_SIZE), KEYTEX_SIZE, KEYTEX_SIZE)
+        if box is None or cov < 20:
+            raise Unfit(f"the game's KeyTexFont{button} holds no letter")
+        boxes.append(box)
+        strokes.append(stroke)
+    cx = sum(b[0] + b[2] for b in boxes) / (2 * len(boxes))
+    cy = sum(b[1] + b[3] for b in boxes) / (2 * len(boxes))
+    cap = sum(b[3] - b[1] for b in boxes) / len(boxes)
+    stroke = sorted(strokes)[len(strokes) // 2]
+    if not (12 <= cap <= 56 and 16 <= cx <= 48 and 16 <= cy <= 48 and 2 <= stroke <= cap / 3):
+        raise Unfit(f"the game's KeyTexFont letters are not the size known (cap height {cap:.1f}, centre {cx:.1f},"
+                    f"{cy:.1f}, stroke {stroke})")
+    return cx, cy, cap, stroke
+
+
+def keytex_mask(family, position, target):
+    """ReLink's mask of a family's face label (the label alone, no disc) as 64 x 64 coverage values: the letter drawn
+    at the game's letters' cap height with their stroke, the symbol with the face labels' proportions to that height,
+    its ink box centred on the game's letters'"""
+    global STEM, BAR
+    cx, cy, cap, stroke = target
+    p = Pen()
+    if family == "xbox":
+        H = 1000.0
+        old = STEM, BAR
+        STEM = stroke / cap
+        BAR = STEM * old[1] / old[0]
+        try:
+            contours = text({"south": "A", "east": "B", "west": "X", "north": "Y"}[position], H, 0, 0)
+        finally:
+            STEM, BAR = old
+        s = cap / H
+    else:
+        {"south": sym_cross, "east": sym_circle, "west": sym_square, "north": sym_triangle}[position](p, 0, 0)
+        contours = p.contours
+        s = cap / FACE_CAP
+    b = bbox(contours)
+    mx, my = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    return raster(contours, KEYTEX_SIZE, KEYTEX_SIZE, lambda q: (cx + (q[0] - mx) * s, cy - (q[1] - my) * s))
+
+
+def write_keytex(path, game, masks):
+    """keytex.bin, little-endian: "RLKT", u16 version 1, u16 textures 4, u16 width 64, u16 height 64, u16 families 2,
+    u16 positions 4; then for each of the game's textures (Switch A, B, X, Y) the button's letter, 7 zero bytes and
+    the 64-bit FNV-1a hash of its 2,048 bytes of BC4 blocks in rows, top down (as the renderer has them once
+    unswizzled); then the masks, 2,048 bytes of BC4 blocks each in the same order, xbox south, east, west, north, then
+    playstation's; then the 64-bit FNV-1a hash of all the bytes before it"""
+    out = bytearray(b"RLKT" + struct.pack("<6H", 1, len(KEYTEX), KEYTEX_SIZE, KEYTEX_SIZE, len(FAMILIES), len(FACE)))
+    for button, _ in KEYTEX:
+        out += button.encode() + bytes(7) + struct.pack("<Q", fnv1a64(game[button]))
+    for fam in FAMILIES:
+        for pos in FACE:
+            if len(masks[fam][pos]) != KEYTEX_SIZE * KEYTEX_SIZE // 2:
+                raise Unfit("a mask of the wrong size")
+            out += masks[fam][pos]
+    out += struct.pack("<Q", fnv1a64(bytes(out)))
+    with open(path, "wb") as f:
+        f.write(out)
+
+
+def make_keytex(romfs, dictionary, out):
+    """keytex.bin into out; the path, or raises Unfit"""
+    game = game_keytex(pa.read_zs(romfs, BNTX, dictionary))
+    target = keytex_target(game)
+    masks = {fam: {pos: bc4_encode(keytex_mask(fam, pos, target), KEYTEX_SIZE, KEYTEX_SIZE) for pos in FACE}
+             for fam in FAMILIES}
+    path = os.path.join(out, "keytex.bin")
+    write_keytex(path, game, masks)
+    return path, target
+
+
 def make(romfs, out):
-    wrapped = pa.read_zs(romfs, FONT, pa.zs_dictionary(romfs))
+    dictionary = pa.zs_dictionary(romfs)
+    wrapped = pa.read_zs(romfs, FONT, dictionary)
     orig = unwrap(wrapped)
     wrap = wrapper(wrapped)
     fonts, infos = {}, {}
@@ -1141,6 +1384,17 @@ def make(romfs, out):
     path = os.path.join(out, "prompts.txt")
     write_sidecar(path, orig, infos, wrap, fonts)
     print(f"button prompts: the slots and labels in {path}", file=sys.stderr)
+    # (the HUD cross's letters: without them the fonts still work, and the cross keeps the Switch's letters)
+    path = os.path.join(out, "keytex.bin")
+    try:
+        path, (cx, cy, cap, stroke) = make_keytex(romfs, dictionary, out)
+        print(f"button prompts: the HUD cross's letters (cap height {cap:.1f} px, stroke {stroke} px, centre {cx:.1f},"
+              f"{cy:.1f}) in {path}", file=sys.stderr)
+    except Exception as e:
+        if os.path.exists(path):
+            os.remove(path)
+        print(f"button prompts: the HUD cross's letters not made ({type(e).__name__ + ': ' if not isinstance(e, Unfit) else ''}"
+              f"{e}): they stay the Switch's", file=sys.stderr)
 
 
 def main(argv=None):
@@ -1153,7 +1407,7 @@ def main(argv=None):
     except Exception as e:   # (a font not the one known: the game shows its own prompts)
         print(f"button prompts: not made ({type(e).__name__ + ': ' if not isinstance(e, Unfit) else ''}{e})",
               file=sys.stderr)
-        for name in [fam + ".otf" for fam in FAMILIES] + ["prompts.txt"]:
+        for name in [fam + ".otf" for fam in FAMILIES] + ["prompts.txt", "keytex.bin"]:
             if os.path.exists(os.path.join(a.out, name)):
                 os.remove(os.path.join(a.out, name))
         return 1

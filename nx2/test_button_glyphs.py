@@ -8,6 +8,13 @@ advance; the slots in prompts.txt hold what the cmap gives, the defaults being R
 by hand); a patched slot changes that code point only; the checksums; the labels' outlines do not touch or cross each other
 (so a knocked-out label does not fill back in with any fill rule). Then it renders with FreeType (Pillow) every code point
 and every label at 64 and 20 px, and writes one contact sheet of the labels per family into --sheet.
+
+keytex.bin (the HUD cross's letters), with its own BNTX reader, GOB unswizzle (the renderer's texel copy's formula, not the
+script's) and BC4 decoder: the four KeyTexFont textures are found, BC4 64 x 64 one level, and their hashes are in the
+file; each of ReLink's eight masks decodes to something, differs from the others, and has an ink box and coverage close to
+the game's letters' (the tolerances are in check_keytex); a BNTX missing or with textures of another shape leaves the
+fonts made, keytex.bin not, and says so in one line. A contact sheet of ReLink's eight masks (none of the game's) goes
+into --sheet as keytex_masks.png.
 """
 import argparse
 import contextlib
@@ -309,6 +316,161 @@ def outline_problems(contours, gap=6):
     return out
 
 
+# --- keytex.bin ------------------------------------------------------------------------------------------------------
+
+def bntx_find(b, name):
+    """(format, width, height, levels, layers, block height in GOBs, data offset) of a texture of a Switch 2 BNTX"""
+    count = int.from_bytes(b[0x24:0x28], "little")
+    table = int.from_bytes(b[0x28:0x30], "little")
+    for i in range(count):
+        brti = int.from_bytes(b[table + 8 * i:table + 8 * i + 8], "little")
+        name_at = int.from_bytes(b[brti + 0x60:brti + 0x68], "little")
+        n = int.from_bytes(b[name_at:name_at + 2], "little")
+        if b[name_at + 2:name_at + 2 + n] != name.encode():
+            continue
+        u32 = lambda o: int.from_bytes(b[brti + o:brti + o + 4], "little")  # noqa: E731
+        levels_at = int.from_bytes(b[brti + 0x70:brti + 0x78], "little")
+        return (u32(0x1C), u32(0x24), u32(0x28), int.from_bytes(b[brti + 0x16:brti + 0x18], "little"), u32(0x30),
+                1 << u32(0x34), int.from_bytes(b[levels_at:levels_at + 8], "little"))
+    return None
+
+
+def unswizzle_blocks(b, data, bw, bh, bpb, gobs):
+    """block-linear blocks into rows: each block's place by the GOB formula of gpu/vk/vk_texture.cpp's texel copy (the
+    Switch 2 GOB, 512 bytes, blocks of gobs GOBs high)"""
+    th = gobs.bit_length() - 1
+    gobs_x = (bw * bpb + 63) // 64
+    block = 512 << th
+    out = bytearray()
+    for y in range(bh):
+        for xb in range(0, bw * bpb, 16):
+            gob = ((xb & 63) >> 5) << 8 | ((y & 7) >> 2) << 7 | ((xb & 31) >> 4) << 6 | ((y >> 1) & 1) << 5 | (y & 1) << 4
+            off = (y >> (3 + th)) * gobs_x * block + (xb >> 6) * block + (((y >> 3) & ((1 << th) - 1)) << 9) + gob
+            out += b[data + off:data + off + 16]
+    return bytes(out)
+
+
+def bc4(blocks, w):
+    """BC4 blocks in rows into w x w values (interpolation in floating point, rounded)"""
+    px = [0] * (w * w)
+    per = w // 4
+    for k in range(len(blocks) // 8):
+        a, c = blocks[8 * k], blocks[8 * k + 1]
+        if a > c:
+            pal = [a, c] + [round(((7 - i) * a + i * c) / 7) for i in range(1, 7)]
+        else:
+            pal = [a, c] + [round(((5 - i) * a + i * c) / 5) for i in range(1, 5)] + [0, 255]
+        bits = int.from_bytes(blocks[8 * k + 2:8 * k + 8], "little")
+        for i in range(16):
+            px[(4 * (k // per) + i // 4) * w + 4 * (k % per) + i % 4] = pal[(bits >> (3 * i)) & 7]
+    return px
+
+
+def measure(px, w):
+    """the ink box (pixels at 128 or more: x0, y0, x1, y1 as pixel edges), the coverage (sum / 255) and the median run of
+    pixels at 128 or more along the rows"""
+    on = [(i % w, i // w) for i, v in enumerate(px) if v >= 128]
+    if not on:
+        return None, 0.0, 0
+    runs = []
+    for y in range(w):
+        r = 0
+        for x in range(w + 1):
+            if x < w and px[y * w + x] >= 128:
+                r += 1
+            elif r:
+                runs.append(r)
+                r = 0
+    runs.sort()
+    return ((min(p[0] for p in on), min(p[1] for p in on), max(p[0] for p in on) + 1, max(p[1] for p in on) + 1),
+            sum(px) / 255, runs[len(runs) // 2])
+
+
+def fnv64(b):
+    h = 0xCBF29CE484222325
+    for c in b:
+        h = ((h ^ c) * 0x100000001B3) % (1 << 64)
+    return h
+
+
+def check_keytex(path, bntx, sheet_dir, Image, ImageDraw, ImageFont):
+    """keytex.bin against the game's textures. Tolerances: each mask's ink box centre within 2 px of the game's letters'
+    mean centre in x and y, its height within 4 px of their mean height and its width within 6 px of their mean width,
+    its coverage within 40 % of their mean coverage; each Xbox letter against the game's same letter: each side of the
+    box within 3 px, coverage within 25 %, median run within 1 px"""
+    with open(path, "rb") as fh:
+        k = fh.read()
+    check(len(k) == 16 + 4 * 16 + 8 * 2048 + 8, f"keytex.bin is {len(k)} bytes")
+    check(k[:4] == b"RLKT" and struct.unpack("<6H", k[4:16]) == (1, 4, 64, 64, 2, 4), "keytex.bin's header")
+    check(struct.unpack("<Q", k[-8:])[0] == fnv64(k[:-8]), "keytex.bin's last hash")
+    game = {}
+    for i, sw in enumerate("ABXY"):
+        t = bntx_find(bntx, f"KeyTexFont{sw}_00")
+        check(t is not None, f"KeyTexFont{sw}_00 found")
+        if t is None:
+            return
+        fmt, w, h, levels, layers, gobs, data = t
+        print(f"(KeyTexFont{sw}_00: format {fmt:#x}, {w} x {h}, {levels} level, {layers} layer, blocks {gobs} GOBs high)")
+        check((fmt, w, h, levels, layers) == (0x1D01, 64, 64, 1, 1), f"KeyTexFont{sw}_00 is BC4 64 x 64, one level")
+        blocks = unswizzle_blocks(bntx, data, 16, 16, 8, gobs)
+        rec = k[16 + 16 * i:32 + 16 * i]
+        check(rec[:1] == sw.encode() and rec[1:8] == bytes(7), f"keytex.bin's record {i} is Switch {sw}'s")
+        check(struct.unpack("<Q", rec[8:])[0] == fnv64(blocks), f"keytex.bin holds KeyTexFont{sw}_00's hash")
+        game[sw] = measure(bc4(blocks, 64), 64)
+        print(f"(game {sw}: ink box {game[sw][0]}, coverage {game[sw][1]:.0f} px, median run {game[sw][2]} px)")
+    hashes = {k[24 + 16 * i:32 + 16 * i] for i in range(4)}
+    check(len(hashes) == 4, "keytex.bin's four hashes differ (the renderer tells the textures apart by them)")
+    boxes = [g[0] for g in game.values()]
+    mean_cx = sum(b[0] + b[2] for b in boxes) / 8
+    mean_cy = sum(b[1] + b[3] for b in boxes) / 8
+    mean_w = sum(b[2] - b[0] for b in boxes) / 4
+    mean_h = sum(b[3] - b[1] for b in boxes) / 4
+    mean_cov = sum(g[1] for g in game.values()) / 4
+    masks, seen = {}, {}
+    for f, fam in enumerate(FAMILIES):
+        for p, pos in enumerate(["south", "east", "west", "north"]):
+            at = 80 + (4 * f + p) * 2048
+            blocks = k[at:at + 2048]
+            px = bc4(blocks, 64)
+            masks[(fam, pos)] = px
+            box, cov, run = measure(px, 64)
+            print(f"({fam} {pos}: ink box {box}, coverage {cov:.0f} px, median run {run} px)")
+            check(box is not None and cov > 50, f"{fam} {pos}: the mask is not empty")
+            if box is None:
+                continue
+            check(blocks not in seen, f"{fam} {pos} and {seen.get(blocks)} are the same mask")
+            seen[blocks] = (fam, pos)
+            cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+            check(abs(cx - mean_cx) <= 2 and abs(cy - mean_cy) <= 2,
+                  f"{fam} {pos}: centre {cx},{cy} not within 2 px of the game's {mean_cx},{mean_cy}")
+            check(abs((box[3] - box[1]) - mean_h) <= 4 and abs((box[2] - box[0]) - mean_w) <= 6,
+                  f"{fam} {pos}: {box[2] - box[0]} x {box[3] - box[1]} against the game's {mean_w} x {mean_h}")
+            check(abs(cov - mean_cov) <= 0.4 * mean_cov, f"{fam} {pos}: coverage {cov:.0f} against the game's {mean_cov:.0f}")
+            if fam == "xbox":
+                sw = {"south": "A", "east": "B", "west": "X", "north": "Y"}[pos]
+                gbox, gcov, grun = game[sw]
+                check(all(abs(a - b) <= 3 for a, b in zip(box, gbox)) and abs(cov - gcov) <= 0.25 * gcov and
+                      abs(run - grun) <= 1, f"xbox {pos} ({sw}) against the game's {sw}: {box} {cov:.0f} {run}, "
+                      f"{gbox} {gcov:.0f} {grun}")
+    # the contact sheet: ReLink's masks only, each at 64 x 64 and enlarged 4 times, white on dark as the layout tints them
+    cell = 4 * 64 + 12
+    sheet = Image.new("L", (cell * 4, 2 * (cell + 64 + 24)), 40)
+    dr = ImageDraw.Draw(sheet)
+    small = ImageFont.load_default()
+    for (fam, pos), px in masks.items():
+        f, p = FAMILIES.index(fam), ["south", "east", "west", "north"].index(pos)
+        im = Image.new("L", (64, 64))
+        im.putdata(px)
+        x, y = p * cell + 6, f * (cell + 64 + 24) + 6
+        sheet.paste(im.resize((256, 256), Image.NEAREST), (x, y))
+        sheet.paste(im, (x, y + 262))
+        dr.text((x + 72, y + 290), f"{fam} {pos}", font=small, fill=255)
+    os.makedirs(sheet_dir, exist_ok=True)
+    out = os.path.join(sheet_dir, "keytex_masks.png")
+    sheet.save(out)
+    print(f"keytex: contact sheet {out}")
+
+
 # --- the test --------------------------------------------------------------------------------------------------------
 
 def main():
@@ -509,6 +671,35 @@ def main():
         path = os.path.join(a.sheet, f"prompts_{fam}.png")
         sheet.save(path)
         print(f"{fam}: contact sheet {path}")
+
+    # keytex.bin: the HUD cross's letters
+    bntx_rel = "UI/Layout2Archive/Common.Product.100.Nin_Ounce_NVN2.bntx.zs"
+    kpath = os.path.join(tmp, "keytex.bin")
+    check(os.path.exists(kpath), "keytex.bin made")
+    if os.path.exists(kpath):
+        bntx = wheel_assets.read_zs(a.romfs, bntx_rel, wheel_assets.zs_dictionary(a.romfs))
+        check_keytex(kpath, bntx, a.sheet, Image, ImageDraw, ImageFont)
+        del bntx
+
+    # a BNTX missing, textures of another shape: the fonts made, keytex.bin not, one line about it, exit 0
+    def keytex_failing(why, attr, value):
+        old = getattr(button_glyphs, attr)
+        setattr(button_glyphs, attr, value)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = button_glyphs.main(["--romfs", a.romfs, "--out", d])
+                left = sorted(os.listdir(d))
+                lines = [ln for ln in err.getvalue().splitlines() if "cross" in ln]
+                print(f"({why}: exit {rc}: {' / '.join(lines)}; files {left})")
+                check(rc == 0 and len(lines) == 1 and "not made" in lines[0] and
+                      left == ["playstation.otf", "prompts.txt", "xbox.otf"], f"{why}: fonts made, keytex.bin not, one line")
+        finally:
+            setattr(button_glyphs, attr, old)
+    keytex_failing("no BNTX", "BNTX", "UI/Layout2Archive/Missing.bntx.zs")
+    keytex_failing("textures of another shape", "KEYTEX", (("A", "DoCommandCrossBase_A_00"), ("B", "KeyTexFontB_00"),
+                                                           ("X", "KeyTexFontX_00"), ("Y", "KeyTexFontY_00")))
 
     for name in os.listdir(tmp):
         os.remove(os.path.join(tmp, name))
