@@ -41,14 +41,32 @@ static void mount(const char *name, const char *root, int writable) {
            Product.111): a game that died in its first second gave no other trace of the files it read */
         char pattern[MAX_PATH];
         WIN32_FIND_DATAA fd;
-        snprintf(pattern, sizeof pattern, "%s\\System\\Resource\\ResourceSizeTable*", root);
-        HANDLE f = FindFirstFileA(pattern, &fd);
         /* (relink, issue 26) and said to the player: the game reads that table first and dies in its first second without it
            (a null from its allocator), and a romfs from another PC port's install (a few packed .bin files) had none. Not
            stopped here: only said, the game goes on as before */
         const char *expected = "ResourceSizeTable.Product.111.Nin_Ounce_NVN2.rsizetable.zs";
+        /* (relink, issue 88) The supported version's table is looked for by its own name first. The folder's first
+           ResourceSizeTable file was taken as the version: a dump of the updated game that keeps the first version's table
+           beside the update's (Product.100 sorts before Product.111) was called another version at every start, with the
+           right files in it. Another version's table beside the supported one is only noted in the log */
+        WIN32_FIND_DATAA other;
+        int found = 0, others = 0;   /* (found: fd holds a table, the supported one when it is there) */
+        snprintf(pattern, sizeof pattern, "%s\\System\\Resource\\%s", root, expected);
+        HANDLE f = FindFirstFileA(pattern, &fd);
+        if (f != INVALID_HANDLE_VALUE) found = 1, FindClose(f);
+        snprintf(pattern, sizeof pattern, "%s\\System\\Resource\\ResourceSizeTable*", root);
+        f = FindFirstFileA(pattern, &other);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                if (!_stricmp(other.cFileName, expected)) continue;
+                if (!found) { fd = other, found = 2; break; }   /* (no supported table: the first other one is the version) */
+                if (others++ < 4)
+                    hos_log("fs: another version's table is beside the supported one and is not read: %s", other.cFileName);
+            } while (FindNextFileA(f, &other));
+            FindClose(f);
+        }
         char text[1024] = "";
-        if (f == INVALID_HANDLE_VALUE) {
+        if (!found) {
             hos_log("fs: the RomFS has no System\\Resource\\ResourceSizeTable file: the game files are incomplete");
             snprintf(text, sizeof text, "The game files in %s are not the game's own RomFS: its System\\Resource folder has no "
                      "ResourceSizeTable file, and the game will most likely close at once.\n\nA romfs folder taken from another PC "
@@ -56,8 +74,7 @@ static void mount(const char *name, const char *root, int writable) {
                      "of the game (the .nup file, or the romfs and exefs folders dumped from it).", root);
         } else {
             hos_log("fs: RomFS resource table %s (%lu bytes)", fd.cFileName, (unsigned long)fd.nFileSizeLow);
-            FindClose(f);
-            if (_stricmp(fd.cFileName, expected)) {
+            if (found == 2) {
                 hos_log("fs: that is not the supported version's (%s): the game files are from another version", expected);
                 snprintf(text, sizeof text, "The game files in %s are from another version of the game (%s; ReLink supports the "
                          "one with %s), and the game may close or misbehave.\n\nInstall again from a dump of the game with its "
