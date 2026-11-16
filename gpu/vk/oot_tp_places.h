@@ -1,4 +1,5 @@
-/* The Teleport page's places, after the Fast Travel mod's list (MIT, OoT_FastTravel), grouped by the Zelda Wiki's regions. */
+/* The Travel page's places, after the Fast Travel mod's list (MIT: its copyright and permission notice are in NOTICE.md),
+   grouped by the Zelda Wiki's regions. */
 /* The Teleport page's places (gpu/vk/vk_menu.cpp) and their warps (host/hos_main.c), C and C++. */
 #pragma once
 typedef struct { int adult, region; const char *title; int first, count; } OotTpArea;
