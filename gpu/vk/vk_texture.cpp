@@ -3816,6 +3816,31 @@ void texture_frame(uint64_t completed) {
     static const bool strict = !getenv("RX_VK_SPARE_STRICT") || atoi(getenv("RX_VK_SPARE_STRICT")) != 0;
     int per_frame = tight ? std::max(per_frame_cfg, 1024) : per_frame_cfg;
     if (strict && !tight && dead.size() > (size_t)per_frame * 8) per_frame = std::max(per_frame, (int)(dead.size() / 30));
+    // (relink, 0.7.8, RX_VK_SPARES_NEWEST=1) The spares as the newest dead images, and a few of them while VRAM is tight. In the
+    // Market with the camera turning (hs3006, 8 GB card) the game makes 3766-8484 images a 600 frames (its per-frame targets at
+    // addresses that move in its transient heap) and the render thread spent 7.9 % of its time in vmaCreateImage: VRAM was over
+    // 95 % of what the driver allows, so no dead image was kept (0 spares, 3 and 310 recycled), and in the block before, the
+    // reserve was full of images kept up to 300 frames earlier (59 spares, 180 of 192 MB), so the ones that had just died, the
+    // likeliest to be asked for again, were destroyed instead (15 recycled, 1715 made). With it: a dead image that does not fit
+    // under the cap takes the place of the oldest spares; and while VRAM is over 95 % but under what the driver allows (and the
+    // system not short of commit), up to RX_VK_TIGHT_SPARE_MB (64) of spares for RX_VK_TIGHT_SPARE_FRAMES (60) frames instead of
+    // none. A spare taken for a new texture is VRAM the new one would have taken anyway; the ones nobody takes are at most that.
+    static const bool newest = [] {
+        const bool on = getenv("RX_VK_SPARES_NEWEST") && atoi(getenv("RX_VK_SPARES_NEWEST")) != 0;
+        if (on)
+            logf("vk: spare images: the newest dead ones kept, the oldest let go for them, and up to %d MB kept for %d frames while VRAM "
+                 "is tight (RX_VK_SPARES_NEWEST=1; RX_VK_TIGHT_SPARE_MB, RX_VK_TIGHT_SPARE_FRAMES)",
+                 getenv("RX_VK_TIGHT_SPARE_MB") ? std::max(0, atoi(getenv("RX_VK_TIGHT_SPARE_MB"))) : 64,
+                 getenv("RX_VK_TIGHT_SPARE_FRAMES") ? std::max(1, atoi(getenv("RX_VK_TIGHT_SPARE_FRAMES"))) : 60);
+        return on;
+    }();
+    static const uint64_t tight_cap = (uint64_t)(getenv("RX_VK_TIGHT_SPARE_MB") ? std::max(0, atoi(getenv("RX_VK_TIGHT_SPARE_MB"))) : 64) << 20;
+    static const uint64_t tight_life = (uint64_t)(getenv("RX_VK_TIGHT_SPARE_FRAMES") ? std::max(1, atoi(getenv("RX_VK_TIGHT_SPARE_FRAMES"))) : 60);
+    static int64_t st_newest_kept, st_newest_tight, st_newest_evicted, st_tight_frames;
+    // (vu and va were asked above whenever tight is set for VRAM; tight for commit alone keeps the old rule: none kept)
+    const bool keep_tight = newest && tight && tight_cap && va && vu <= va && commit_short(frame_no) == 0;
+    const uint64_t spare_cap = keep_tight ? tight_cap : kSpareBytes;
+    st_tight_frames += keep_tight;
     int destroyed = 0;
     for (auto it = dead.begin(); it != dead.end() && destroyed < per_frame;) {
         if (it->value > completed) {
@@ -3824,8 +3849,19 @@ void texture_frame(uint64_t completed) {
         }
         if (!it->views.empty())   // (relink: on the reaper, before the image's own end: vk_vma.cpp)
             reap([views = std::move(it->views)] { for (VkImageView v : views) vkDestroyImageView(dev.device, v, nullptr); });
-        const bool spare = !tight && recycle_on() && it->ci.sType == VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO && it->image && it->memory.empty() &&
-                           it->bytes <= kSpareBytes / 4 && (!strict || spare_bytes + it->bytes <= kSpareBytes);
+        const bool kind_ok = recycle_on() && it->ci.sType == VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO && it->image && it->memory.empty();
+        bool spare = !tight && kind_ok && it->bytes <= kSpareBytes / 4 && (!strict || spare_bytes + it->bytes <= kSpareBytes);
+        if (newest && !spare && kind_ok && (!tight || keep_tight) && it->bytes <= spare_cap / 4) {
+            // (room made by the oldest spares, each one destroyed counted as the dead one would have been)
+            while (!spares.empty() && spare_bytes + it->bytes > spare_cap && destroyed < per_frame) {
+                destroy_image(spares.front().image, spares.front().allocation);
+                spare_bytes -= std::min(spare_bytes, spares.front().bytes);
+                spares.erase(spares.begin());
+                destroyed++, st_newest_evicted++;
+            }
+            spare = spare_bytes + it->bytes <= spare_cap;
+            if (spare) st_newest_kept++, st_newest_tight += keep_tight;
+        }
         if (spare) {
             spares.push_back({it->ci, it->image, it->allocation, frame_no, it->bytes});   // (relink: kept for the next of its kind)
             spare_bytes += it->bytes;
@@ -3841,7 +3877,11 @@ void texture_frame(uint64_t completed) {
     // (relink) spare images: none kept over 300 frames, nor past kSpareBytes (the oldest go first)
     if (strict) destroyed = 0;   // (their trim has the cap to itself)
     for (size_t i = 0; i < spares.size();) {
-        if ((frame_no - spares[i].frame > 300 || spare_bytes > kSpareBytes || tight) && destroyed < per_frame) {
+        // (RX_VK_SPARES_NEWEST: while VRAM is tight, the few kept go after tight_life frames or past their cap, not all at once)
+        const bool go = newest && (!tight || keep_tight)
+                            ? frame_no - spares[i].frame > (keep_tight ? tight_life : 300) || spare_bytes > spare_cap
+                            : frame_no - spares[i].frame > 300 || spare_bytes > kSpareBytes || tight;
+        if (go && destroyed < per_frame) {
             destroyed++;
             destroy_image(spares[i].image, spares[i].allocation);
             spare_bytes -= std::min(spare_bytes, spares[i].bytes);
@@ -3853,6 +3893,11 @@ void texture_frame(uint64_t completed) {
     if (frame_no % 600 == 0 && (st_recycled || st_fresh)) {
         logf("vk: images: %lld recycled, %lld made (%zu spares, %llu MB)", (long long)st_recycled, (long long)st_fresh, spares.size(),
              (unsigned long long)(spare_bytes >> 20));
+        if (newest)
+            logf("vk: spares (RX_VK_SPARES_NEWEST): %lld kept that the old rule destroyed (%lld of them while VRAM was tight), %lld older "
+                 "ones let go for them; VRAM tight with spares kept %lld of these frames", (long long)st_newest_kept,
+                 (long long)st_newest_tight, (long long)st_newest_evicted, (long long)st_tight_frames);
+        st_newest_kept = st_newest_tight = st_newest_evicted = st_tight_frames = 0;
         st_recycled = st_fresh = 0;
     }
     // A budget: RX_VK_VRAM_MB of textures (default 4096), and less when the driver says the process is near what it
