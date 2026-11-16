@@ -3188,8 +3188,8 @@ void status_tick() {
 
 uint64_t present_value = 0;   // (the present job's value, handed out as it came; 0: the next one)
 // (relink, from Longshot) the Travel page's own pictures, vk_menu.cpp: when the game side says Link has stayed at a place, the
-// middle 60% of the picture shown, away from the HUD's corners, at 480x270; recorded with one present and read at the next,
-// handed to the menu's picture worker
+// middle 60% of the picture shown, away from the HUD's corners, at 480x270; recorded with one present and read at a later one
+// once the GPU has finished it (a present never waits for it), handed to the menu's picture worker
 struct TeleportShot {
     VkImage image = VK_NULL_HANDLE;
     VmaAllocation image_alloc = nullptr;
@@ -3203,8 +3203,8 @@ struct TeleportShot {
 TeleportShot tp_shot;
 constexpr uint32_t kTpShotW = 480, kTpShotH = 270;
 void teleport_capture(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t sh, const int crop[4], uint64_t value) {
-    if (tp_shot.pending >= 0) {   // (the last one's pixels: its present is behind this one)
-        wait_value(tp_shot.value);
+    if (tp_shot.pending >= 0) {   // (the last one's pixels, once the GPU is past its present: never waited for here)
+        if (completed() < tp_shot.value) return;
         invalidate_mapped(tp_shot.buf_alloc, (uint64_t)kTpShotW * kTpShotH * 4);
         menu_store_capture(tp_shot.pending, (const uint8_t*)tp_shot.map, kTpShotW, kTpShotH);
         tp_shot.pending = -1;
