@@ -39,6 +39,7 @@
 #include "oot_teleport_capture.h"   // (relink: the Travel page's pictures)
 #include "oot_tp_places.h"   // (relink: the Travel page's places)
 #include "prompt_tex.h"   // (relink: the HUD cross's letters follow the button font)
+#include "vk_screenshot.h"   // (relink: F12)
 #include "vk_startup_paint.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #include "vk_dlss.h"
@@ -2209,6 +2210,26 @@ void menu_store_capture(int place, const uint8_t* rgba, uint32_t w, uint32_t h) 
     picture_job(std::move(j));
 }
 bool menu_teleport_captures_on() { return travel_pictures_on.load(std::memory_order_relaxed); }   // (relink)
+/// (relink) F12 (menu_tick): the next present's picture is kept. With the menu open too: the picture is the game's, the
+/// menu is drawn over it afterwards and is not in it
+std::atomic<bool> screenshot_want{false};
+bool menu_take_screenshot_request() { return screenshot_want.exchange(false, std::memory_order_relaxed); }
+void menu_store_screenshot(std::vector<uint8_t>&& rgba, uint32_t w, uint32_t h) {
+    // (a thread of its own: compressing and writing a 3840x2160 picture takes a few hundred ms, never the replay's)
+    std::thread([px = std::move(rgba), w, h] {
+        const std::string path = screenshot_path(game_folder_file("screenshots"));
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool saved = screenshot_write(path, px.data(), w, h);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        const size_t slash = path.find_last_of("\\/");
+        const std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+        logf("menu: screenshot %ux%u %s%s (%.0f ms)", w, h, saved ? "written to " : "NOT written: ", path.empty() ? "no game folder" : path.c_str(), ms);
+        if (saved) snprintf(notice_text, sizeof notice_text, "Screenshot saved: screenshots\\%s", name.c_str());
+        else snprintf(notice_text, sizeof notice_text, "The screenshot could not be saved");
+        notice_new.store(true, std::memory_order_release);
+        notice_until.store(prof_now() + 2500000000LL, std::memory_order_relaxed);
+    }).detach();
+}
 int menu_heart_protection() { return protect_hearts.load(std::memory_order_relaxed); }
 int menu_player_flight() { return cheats_enabled ? player_flight.load(std::memory_order_relaxed) : -1; }
 int menu_free_camera() { return free_camera.load(std::memory_order_relaxed); }
@@ -2357,6 +2378,10 @@ void menu_tick() {
         press[i] = host && host->take_key_press ? mine && queued : down && !held[i];
         held[i] = down;
     }
+    // (relink) F12: a screenshot of the game's picture (vk_screenshot.h), menu open or not; not while a control waits for
+    // its key in the menu (the key is that control's then)
+    if (host && host->take_key_press && host->take_key_press(VK_F12) && mine && !listening)
+        screenshot_want.store(true, std::memory_order_relaxed);
     // (relink) the gamepads, by position: Home, or Select and Start together, as Insert; the D-pad as the arrows,
     // the bottom face button as Enter, the right one as Esc (not while a binding waits for its button)
     static uint32_t pad_held = 0;
@@ -2385,6 +2410,7 @@ void menu_tick() {
         press[4] |= pad(HOS_PAD_RIGHT), press[5] |= pad(HOS_PAD_EAST), press[7] |= pad(HOS_PAD_SOUTH);
     }
     {   // RX_VK_MENU_SCRIPT (test runs, which never have the focus): timed menu keys, "<seconds>:<INS|UP|DOWN|LEFT|RIGHT|ESC|ENTER|TABL|TABR>,..."
+        // (SHOT: F12, the screenshot)
         static const char* next = getenv("RX_VK_MENU_SCRIPT");
         static const int64_t start = prof_now();
         double at;
@@ -2393,6 +2419,7 @@ void menu_tick() {
         if (next && sscanf(next, "%lf:%7[A-Z]%n", &at, key, &n) == 2 && (prof_now() - start) / 1e9 >= at) {
             static const char* names[] = {"INS", "UP", "DOWN", "LEFT", "RIGHT", "ESC", "", "ENTER", "", "", "TABL", "TABR"};
             for (int i = 0; i < 12; i++) press[i] |= *names[i] && !strcmp(key, names[i]);
+            if (!strcmp(key, "SHOT")) screenshot_want.store(true, std::memory_order_relaxed);
             next = next[n] == ',' ? next + n + 1 : nullptr;
         }
     }

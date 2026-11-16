@@ -91,6 +91,10 @@ int menu_link_age();          // (relink) Link's age as the game side said it: 0
 int menu_take_capture_request();   // (relink, vk_replay.cpp: a place whose picture the Travel page wants now, -1 none)
 void menu_store_capture(int place, const uint8_t* rgba, uint32_t w, uint32_t h);   // (that picture, RGBA: to the picture worker)
 bool menu_teleport_captures_on();   // (relink: whether the Travel page's pictures are taken: the game side watches only then)
+bool menu_take_screenshot_request();   // (relink, vk_replay.cpp: F12 was pressed since the last picture taken)
+/// (relink) F12's picture (RGBA, the game's picture as presented): a worker writes it as a PNG in the game folder's
+/// screenshots folder and says so over the game (vk_screenshot.h)
+void menu_store_screenshot(std::vector<uint8_t>&& rgba, uint32_t w, uint32_t h);
 void menu_note_frame(bool game_frame);   // (the frame rates the FPS counter shows)
 /// The game's picture's size (the Output resolution, its crop) and the window's, at each present: the Window scaling filter
 /// row says when it is not needed

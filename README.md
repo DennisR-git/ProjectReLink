@@ -79,7 +79,9 @@ folder, from the game files the folder keeps: your `.nup` is not needed again. S
 The launcher sets the display (full screen, 3D render resolution, upscaling, sharpness, ultrawide), the smoothness (60
 frames a second or unlocked, frame generation), the game's language and the controls. It can put the display at 60 Hz while
 you play, so that every frame lasts the same time on a 100 or 144 Hz display, and puts the display's own rate back
-afterwards. In the game, **Insert** or **F1** opens the same menu, and **F11** switches full screen.
+afterwards. In the game, **Insert** or **F1** opens the same menu, **F11** switches full screen, and **F12** saves a
+screenshot: the game's picture at its output resolution, without the menu or the FPS counter, as a PNG in the game folder's
+`screenshots` folder (a line over the game says where).
 
 **Upscaler** (since 0.7): what scales the 3D up to the screen. The game's own network by default; **AMD FSR 3.1** on any
 graphics card (AMD's library comes with ReLink); or **NVIDIA DLSS / DLAA** on an RTX card, after turning on **NVIDIA DLSS** on
