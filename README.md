@@ -108,8 +108,9 @@ ZR; +Bombs the bombs too; +Tools the hookshot, hammer, slingshot and boomerang t
 in for the two rows.
 
 **Travel** (Gameplay): a page of 190 places to go to, villages, dungeons' entrances, shops, warp points and story spots,
-grouped by area, for Link's age (Tab or X shows the other age's: going there makes Link that age). Each place has a picture taken from your own game the first time Link stays there a few
-seconds with the menu closed (in `teleport_pictures` in the game folder); Y or Backspace on the page takes a place's picture
+grouped by area, for Link's age (Tab or X shows the other age's: going there makes Link that age). Once you have opened the
+page, each place gets a picture taken from your own game the first time Link stays there a few seconds with the menu closed
+(in `teleport_pictures` in the game folder); Y or Backspace on the page takes a place's picture
 again at the next stay there. Link arrives through the game's own map change, as when he walks in. The places' positions
 and arrival events come from your game files at every build (`teleport_places.bin`, `nx2/teleport_places.py`).
 

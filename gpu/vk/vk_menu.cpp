@@ -1194,6 +1194,9 @@ std::map<std::string, TeleportPicture> teleport_captures;   // (by a place's key
 std::map<std::string, int> teleport_files;   // (by key: 1 its file being read, 2 read: in teleport_captures, or none on disk)
 std::mutex teleport_captures_mu;   // (both maps: the worker's thread and the menu's)
 std::atomic<int> teleport_capture_want{-1};
+// (whether pictures are taken at all: only once the player has opened the Travel page, in this session or an earlier one (its
+// folder is there). A player who never opens it gets no files and no notice over the game)
+std::atomic<bool> travel_pictures_on{false};
 std::atomic<int> teleport_map_now{-1};   // (the place nearest Link, as the game side says)
 std::atomic<int64_t> notice_until{0};    // (a line over the game while the menu is closed: a picture taken, until then)
 std::atomic<bool> notice_new{false};     // (drawn again at the next frame: a new picture)
@@ -1259,7 +1262,7 @@ bool write_picture_file(const std::string& path, const TeleportPicture& p) {
 // The worker's jobs: read a picture's file; Link has stayed near a place (its picture wanted when it has none, here or on
 // disk); keep and write a picture taken; forget one (the page's retake: taken again at the next stay there)
 struct PictureJob {
-    enum Kind { Read, Arrived, Store, Forget } kind = Read;
+    enum Kind { Read, Arrived, Store, Forget, Begin } kind = Read;   // (Begin: the page opened the first time, its folder made)
     int place = -1;     // (Arrived, Store, Forget: a place of oot_tp_places)
     std::string name;   // (Read: a place's key)
     TeleportPicture pic;
@@ -1290,7 +1293,12 @@ void picture_worker() {
             j = std::move(picture_jobs.front());
             picture_jobs.pop_front();
         }
-        if (j.kind == PictureJob::Read) {
+        if (j.kind == PictureJob::Begin) {
+            std::error_code ec;
+            const std::string dir = game_folder_file("teleport_pictures");
+            if (!dir.empty()) std::filesystem::create_directories(dir, ec);
+            logf("menu: Travel pictures are taken from now on, in %s%s", dir.c_str(), ec ? " (the folder could not be made)" : "");
+        } else if (j.kind == PictureJob::Read) {
             picture_read_now(j.name);
             menu_refresh = true;   // (the page shows it now, if it is the chosen place's)
         } else if (j.kind == PictureJob::Arrived) {
@@ -2074,6 +2082,11 @@ void menu_init() {
     bool has_options = false;
     const char* cheats = getenv("HOS_OOT_CHEATS");
     cheats_enabled = cheats && !strcmp(cheats, "1");
+    {   // (relink) the Travel page's pictures: taken when the page was opened before (its folder is there)
+        std::error_code ec;
+        const std::string dir = game_folder_file("teleport_pictures");
+        travel_pictures_on.store(!dir.empty() && std::filesystem::is_directory(dir, ec), std::memory_order_relaxed);
+    }
     if (cheats_enabled) {
         const char* hearts = getenv("HOS_OOT_PROTECT_HEARTS");
         protect_hearts.store(hearts && !strcmp(hearts, "1"));
@@ -2170,7 +2183,7 @@ void menu_store_capture(int place, const uint8_t* rgba, uint32_t w, uint32_t h) 
     j.pic.rgba.assign(rgba, rgba + (size_t)w * h * 4);
     picture_job(std::move(j));
 }
-bool menu_teleport_captures_on() { return true; }   // (relink: the Travel row is on the Gameplay tab for everyone)
+bool menu_teleport_captures_on() { return travel_pictures_on.load(std::memory_order_relaxed); }   // (relink)
 int menu_heart_protection() { return protect_hearts.load(std::memory_order_relaxed); }
 int menu_player_flight() { return cheats_enabled ? player_flight.load(std::memory_order_relaxed) : -1; }
 int menu_free_camera() { return free_camera.load(std::memory_order_relaxed); }
@@ -2745,7 +2758,14 @@ void menu_tick() {
         if (press[7] && &r == &rows[kCheatsRow]) page = 2, changed = true;
         else if (press[7] && &r == &rows[kQuitRow]) {   // (Quit game: asked first, Back the default)
             if (app_window()) page = 5, ask_sel = 0, ask_quit = true, changed = true;
-        } else if (press[7] && &r == &rows[kTravelRow]) page = 6, travel_pick = -1, travel_list(), travel_reveal(), changed = true;   // (relink: Link's own age first)
+        } else if (press[7] && &r == &rows[kTravelRow]) {   // (relink: Link's own age first)
+            page = 6, travel_pick = -1, travel_list(), travel_reveal(), changed = true;
+            if (!travel_pictures_on.exchange(true, std::memory_order_relaxed)) {   // (pictures are taken from now on)
+                PictureJob j;
+                j.kind = PictureJob::Begin;
+                picture_job(std::move(j));
+            }
+        }
         else if (press[7] && !r.value && &r != &rows[kTravelRow] && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
         if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or the bottom face button, as Right)
             if (press[7]) press[4] = true;
