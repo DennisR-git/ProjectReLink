@@ -261,6 +261,11 @@ les cartes graphiques (la bibliothèque d'AMD est livrée avec ReLink) ; ou **NV
 activé **NVIDIA DLSS** dans la page Display du lanceur : le jeu est reconstruit avec le SDK DLSS, téléchargé chez NVIDIA sous
 la licence de NVIDIA. Avec FSR ou DLSS, mettez la netteté vers 80 %.
 
+**Roue d'objets** (depuis la 0.7.8, menu Insert, onglet Gameplay, éteinte par défaut) : maintenir R ou L montre vos objets
+en roue au lieu de la rangée du jeu ; visez-en un au stick et relâchez pour le mettre sur ZR, Gauche et Droite tournent les
+pages, Y déplace un objet. **Cycle items** change l'objet de ZR d'un appui bref sur R ou L. Le même onglet a une ligne
+**Quit game**, qui demande confirmation puis ferme le jeu.
+
 Il faut Windows 10 ou 11 en 64 bits, un processeur avec AVX2, une carte graphique avec Vulkan 1.3 et les mesh shaders
 (GeForce RTX 20 ou plus récente, Radeon RX 6000 ou plus récente, Intel Arc ; nous n'avons testé que sur NVIDIA), 16 Go de RAM
 et environ 60 Go libres pendant l'installation.
