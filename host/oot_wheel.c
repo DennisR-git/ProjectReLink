@@ -1,4 +1,4 @@
-/* (relink, from Longshot) The R button's item choice as a wheel, Twilight Princess style (the Gameplay tab's Item wheel row).
+/* (relink) The R button's item choice as a wheel, Twilight Princess style (the Gameplay tab's Item wheel row).
 
    f_802f1380 is every menu screen's update (each frame, with the screen in x0; nx2/oot_patches.py has it call
    hos_wheel_menu_tick here first). The R item row's screen has the vtable
@@ -741,7 +741,7 @@ static void wheel_tick(Ctx *c, uint64_t screen, int opened) {
    bottle slots, in their order), Din's Fire, Farore's Wind and Nayru's Love; with 2 also the Bomb and the Bombchu, with 3
    also the Hookshot (or the Longshot) and the Megaton Hammer, and the child's Slingshot and Boomerang. Only items the game would list in its own row now count
    (owned, usable at Link's age). (relink) 4, Last used: a tap of R or L puts back the item that was on ZR before this one,
-   whatever it is (two taps: back to the first), as Hookshot's quick switch.
+   whatever it is (two taps: back to the first): a quick switch.
    The game's calls (the lifted addresses, and the item numbers, PouchMgr's AssignableItem: 0 DekuStick .. 53 NormalLure)
    are those PR #2151 (item assignable buttons) found: PouchMgr::getAssignableItem and setAssignableItem, and the walk of
    the pouch the quick-switch makes its list with. The change is made on the game's thread, on the HUD screen's update */

@@ -325,7 +325,7 @@ void hos_display_loop(void) {
     }
 }
 
-/* (relink, from Longshot) The item wheel's mouse (host/display.c on Windows): not here yet, the wheel takes the stick only */
+/* (relink) The item wheel's mouse (host/display.c on Windows): not here yet, the wheel takes the stick only */
 int hos_mouse_wheel_take(void) { return 0; }
 void hos_wheel_mouse_open(int open) { (void)open; }
 int hos_wheel_pointer(int32_t *x, int32_t *y, int32_t *w, int32_t *h, int *clicked, int32_t *click_x, int32_t *click_y) {

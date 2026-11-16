@@ -357,7 +357,7 @@ void display_main() {
 }
 
 
-// ---- (relink, from Longshot) the item wheel's backdrop and picture ----
+// ---- (relink) the item wheel's backdrop and picture ----
 // The game draws its HUD (hearts, the item row, prompts) onto the gameplay upscale's output, then copies that picture to the
 // window texture one to one. With the Item wheel row on, the upscale's output is copied each frame as the upscale leaves it
 // (the scene before the HUD): the game stops drawing its scene while its row is shown, so the last frame before the row opens
@@ -702,7 +702,7 @@ void framegen_queue(uint64_t value) {
     fg.cv.notify_all();
 }
 
-/// (relink, from Longshot) The Gameplay tab's Item wheel row is on (HOS_ITEM_WHEEL=0 or 1 over it, as host/oot_wheel.c reads
+/// (relink) The Gameplay tab's Item wheel row is on (HOS_ITEM_WHEEL=0 or 1 over it, as host/oot_wheel.c reads
 /// it). Off: nothing below records or makes anything
 bool framegen_wheel_on() {
     static const int forced = getenv("HOS_ITEM_WHEEL") ? atoi(getenv("HOS_ITEM_WHEEL")) : -1;

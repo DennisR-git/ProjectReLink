@@ -224,7 +224,7 @@ MENU_TICK_HEAD = "void f_802f1380(Ctx *__restrict A64_NOESC c) {\n"
 
 
 def patch_menu_tick(source):
-    """(relink, from Longshot) f_802f1380, a menu screen's update (each frame, before the screen's UI controller: +56, its
+    """(relink) f_802f1380, a menu screen's update (each frame, before the screen's UI controller: +56, its
     vtable's +16), calls hos_wheel_menu_tick first with the screen: the item row shown as the item wheel (host/oot_wheel.c),
     which does nothing with the Gameplay tab's Item wheel row off. None without the function, or patched before"""
     start = source.find(MENU_TICK_HEAD)

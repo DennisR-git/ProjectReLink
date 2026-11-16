@@ -17,7 +17,7 @@ void framegen_queue(uint64_t value);
 void present_image(VkImage src, uint32_t w, uint32_t h, const int crop[4], VkImageView view = VK_NULL_HANDLE);
 /// The Insert menu's upscaling of a frame to the window (dw x dh), recorded: the image to show, or null when it is off
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh);
-/// (relink, from Longshot) The Gameplay tab's Item wheel row is on (off by default; HOS_ITEM_WHEEL over it). While it is
+/// (relink) The Gameplay tab's Item wheel row is on (off by default; HOS_ITEM_WHEEL over it). While it is
 /// false the two below record nothing and make nothing
 bool framegen_wheel_on();
 /// With the Item wheel row on: the gameplay upscale's output (image, its view format, w x h at level, GENERAL) as the upscale

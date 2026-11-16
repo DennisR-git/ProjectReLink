@@ -7208,7 +7208,7 @@ bool dlss_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     vertex_set.on = false, last_ib.on = false;
     return done;
 }
-/// (relink, from Longshot) After the gameplay upscale wrote its output (the game's network, or DLSS in its place: stood_in),
+/// (relink) After the gameplay upscale wrote its output (the game's network, or DLSS in its place: stood_in),
 /// with the Item wheel row on: that picture before the game draws its HUD on it, the wheel's backdrop
 /// (vk_framegen.h framegen_wheel_scene). With the row off (the default) it returns at once
 void wheel_scene_note(VkCommandBuffer cmd, const NvnState& s, const Program& p, bool stood_in) {

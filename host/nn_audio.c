@@ -95,7 +95,7 @@ typedef struct {
     int bq_on[2];                              /* the voice's two biquad filters (BiquadFilterParameter, Q14) */
     float bq_b[2][3], bq_a[2][2], bq_z[2][MAX_CH][2];
     int dropped;
-    int hushed;                                /* (relink, from Longshot) the item row's tick while the wheel steers the row: silent */
+    int hushed;                                /* (relink) the item row's tick while the wheel steers the row: silent */
 } Voice;
 
 static CRITICAL_SECTION lock;
@@ -454,7 +454,7 @@ static int mix_depth(int i, int guard) {   /* how many sub mixes lie between thi
     return 1 + mix_depth(mixes[i].dest, guard + 1);
 }
 
-/* ---- (relink, from Longshot) the item wheel's sounds ------------------------------------------------------------------------ */
+/* ---- (relink) the item wheel's sounds ------------------------------------------------------------------------ */
 /* <game folder>/wheel/sounds.bin (nx2/wheel_sounds.py, run by make_game.py: the item row's own sounds, decoded from the RomFS), read
    at the first use. hos_audio_cue plays one over the game's output. While the wheel steers the game's hidden row
    (hos_wheel_hush, oot_wheel.c), the game's own voices of the row's tick (known by their ADPCM coefficients) are silent:
@@ -1643,7 +1643,7 @@ HLE(_ZN2nn5audio16AppendWaveBufferEPNS0_9VoiceTypeEPKNS0_10WaveBufferE) {
             }
         }
         const Cmd k = {.op = OP_VOICE_APPEND, .idx = (int)(v - voices), .wbp = ARG(1), .wb = read_wb(ARG(1))};
-        {   /* (relink, from Longshot) */
+        {   /* (relink) */
             const int hush = wheel_hushes(v);
             if (hush && !v->hushed) {
                 static int logged;

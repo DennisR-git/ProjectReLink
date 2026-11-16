@@ -164,7 +164,7 @@ static void menu_mouse(HWND w, int open) {
         captured_before_menu = 0;
     }
 }
-/* (relink, from Longshot) The item wheel (host/oot_wheel.c) for the mouse: while it is open the mouse is let go and the
+/* (relink) The item wheel (host/oot_wheel.c) for the mouse: while it is open the mouse is let go and the
    pointer put in the wheel's middle, hidden until the mouse moves 5 pixels (R or L is held the whole time: a controller's
    opening as a rule); the item under it is picked, a left click picks it and closes the wheel, the mouse wheel turns its
    pages. The capture it had comes back when the wheel closes. The input thread posts WM_APP + 20 (wParam 1 open, 0 closed) */

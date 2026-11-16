@@ -1,7 +1,7 @@
-// (relink, from Longshot) The item wheel, Twilight Princess style: host/oot_wheel.c's state (the page's 8 slots, the equipped
+// (relink) The item wheel, Twilight Princess style: host/oot_wheel.c's state (the page's 8 slots, the equipped
 // item, the stick's pick, the item being moved) drawn here, on the CPU, into a picture of the game's picture's size.
 // vk_framegen.cpp framegen_wheel_backdrop lays it over the scene, blurred and dimmed (the game's own item row and HUD gone).
-// Longshot draws it with Dear ImGui; ReLink's menu is drawn with GDI, so this draws its shapes itself, anti-aliased by their
+// ReLink's menu is drawn with GDI, with no UI library: this draws its shapes itself, anti-aliased by their
 // distance to each pixel, and its text with GDI (white on black, the letters' coverage).
 //
 // The game's own icons and names, made from the player's RomFS at every build (nx2/wheel_assets.py, nx2/wheel_names.py) into

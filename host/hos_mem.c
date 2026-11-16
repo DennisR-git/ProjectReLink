@@ -54,7 +54,7 @@ void hos_mem_init(uint64_t image_end) {
 
 uint64_t hos_region_floor(void) { return region_floor; }
 
-/* (relink, from Longshot) Whether [addr, addr + size) is wholly inside memory the runtime has mapped for the game: the image,
+/* (relink) Whether [addr, addr + size) is wholly inside memory the runtime has mapped for the game: the image,
    the system region in use (our own objects), the heap, or an address region (the item wheel's pouch walk, host/oot_wheel.c:
    the pouch lives in an address region, above the heap). A read outside it is not made. 0 none, else its class */
 int hos_mem_region(uint64_t addr, uint64_t size) {
