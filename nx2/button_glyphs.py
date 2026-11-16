@@ -12,7 +12,8 @@ place to follow the player's bindings; as written, they hold the labels of ReLin
 point maps to the original glyph, with its outline and advance unchanged; the game's own Switch glyphs stay in the font.
 The font's empty glyphs that nothing maps to are left out to make room.
 
-prompts.txt: what the host needs to patch the fonts, one record a line (see write_sidecar).
+prompts.txt: what the host (host/prompts.c) needs to patch the fonts and wrap them as the game's file is wrapped, one
+record a line (see write_sidecar).
 """
 import argparse
 import hashlib
@@ -850,6 +851,18 @@ def unwrap(b):
     return bytes(c ^ key[i & 3] for i, c in enumerate(b[8:8 + size]))
 
 
+def wrapper(b):
+    """what the host needs to wrap a font as the game's file is wrapped: the magic, the key, the file's length and the
+    bytes after the font (the file is the magic, the font's length XORed with the key, the font XORed with the key, then
+    those bytes as they are)"""
+    key = bytes(x ^ y for x, y in zip(b[8:12], b"OTTO"))
+    size = int.from_bytes(bytes(x ^ y for x, y in zip(b[4:8], key)), "big")
+    after = b[8 + size:]
+    if len(after) > 4096:
+        raise Unfit(f"External has {len(after)} bytes after its font")
+    return {"magic": b[:4], "key": key, "length": len(b), "after": after}
+
+
 def tables(font):
     """[(tag, checksum, offset, length)] in the directory's order"""
     if font[:4] != b"OTTO":
@@ -1067,7 +1080,15 @@ def build(orig, family):
     return bytes(out), info
 
 
-def write_sidecar(path, orig, infos):
+def fnv1a64(b):
+    """the 64-bit FNV-1a hash of b (the host checks each font against it before patching it)"""
+    h = 0xCBF29CE484222325
+    for c in b:
+        h = ((h ^ c) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def write_sidecar(path, orig, infos, wrap, fonts):
     """prompts.txt"""
     first = infos[FAMILIES[0]]
     for fam in FAMILIES[1:]:          # (the same font but its outlines: the same places in both files)
@@ -1086,6 +1107,10 @@ def write_sidecar(path, orig, infos):
         "# switch <code point> <glyph id>: the game's own glyph for that Switch button, still in both fonts.",
         "# cmap <offset> <length> <checksum offset>: the cmap table, and where the table directory holds its checksum.",
         "# head <offset>: head.checkSumAdjustment, 0xB1B0AFBA minus the file's checksum (taken with it at zero).",
+        "# wrapper <magic hex> <key hex> <length> <after hex, - for none>: the game's file as it is decompressed: the",
+        "# magic, the font's length (4 bytes, big-endian) XORed with the key, the font with byte i XORed with key[i & 3],",
+        "# then the bytes after the font as they are; length is the whole file's.",
+        "# font <family> <hex>: the 64-bit FNV-1a hash of that family's file as written here.",
         f"size {len(orig)}",
         f"original_sha256 {hashlib.sha256(orig).hexdigest()}",
     ]
@@ -1093,12 +1118,17 @@ def write_sidecar(path, orig, infos):
     lines += [f"label {fam} {pos} {infos[fam]['labels'][pos]}" for fam in FAMILIES for pos in POSITIONS]
     lines += [f"switch {cp:04X} {first['switch'][name]}" for name, cp, _ in SWITCH]
     lines += ["cmap %d %d %d" % first["cmap"], f"head {first['head']}"]
+    lines += ["wrapper %s %s %d %s" % (wrap["magic"].hex(), wrap["key"].hex(), wrap["length"],
+                                       wrap["after"].hex() if wrap["after"] else "-")]
+    lines += ["font %s %016x" % (fam, fnv1a64(fonts[fam])) for fam in FAMILIES]
     with open(path, "w", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
 
 
 def make(romfs, out):
-    orig = unwrap(pa.read_zs(romfs, FONT, pa.zs_dictionary(romfs)))
+    wrapped = pa.read_zs(romfs, FONT, pa.zs_dictionary(romfs))
+    orig = unwrap(wrapped)
+    wrap = wrapper(wrapped)
     fonts, infos = {}, {}
     for fam in FAMILIES:
         fonts[fam], infos[fam] = build(orig, fam)
@@ -1109,7 +1139,7 @@ def make(romfs, out):
             f.write(fonts[fam])
         print(f"button prompts: {fam} labels, {len(fonts[fam])} bytes, in {path}", file=sys.stderr)
     path = os.path.join(out, "prompts.txt")
-    write_sidecar(path, orig, infos)
+    write_sidecar(path, orig, infos, wrap, fonts)
     print(f"button prompts: the slots and labels in {path}", file=sys.stderr)
 
 

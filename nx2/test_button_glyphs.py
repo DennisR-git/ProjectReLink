@@ -351,9 +351,10 @@ def main():
 
     tmp = tempfile.mkdtemp(prefix="relink_prompts_")
     check(button_glyphs.main(["--romfs", a.romfs, "--out", tmp]) == 0, "the script exits 0")
-    orig = decode_bfotf(wheel_assets.read_zs(a.romfs, "Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs",
-                                             wheel_assets.zs_dictionary(a.romfs)))
-    side = {"slot": {}, "label": {}, "switch": {}}
+    wrapped = wheel_assets.read_zs(a.romfs, "Font2/Scalable/External.Nin_Ounce_NVN2.bfotf.zs",
+                                   wheel_assets.zs_dictionary(a.romfs))
+    orig = decode_bfotf(wrapped)
+    side = {"slot": {}, "label": {}, "switch": {}, "font": {}}
     with open(os.path.join(tmp, "prompts.txt"), "rb") as fh:
         raw = fh.read()
     check(b"\r" not in raw, "prompts.txt has LF line ends")
@@ -367,12 +368,24 @@ def main():
             side["label"][(w[1], w[2])] = int(w[3])
         elif w[0] == "switch":
             side["switch"][int(w[1], 16)] = int(w[2])
+        elif w[0] == "font":
+            side["font"][w[1]] = int(w[2], 16)
         else:
             side[w[0]] = [int(v) if v.isdigit() else v for v in w[1:]]
     check(side["size"] == [len(orig)], "size is the original's length")
     check(side["original_sha256"] == [hashlib.sha256(orig).hexdigest()], "original_sha256")
     check(sorted(side["slot"]) == sorted(EXPECTED), "twelve slots")
     check(len(side["label"]) == 24, "24 labels")
+    # the wrapper record: the game's own file made again from it and the original font, byte for byte
+    w = side.get("wrapper", [])
+    check(len(w) == 4, "a wrapper record of four fields")
+    if len(w) == 4:
+        key = bytes.fromhex(w[1])
+        after = b"" if w[3] == "-" else bytes.fromhex(w[3])
+        again = (bytes.fromhex(w[0]) + bytes(x ^ y for x, y in zip(len(orig).to_bytes(4, "big"), key)) +
+                 bytes(c ^ key[i & 3] for i, c in enumerate(orig)) + after)
+        print(f"(wrapper: magic {w[0]}, key {w[1]}, {w[2]} bytes, {len(after)} after the font)")
+        check(w[2] == len(wrapped) and again == wrapped, "the wrapper record makes the game's file again")
 
     o_maps, o_cs, o_adv = cmaps(orig), cff_glyphs(orig)[0], advances(orig)
     for fam in FAMILIES:
@@ -380,6 +393,10 @@ def main():
             f = fh.read()
         print(f"{fam}.otf: {len(f)} bytes, {len(f) - len(f.rstrip(bytes(1)))} of them zero padding at the end")
         check(len(f) == len(orig), f"{fam}: length")
+        h = 0xCBF29CE484222325        # (FNV-1a, 64 bits, written out here again)
+        for c in f:
+            h = ((h ^ c) * 0x100000001B3) % (1 << 64)
+        check(side["font"].get(fam) == h, f"{fam}: the font record's hash")
         check(checksums_ok(f) is None, f"{fam}: {checksums_ok(f)}")
         d = directory(f)
         check(side["cmap"] == [d["cmap"][1], d["cmap"][2], d["cmap"][3] + 4], f"{fam}: the cmap record")
