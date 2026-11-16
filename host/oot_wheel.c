@@ -18,6 +18,7 @@
 #include "hos_paths.h"   /* (the game folder: wheel_layout.txt) */
 #include "../gpu/vk/vk_api.h"
 #include "../gpu/vk/oot_cheat_items.h"
+#include "../gpu/vk/oot_wheel_state.h"   /* (MkwVkWheel, the two rows' option ids) */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

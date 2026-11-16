@@ -36,6 +36,7 @@
 #include "vk_framegen.h"
 #include "vk_menu.h"
 #include "oot_cheat_items.h"   // (relink: OOT_CHEAT_ITEM_BASE, OOT_CHEAT_AGE_ID: the item wheel's counts and pages)
+#include "oot_wheel_state.h"   // (relink: the Item wheel and Cycle items rows' option ids)
 #include "vk_jobs.h"
 #include "vk_shader.h"
 #include "vk_state.h"

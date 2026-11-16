@@ -22,6 +22,7 @@
 #include "vk_wheel.h"
 #include "vk_internal.h"
 #include "vk_menu.h"
+#include "oot_wheel_state.h"
 #include "video_core/textures/astc.h"
 
 namespace mkwvk {
@@ -461,7 +462,8 @@ constexpr float kBannerGap = 3, kBannerHalf = 3;   // (units: the gap above the 
 bool wheel_update(bool* changed) {
     *changed = false;
     if (!opts.item_wheel && !getenv("HOS_ITEM_WHEEL")) return false;
-    const MkwVkWheel* src = host && host->wheel ? host->wheel() : nullptr;
+    // (the host's mic_name with MKWVK_WHEEL_QUERY answers the wheel's state: oot_wheel_state.h)
+    const MkwVkWheel* src = host && host->mic_name ? (const MkwVkWheel*)(const void*)host->mic_name(MKWVK_WHEEL_QUERY) : nullptr;
     constexpr int64_t kSpreadNs = 160000000;
     static int64_t opened_at = 0;
     static bool shown = false;
