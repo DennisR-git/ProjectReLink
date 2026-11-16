@@ -135,6 +135,16 @@ static void free_handle(uint64_t id) {
     ReleaseSRWLockExclusive(&handle_lock);
 }
 
+/* (relink, issue 32) Whether the game is writing a file now: one is open for writing and was written in the last second.
+   The game's Commit is nothing here, so a save goes straight into its files; closing the window (or the Insert menu's Quit
+   game) waits for such a write to end before the process exits (host/hos_relaunch.c) */
+static volatile LONG writes_open;
+static volatile LONG64 last_write_ns;
+static void wrote_now(void) { InterlockedExchange64(&last_write_ns, hos_now_ns()); }
+int hos_fs_writing(void) {
+    return writes_open > 0 && hos_now_ns() - InterlockedExchangeAdd64(&last_write_ns, 0) < 1000000000LL;
+}
+
 /* ---- mounts --------------------------------------------------------------------------------------------------- */
 HLE(_ZN2nn2fs22QueryMountRomCacheSizeEPm) { G64(ARG(0)) = 0x10000; RET(0); }
 HLE(_ZN2nn2fs8MountRomEPKcPvm) {
@@ -279,6 +289,7 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     Handle *fh = (Handle *)calloc(1, sizeof *fh);
     fh->h = h;
     fh->writable = want_write;
+    if (want_write) InterlockedIncrement(&writes_open);
     snprintf(fh->path, sizeof fh->path, "%s", g);
     G64(ARG(0)) = new_handle(fh);
     if (hos_trace || fs_trace()) hos_log("fs: OpenFile(%s)", g);
@@ -350,13 +361,16 @@ HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     ov.Offset = (DWORD)ARG(1);
     ov.OffsetHigh = (DWORD)(ARG(1) >> 32);
     DWORD put = 0;
+    wrote_now();
     WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
+    wrote_now();
     RET(put == ARG(3) ? 0 : 0x2EE202);
 }
 HLE(_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl) {
     Handle *fh = get_handle(c, ARG(0));
     LARGE_INTEGER sz;
     sz.QuadPart = (LONGLONG)ARG(1);
+    wrote_now();
     SetFilePointerEx(fh->h, sz, NULL, FILE_BEGIN);
     SetEndOfFile(fh->h);
     RET(0);
@@ -365,6 +379,7 @@ HLE(_ZN2nn2fs9FlushFileENS0_10FileHandleE) { FlushFileBuffers(get_handle(c, ARG(
 HLE(_ZN2nn2fs9CloseFileENS0_10FileHandleE) {
     Handle *fh = get_handle(c, ARG(0));
     CloseHandle(fh->h);
+    if (fh->writable) InterlockedExchangeAdd(&writes_open, -1);
     free_handle(ARG(0));
     free(fh);
 }
