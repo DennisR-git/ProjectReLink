@@ -3831,9 +3831,31 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
             units = 250000.0f, slope = 0.0f;
             if (const char* e = getenv("RX_VK_SHADOW_BIAS")) sscanf(e, "%f,%f", &units, &slope);
         }
-        if (units > 0 && at.n == 0 && at.width == at.height && at.width <= 768 && at.depth) {
+        // (relink, issue 48, an experiment) The broken pots' shards go dark in blocks with straight screen-aligned edges, the ground
+        // around them lit: a shadow projected over a screen rectangle, the shards shadowing themselves inside it, as Link did before
+        // this rule. If the shards' maps are outside it, these take them: RX_VK_SHADOW_BIAS_MAX=<px>, the largest side of a depth
+        // target it applies to (768); RX_VK_SHADOW_BIAS_ANY=1: not square too, 2: and with colour targets (main passes too: their
+        // EQUAL depth tests may break). The log names each target they add it to that the rule above does not
+        static const uint32_t max_side =
+            getenv("RX_VK_SHADOW_BIAS_MAX") ? (uint32_t)std::max(1, atoi(getenv("RX_VK_SHADOW_BIAS_MAX"))) : 768u;
+        static const int any_shape = getenv("RX_VK_SHADOW_BIAS_ANY") ? atoi(getenv("RX_VK_SHADOW_BIAS_ANY")) : 0;
+        const bool rule = at.n == 0 && at.width == at.height && at.width <= 768 && at.depth;
+        const bool wider = at.depth && std::max(at.width, at.height) <= max_side && (at.n == 0 || any_shape >= 2) &&
+                           (at.width == at.height || any_shape >= 1);
+        if (units > 0 && (rule || wider)) {
             d.bias[0] += units, d.bias[2] += slope;
             d.bias_en = true;
+            if (!rule) {
+                static std::mutex m;
+                static std::unordered_set<uint64_t> told;
+                const uint64_t k = (uint64_t)at.width << 40 ^ (uint64_t)at.height << 16 ^ (uint64_t)at.depth_format << 4 ^ (uint64_t)at.n;
+                std::lock_guard lk(m);
+                if (told.size() < 64 && told.insert(k).second)
+                    logf("vk: shadow bias also added (RX_VK_SHADOW_BIAS_MAX / _ANY) to a depth target %ux%u format %d with %d colour "
+                         "targets, program %016llx (the game's bias %s, units %g slope %g)", at.width, at.height, (int)at.depth_format,
+                         at.n, (unsigned long long)(cur_program ? cur_program->key : 0), s.poly.offset_en ? "on" : "off",
+                         s.poly_offset[1], s.poly_offset[0]);
+            }
         }
         // (amd-fix, 11-07) the sun's shadow cascades (square, depth only, past 768): RX_VK_CASCADE_BIAS=<units>,<slope> added;
         // RX_VK_LOG_CASCADE_BIAS=1: what the game asks for them
