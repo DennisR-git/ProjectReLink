@@ -245,8 +245,32 @@ They need the `zstandard` package, which ReLink's own Python has
 ## Mods
 
 RomFS mods go in `mods\<name>\romfs\...` in the game folder, with the same paths as the game's. The log
-(`relink_log.txt`) names each mod it reads. Patches of the game's code (`exefs`) are not supported: the code is compiled
-ahead of time.
+(`relink_log.txt`) names each mod it reads. A mod may sit deeper, as emulators keep them (`mods\contents\<title id>\<name>`),
+a folder whose name starts with `-` or `_` is off, and when two mods have the same file the one whose path sorts last wins
+(name them `01-...`, `02-...`).
+
+Patches of the game's code go in `mods\<name>\exefs\`, in the two formats emulators read:
+
+- `<build id>.ips`, IPS32 or IPS, applied to the module whose build id is the file's name (the game's `main` is
+  `E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348`);
+- `*.pchtxt`, the text patches that name their module with `@nsobid-<build id>` (with `@flag offset_shift`, `@enabled`,
+  `@disabled`, `@stop`, `@flag be`, comments, hex values and `"strings"`).
+
+ReLink translates the game's code when it builds the game, so these patches are applied then, to a copy of the code before
+it is translated: **after adding, changing or removing one, build the game again** (the launcher's first page says
+*Exefs mods changed since the last build* and offers *Build again*; the game says it too at its start). Your own copy of the
+game is never changed. `relink_exefs_mods.txt` in the game folder lists what the last build applied or left out, and why.
+
+- Patches made for another version of the game (another build id) are left out, and so is a patch that writes outside the
+  module's code and data. When two mods write different bytes at the same place, the one whose path sorts last wins.
+- Not supported: replacement module files (a whole `main` or `subsdk` in `exefs`), and patches of `rtld`.
+- Code a patch adds in unused space ("code caves") is translated when the game's code branches to it (`b` or `bl`); code
+  reached only through a pointer is not, and the build says so (*not translated* in `relink_exefs_mods.txt`).
+- A patch changes the translated code, so one of ReLink's own fixes or options in the same function may not apply any more:
+  the build says which (*warning* lines), and stops with a message naming the patch when it is in the way of the output
+  resolution, which cannot be half applied. Where a patch changes one of the two game functions ReLink runs natively (its
+  zstd decoding and its name searches), the native version is left out and the patched code runs; a patch of a system
+  function ReLink provides itself (`nn::` services, the graphics driver) has no effect. The build lists both.
 
 ## Build from source
 
