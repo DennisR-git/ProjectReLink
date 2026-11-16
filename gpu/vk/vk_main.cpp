@@ -314,7 +314,20 @@ bool create_device() {
     // (asked for only: a marker written twice a draw, where the NV ones are not there to hide a race)
     if (const char* c = getenv("RX_VK_CHECKPOINTS"); !dev.checkpoints && c && strcmp(c, "0") != 0 && strcmp(c, "ext") != 0)
         optional(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, dev.buffer_marker);
+    // (relink, issues 62 and 66) RX_VK_CHECKPOINTS=marker on a driver without VK_AMD_buffer_marker left no marker of any kind,
+    // where the default would have had the NV checkpoints (an Intel Arc B580 has them, issue 62's log): those instead
+    if (want_markers && !dev.buffer_marker) {
+        optional(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME, dev.checkpoints);
+        logf("vk: RX_VK_CHECKPOINTS=marker: this driver has no VK_AMD_buffer_marker; %s", dev.checkpoints
+             ? "the NV checkpoints instead" : "no NV checkpoints either: no markers");
+    }
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
+    // (relink, issues 45, 62 and 66) what this driver offers to name the work of a lost device, said at every start, so a player's
+    // first log tells which of RX_VK_CHECKPOINTS=marker and RX_VK_FAULT_INFO=1 can work there before they are asked for
+    logf("vk: device lost diagnostics on this driver: buffer markers %s, NV checkpoints %s, fault info %s",
+         has_extension(exts, VK_AMD_BUFFER_MARKER_EXTENSION_NAME) ? "yes (RX_VK_CHECKPOINTS=marker)" : "no",
+         has_extension(exts, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME) ? (dev.checkpoints ? "yes, on" : "yes, off") : "no",
+         dev.device_fault ? "yes (RX_VK_FAULT_INFO=1)" : "no");
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
     dlss_device_extensions(want, exts);   // (relink: NVIDIA DLSS's, vk_dlss.cpp)
     fsr_device_extensions(want, exts);    // (relink: what AMD FSR's runtime takes by name, vk_fsr.cpp)

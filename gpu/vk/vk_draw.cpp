@@ -3465,9 +3465,13 @@ void checkpoints_report() {
     }
     hang_pass_trace();
     // (checkpoints first: on NVIDIA vkGetDeviceFaultInfoEXT has not come back after a fault, which lost the report)
+    // (relink, issue 66: six logs said "reading the fault info" and then nothing, RX_VK_FAULT_INFO not being set; and
+    // RX_VK_CHECKPOINTS=1 is the NV checkpoints where the driver has them, not the buffer markers)
     logf("vk: device lost: reading %s", dev.checkpoints ? "the checkpoints"
                                         : marker_words ? "the buffer markers"
-                                                       : "the fault info (RX_VK_CHECKPOINTS=1 for markers)");
+                                        : getenv("RX_VK_FAULT_INFO") ? "the fault info"
+                                        : "nothing: no markers on (RX_VK_CHECKPOINTS=marker, RX_VK_PARALLEL=0 and RX_VK_FAULT_INFO=1 "
+                                          "in relink_env.txt name the work that stopped)");
     struct FaultLast { ~FaultLast() { if (std::getenv("RX_VK_FAULT_INFO")) device_fault_report(); } } fault_last;
     const auto watched = [] {
         std::lock_guard lk(watch_mu);
