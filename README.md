@@ -43,10 +43,13 @@ Other versions do not work: the launcher checks your copy and says so before it 
 version as above), build the game in the same way and start it. Its settings page writes the game's own
 `relink_options.ini`; the frame rate goes in `relink_env.txt` beside it.
 
-The first start is long, once (about 16 minutes on our PC): the game prepares its shaders and builds its graphics pipelines
-for your driver's cache, with a progress screen. It does that part again after a graphics driver update, so that the first
-visit of a place does not stutter while the driver compiles, and after an update of ReLink that changes the renderer's
-shader code or state (0.6.3 is one).
+The first start is long, once (about 16 minutes on our PC): the game prepares its shaders, builds its graphics pipelines
+for your driver's cache and makes the compute pipelines play is known to use, with a progress screen. It does that part
+again after a graphics driver update, so that the first visit of a place does not stutter while the driver compiles, and
+after an update of ReLink that changes the renderer's shader code or state (0.6.3 is one). Since 0.7.6 every PC starts the
+same way, whatever its RAM. A PC that ran an earlier version with 20 GB of RAM or more has a pipeline cache file in the game
+folder, `mkw_vk_pipelines.bin` (800 MB and more), that nothing reads any more: since 0.7.8 the game deletes it at its first
+start, unless `RX_VK_LEAN_PIPELINES=0` in `relink_env.txt` brings back the older start, which uses it.
 
 ![Installing](docs/install.png)
 
@@ -160,8 +163,8 @@ before and still do. It does not remove the longer stalls of a first visit, whil
 shaders are read from disk.
 
 Version 0.6.6 goes on with it. A shader drawn for the first time in a session is read from the shader cache by background
-threads, several at once, instead of on the thread that draws the frame (on a PC with less than 20 GB of RAM that was every
-scene shader), and the rest of the driver's cleanup (texture views, images the video-memory reshuffle moved, freed
+threads, several at once, instead of on the thread that draws the frame (then on a PC with less than 20 GB of RAM, and on
+every PC since 0.7.6, that is every scene shader), and the rest of the driver's cleanup (texture views, images the video-memory reshuffle moved, freed
 buffers) left the render thread too. The same build with these changes off (`RX_VK_REAP=0`, `RX_VK_ASYNC_LOAD=0`) and on,
 the Market twice per run, three runs per side taken in turn: frames over 25 ms while the camera turns 59.5 on average
 against 47.0, the 99th percentile 38.1 ms against 32.6 (lower in all six pairs), the time lost in long frames at the
@@ -261,6 +264,14 @@ la licence de NVIDIA. Avec FSR ou DLSS, mettez la netteté vers 80 %.
 Il faut Windows 10 ou 11 en 64 bits, un processeur avec AVX2, une carte graphique avec Vulkan 1.3 et les mesh shaders
 (GeForce RTX 20 ou plus récente, Radeon RX 6000 ou plus récente, Intel Arc ; nous n'avons testé que sur NVIDIA), 16 Go de RAM
 et environ 60 Go libres pendant l'installation.
+
+Le premier démarrage est long, une seule fois (environ 16 minutes sur notre PC) : le jeu prépare ses shaders, construit ses
+pipelines graphiques pour le cache du pilote et fabrique les pipelines de calcul dont on sait que le jeu se sert, avec un
+écran de progression. Il le refait après une mise à jour du pilote graphique, et après une mise à jour de ReLink qui change
+le code des shaders du moteur de rendu. Depuis la 0.7.6, tous les PC démarrent de la même façon, quelle que soit leur RAM.
+Un PC qui a fait tourner une version plus ancienne avec 20 Go de RAM ou plus garde dans le dossier du jeu un fichier de cache
+de pipelines, `mkw_vk_pipelines.bin` (800 Mo et plus), que plus rien ne lit : depuis la 0.7.8, le jeu le supprime à son
+premier démarrage, sauf si `RX_VK_LEAN_PIPELINES=0` dans `relink_env.txt` remet l'ancien démarrage, qui s'en sert.
 
 Le lanceur dit quand une nouvelle version est sortie ; **Update** ne télécharge que ce qui a changé et reconstruit le jeu sur
 place. Les sauvegardes, les réglages et les mods sont conservés.

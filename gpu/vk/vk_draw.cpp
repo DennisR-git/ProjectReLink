@@ -5,7 +5,8 @@
 // and storage images as views of vk_texture.cpp's images, texel buffers), passes kept open while the targets stay,
 // and the draws themselves.
 //
-// Pipelines persist in a VkPipelineCache next to the executable (mkw_vk_pipelines.bin).
+// Pipelines persist in the driver's own disk cache. The full start (RX_VK_LEAN_PIPELINES=0) also keeps a VkPipelineCache
+// next to the executable (mkw_vk_pipelines.bin); the lean start, every PC's since 0.7.6, keeps none (pipelines_lean, below).
 #include <algorithm>
 #include <filesystem>
 #include <iterator>
@@ -712,7 +713,8 @@ std::atomic<int64_t> pcache_built_since_save{0};
 // to <file>.new and merged into the big one at the next start, the file made again whole only when that grows past 64 MB or the
 // precompile built something the file lacked. RX_VK_KEEP_PIPELINE_CACHE=1: the cache kept for the whole run, as before.
 //
-// (relink, 13/11, later) LEAN PIPELINES, the default on a PC with less than 20 GB of RAM: letting the cache go gave back 1 GB
+// (relink, 13/11, later) LEAN PIPELINES, then the default on a PC with less than 20 GB of RAM (on every PC since 0.7.6, below):
+// letting the cache go gave back 1 GB
 // of the 4.3 (the driver keeps the code of the 18900 pipelines made from it: 6.2 GB of its arenas instead of 7.3). What costs
 // is having every pipeline the game ever drew alive from the start. Lean: no cache read from the file and none kept, the
 // graphics pipelines made when a draw first wants them (as the ones the notes do not name always were: on the workers, the
@@ -739,7 +741,8 @@ bool pipelines_lean() {
         else if (getenv("RX_VK_PRECOMPILE")) on = false;
         if (on)
             logf("vk: lean pipelines: no pipeline cache kept in memory, graphics pipelines made at their first draw, the compute "
-                 "pipelines play has used before the game (RX_VK_LEAN_PIPELINES=0: all of them before the game, as PCs with 20 GB "
+                 "pipelines play has used (this PC's list and the shipped one) before the game (RX_VK_LEAN_PIPELINES=0: all of "
+                 "them before the game, as PCs with 20 GB "
                  "of RAM and more had until 0.7.5)");
         else
             logf("vk: full pipelines (RX_VK_LEAN_PIPELINES=0 or RX_VK_PRECOMPILE): every noted pipeline made before the game. "
