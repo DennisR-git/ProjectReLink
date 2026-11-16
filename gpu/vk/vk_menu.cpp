@@ -38,6 +38,7 @@
 #include "oot_cheat_items.h"
 #include "oot_teleport_capture.h"   // (relink: the Travel page's pictures)
 #include "oot_tp_places.h"   // (relink: the Travel page's places)
+#include "prompt_tex.h"   // (relink: the HUD cross's letters follow the button font)
 #include "vk_startup_paint.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #include "vk_dlss.h"
@@ -508,10 +509,10 @@ const char* tx_button_prompts(int v) {
     return t[std::clamp(v, 0, 2)];
 }
 MENU_HINTS(hn_button_prompts, 0, "The game's own: the Switch's letters.",
-           "A, B, X, Y, LB, RB, LT, RT, Menu and View, drawn by ReLink. The faded letters around the HUD's action button and "
-           "the ocarina's notes keep the Switch's.",
-           "Cross, circle, square, triangle, L1, R1, L2, R2, Options and Create, drawn by ReLink. The faded letters around "
-           "the HUD's action button and the ocarina's notes keep the Switch's.")
+           "A, B, X, Y, LB, RB, LT, RT, Menu and View, drawn by ReLink, the faded letters around the HUD's action button "
+           "too. The ocarina's notes keep the Switch's.",
+           "Cross, circle, square, triangle, L1, R1, L2, R2, Options and Create, drawn by ReLink, the faded letters around "
+           "the HUD's action button too. The ocarina's notes keep the Switch's.")
 
 Row rows[] = {
     // Graphics (the DLSS model only in a build with DLSS: row_shown)
@@ -2264,6 +2265,7 @@ bool fps_take(int64_t now, int64_t shown, int64_t game, int64_t* next, int64_t* 
 int menu_item_count(int i) { return i >= 0 && i < kItems ? item_counts[i].load(std::memory_order_relaxed) : -1; }
 int menu_link_age() { return link_age.load(std::memory_order_relaxed); }
 void menu_option_set(int id, int value) {
+    if (id == HOS_PROMPTS_TEX_ID) return prompt_tex_announce(value);   // (relink: the button font's family and bindings, host/prompts.c)
     if (id == OOT_CHEAT_AGE_ID) {   // (relink: the Travel page's list is of Link's age)
         if (link_age.exchange(value, std::memory_order_relaxed) != value && page == 6) menu_refresh = true;
         return;

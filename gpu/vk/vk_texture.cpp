@@ -50,6 +50,7 @@
 #include "bc_levels.h"
 #include "astc_bc_policy.h"
 #include "keep_rendered.h"
+#include "prompt_tex.h"
 #include "target_overlap.h"
 #include "host_shaders/block_linear_unswizzle_2d_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -1368,6 +1369,9 @@ bool upload(Texture& tex, const Ranges* dirty) {
     const int out_bpb = tex.astc ? 4 : widen_from ? (widen_from == 3 ? 4 : widen_from == 6 ? 8 : 16) : src_bpb;
     const uint32_t copy_layers = tex.type == VK_IMAGE_TYPE_3D ? 1 : tex.layers;
     const VkImageAspectFlags aspect = tex.aspect;
+    // (relink) the HUD cross's letters: a texture of their shape is uploaded whole (a partial upload too), and one of the
+    // game's four goes up as ReLink's mask when prompt_tex.h says so
+    const bool keytex = prompt_tex_shape(tex) && !widen_from;
     std::vector<VkBufferImageCopy> copies;
     std::vector<uint8_t> scratch, lin;
     VkBuffer buffer = VK_NULL_HANDLE;
@@ -1385,7 +1389,7 @@ bool upload(Texture& tex, const Ranges* dirty) {
             const uint64_t gobs_x = ((uint64_t)g.tw * src_bpb + 63) / 64;
             const uint64_t row_bytes = gobs_x * (512ull << (g.tile_h + g.tile_d));
             std::vector<std::pair<uint32_t, uint32_t>> runs;   // (first row, rows)
-            if (!dirty || linear || tex.astc || widen_from || g.td > 1 || g.tile_d) {
+            if (!dirty || linear || tex.astc || widen_from || g.td > 1 || g.tile_d || keytex) {
                 runs.push_back({0, nrows});
             } else {
                 std::vector<uint8_t> mark(nrows, 0);
@@ -1501,6 +1505,8 @@ bool upload(Texture& tex, const Ranges* dirty) {
                     st_unswizzle_ns +=
                         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - u0).count();
                 }
+                if (keytex && y0 == 0 && th == g.th && block_bytes == prompt_tex::kBlocks)
+                    tex.keytex_wait = prompt_tex_apply(blocks) < 0;
                 if (tex.astc) {
                     Tegra::Texture::ASTC::DecompressSerial(std::span<const uint8_t>(blocks, block_bytes), g.w, px_h, g.d,
                                                            (u32)tex.block_w, (u32)tex.block_h,
@@ -2406,6 +2412,12 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
 
 } // namespace
 
+bool prompt_tex_shape(const Texture& t) {
+    return t.format == VK_FORMAT_BC4_UNORM_BLOCK && t.type == VK_IMAGE_TYPE_2D && t.width == prompt_tex::kSize &&
+           t.height == prompt_tex::kSize && t.depth == 1 && t.levels == 1 && t.layers == 1 && !t.skip && !t.sparse && !t.astc &&
+           !t.bc && t.bpb == 8 && t.block_w == 4 && t.block_h == 4;
+}
+
 std::atomic<uint64_t> work_epoch{0};
 namespace {
 // (each thread's own: the display thread's present records barriers too)
@@ -2670,6 +2682,18 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         }
         tex->upload_gen = gen;
         return tex;
+    }
+    if (tex->keytex_wait && !tex->gpu_written) {   // (relink: a HUD cross letter uploaded before its family was known: prompt_tex.h)
+        const int s = prompt_tex_state();
+        if (s >= 0) {
+            tex->keytex_wait = false;
+            if (s > 0) {   // (uploaded again, whole: replaced now)
+                tex->checked_epoch = epoch;
+                const uint32_t gen = memory_generation();
+                if (upload(*tex, nullptr)) tex->upload_value = rec_value, tex->upload_seg = tl_seg, tex->upload_gen = gen;
+                return tex;
+            }
+        }
     }
     {   // (RX_VK_REUPLOAD_DIM=<w>x<h> (debugging): textures that size uploaded whole again every frame: is what a
         // sampled texture misses in guest memory, unseen by the write tracking, or not there at all?)
