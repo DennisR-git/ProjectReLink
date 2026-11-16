@@ -5504,6 +5504,12 @@ bool fallback_compute_pipelines(Program& p) {
     static std::mutex mu;
     std::lock_guard lk(mu);
     if (!p.fallback_compute.empty()) return true;
+    // (relink, issue 60) A program whose compile failed was compiled again at each of its draws, on the recording thread, the
+    // driver's state after a fault caught in it unknown (-77): the GTX 1070's log stopped for good right after the first
+    // failure. Its draws are now left out without another try. RX_VK_FALLBACK_RETRY=1: tried again at each draw, as before
+    static std::unordered_set<const Program*> failed;
+    static const bool retry = getenv("RX_VK_FALLBACK_RETRY") && atoi(getenv("RX_VK_FALLBACK_RETRY")) != 0;
+    if (!retry && failed.count(&p)) return false;
     std::vector<VkPipeline> made(p.stages.size(), VK_NULL_HANDLE);
     bool any = false;
     for (size_t i = 0; i < p.stages.size(); i++) {
@@ -5518,11 +5524,31 @@ bool fallback_compute_pipelines(Program& p) {
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage = si;
         ci.layout = p.layout;
-        if (guarded_compute(pcache, &ci, &made[i]) != VK_SUCCESS) {
+        {   // (relink, issue 60) RX_VK_NOOPT=1 here too, as for every other pipeline: the test a GTX 1070 can run
+            static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
+            if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        }
+        // (relink, issue 60) These are compiled here, on the recording thread, at the program's first draw. A GTX 1070's log
+        // ended on "could not be made" for one of them and then nothing: no present, no other line. Each compile now says it
+        // starts, how long it took and what the driver answered, so a log that stops says whether a compile was under way
+        static std::atomic<int> told_start{0};
+        if (told_start++ < 64) logf("vk: fallback: compiling stage %zu of %016llx", i, (unsigned long long)p.key);
+        const auto t0 = std::chrono::steady_clock::now();
+        const VkResult r = guarded_compute(pcache, &ci, &made[i]);
+        const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (r != VK_SUCCESS) {
             static std::atomic<int> told{0};
-            if (told++ < 2) logf("vk: fallback: the compute pipeline of %016llx could not be made", (unsigned long long)p.key);
+            if (told++ < 8)
+                logf("vk: fallback: the compute pipeline of %016llx could not be made (%d, %lld ms%s): its draws are left out",
+                     (unsigned long long)p.key, (int)r, ms, r == (VkResult)-77 ? ", a fault in the driver" : "");
+            for (VkPipeline& m : made)
+                if (m) vkDestroyPipeline(dev.device, m, nullptr), m = VK_NULL_HANDLE;
+            failed.insert(&p);
             return false;
         }
+        static std::atomic<int> told_slow{0};
+        if (ms >= 200 && told_slow++ < 64)
+            logf("vk: fallback: stage %zu of %016llx compiled in %lld ms", i, (unsigned long long)p.key, ms);
         pcache_built_since_save++;
     }
     if (!any) return false;
