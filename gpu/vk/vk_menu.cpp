@@ -13,6 +13,9 @@
 // started with, and the Graphics tab lists them. Closing the menu then asks whether to restart now (menu_restart.h):
 // Later keeps the saved settings for the next start and is not asked again until they change; Restart now saves and
 // closes the window as the player would, and the game starts again (WM_APP + 9: host/hos_relaunch.c).
+// (relink, issue 32) The Gameplay tab's Quit game asks the same way (Back, the default, or Quit); Quit saves the options
+// and the pipeline cache as Restart now does and closes the window as the player would, and the game exits (WM_APP + 10:
+// host/display.c, host/posix/display_sdl.c). The launcher puts the display's refresh rate back when the game's process ends.
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -530,7 +533,7 @@ Row rows[] = {
      "Bounds-checked buffer reads: a read past a buffer's end is dropped instead of stopping the GPU. Applies after a "
      "restart.", hn_robust, true},
 
-    // Gameplay (7 rows)
+    // Gameplay (7 rows here; Quit game and Cheats at the end of the table)
     {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff, "Frames per second in the top right corner.", hn_fps,
      false, true},
     {TAB_GAMEPLAY, "Game speed", &opts.realtime, 0, 1, 1, tx_speed, "How the game keeps time when it runs below 60 fps.",
@@ -579,10 +582,13 @@ Row rows[] = {
      "Which face button is which. Binding one yourself on the Controls page makes it Custom.", hn_pad_layout},
     {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (relink: opens its page)
      "Which gamepad button and which keys press each of the Switch's buttons."},
+    {TAB_GAMEPLAY, "Quit game", nullptr, 0, 0, 0, nullptr,   // (relink, issue 32: asks first, then closes the game)
+     "Closes the game, as closing its window does. Your settings are kept; progress since your last save is not."},
     {TAB_GAMEPLAY, "Cheats", nullptr, 0, 0, 0, nullptr,
      "Open the private gameplay tools."},
 };
 constexpr int kCheatsRow = sizeof rows / sizeof rows[0] - 1;
+constexpr int kQuitRow = kCheatsRow - 1;
 bool cheats_enabled = false;
 std::atomic<int> protect_hearts{-1};
 // -1 disables the shortcut, 0 enables it on the ground, and 1 means flying.
@@ -709,6 +715,7 @@ std::string restart_list(const char* last) {
     return mr::names(restart_names, restart_state.n, restart_pending(), ", ", last);
 }
 int ask_sel = 0;   // (the restart question's choice: 0 Later, 1 Restart now)
+bool ask_quit = false;   // (page 5 asks Quit game's question instead: 0 Back, 1 Quit)
 /// "Restart needed: " and the pending rows, on one line of width: the last ones as "and N more" when they do not fit
 std::string restart_line(HDC dc, int width) {
     const unsigned all = restart_pending();
@@ -1169,7 +1176,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
     HFONT title = font(20 * s, FW_SEMIBOLD), body = font(16 * s, FW_NORMAL);
     HGDIOBJ old = SelectObject(dc, title);
     SetTextColor(dc, RGB(236, 240, 236));
-    const char* heading = page == 5 ? "Restart needed" : page == 4 ? "Inventory" : page == 3 ? "Teleport"
+    const char* heading = page == 5 ? (ask_quit ? "Quit game" : "Restart needed") : page == 4 ? "Inventory" : page == 3 ? "Teleport"
                         : page == 2 ? "Cheats" : "Project ReLink";
     TextOutA(dc, 16 * s, 12 * s, heading, (int)strlen(heading));
     {   // (which build, beside the title, so a report can say it without opening the log; the release alone when the whole
@@ -1192,9 +1199,9 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         DeleteObject(small);
     }
     SelectObject(dc, body);
-    if (page == 5) {   // (relink) the restart question, as the menu closes with a setting that takes a restart
+    if (page == 5) {   // (relink) the restart question, as the menu closes with a setting that takes a restart, or Quit game's
         SetTextColor(dc, RGB(236, 240, 236));
-        const std::string ask = "Restart to apply " + restart_list(" and ") + "?";
+        const std::string ask = ask_quit ? std::string("Quit the game?") : "Restart to apply " + restart_list(" and ") + "?";
         const int asked = wrap_help(dc, ask.c_str(), (int)w - 32 * s, 16 * s, 46 * s, true);   // (one line or two)
         HFONT small = font(14 * s, FW_NORMAL);
         SelectObject(dc, small);
@@ -1202,7 +1209,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         const char* lost = "Progress since your last save is lost.";
         TextOutA(dc, 16 * s, std::min(46 * s + asked + 4 * s, 94 * s), lost, (int)strlen(lost));
         SelectObject(dc, body);
-        const char* const labels[2] = {"Later", "Restart now"};
+        const char* const labels[2] = {ask_quit ? "Back" : "Later", ask_quit ? "Quit" : "Restart now"};
         for (int i = 0; i < 2; i++) {
             const int x = menu_hit::ask_button_x(i, s), y = menu_hit::kAskButtonY * s;
             const int bw = menu_hit::kAskButtonW * s, bh = menu_hit::kAskButtonH * s;
@@ -1216,7 +1223,7 @@ void paint_menu(HDC dc, uint32_t w, uint32_t h, int s) {
         }
         SelectObject(dc, small);
         SetTextColor(dc, RGB(140, 150, 144));
-        const char* hint = "Left/Right choose   Enter confirms   Esc: Later";
+        const char* hint = ask_quit ? "Left/Right choose   Enter confirms   Esc: Back" : "Left/Right choose   Enter confirms   Esc: Later";
         TextOutA(dc, 16 * s, 168 * s, hint, (int)strlen(hint));
         SelectObject(dc, old);
         DeleteObject(small);
@@ -1973,10 +1980,12 @@ void menu_tick() {
         restart_state.choose_later(now);
         open_now = false, page = 0, changed = true;
     };
-    if ((press[0] || press[6]) && open_now.load() && page == 5) {
+    if ((press[0] || press[6]) && open_now.load() && page == 5 && ask_quit) {
+        ask_quit = false, open_now = false, page = 0, changed = true;   // (Quit game's question: the menu closes, nothing else)
+    } else if ((press[0] || press[6]) && open_now.load() && page == 5) {
         later();
     } else if ((press[0] || press[6]) && open_now.load() && restart_ask()) {
-        page = 5, ask_sel = 0, listening = 0, changed = true;
+        page = 5, ask_sel = 0, ask_quit = false, listening = 0, changed = true;
     } else if (press[0] || press[6]) {
         open_now = !open_now.load(), changed = true;
         page = 0, listening = 0;
@@ -1995,7 +2004,15 @@ void menu_tick() {
             if (ptr.wheel) ask_sel ^= 1, changed = true;
         }
         if (press[1] || press[2] || press[3] || press[4] || tab_left || tab_right) ask_sel ^= 1, changed = true;
-        if (press[5] || (press[7] && ask_sel == 0)) {
+        if (ask_quit && (press[5] || (press[7] && ask_sel == 0))) {   // (Back: the menu's list again)
+            ask_quit = false, page = 0, changed = true;
+        } else if (ask_quit && press[7]) {   // (Quit: everything saved, then the window closes as the player would close it)
+            logf("menu: quit game");
+            save();
+            pipeline_cache_save(true);
+            ask_quit = false, open_now = false, page = 0, changed = true;
+            PostMessageA(app_window(), WM_APP + 10, 0, 0);
+        } else if (press[5] || (press[7] && ask_sel == 0)) {
             later();
         } else if (press[7]) {   // (Restart now: everything saved, then the window closes as the player would close it)
             logf("menu: restart now, to apply %s", restart_list(", ").c_str());
@@ -2258,7 +2275,7 @@ void menu_tick() {
                 }
             }
         }
-        if (press[5] && restart_ask()) page = 5, ask_sel = 0, changed = true;   // (the restart question first)
+        if (press[5] && restart_ask()) page = 5, ask_sel = 0, ask_quit = false, changed = true;   // (the restart question first)
         else if (press[5]) open_now = false;
         // (the tabs: LB and RB, Q and E, or Tab)
         if (tab_left) cur_tab = (cur_tab + TAB_COUNT - 1) % TAB_COUNT, changed = true;
@@ -2269,7 +2286,9 @@ void menu_tick() {
         if (press[2]) selected = (selected + 1) % tab_count, changed = true;
         Row& r = rows[tab_row_to_global(cur_tab, selected)];
         if (press[7] && &r == &rows[kCheatsRow]) page = 2, changed = true;
-        else if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
+        else if (press[7] && &r == &rows[kQuitRow]) {   // (Quit game: asked first, Back the default)
+            if (app_window()) page = 5, ask_sel = 0, ask_quit = true, changed = true;
+        } else if (press[7] && !r.value && can_bind()) page = 1, csel = 0, ccol = 0, changed = true;
         if ((press[3] || press[4] || press[7]) && r.value) {   // (Enter, or the bottom face button, as Right)
             if (press[7]) press[4] = true;
             set_row(r, *r.value + (press[4] ? r.step : -r.step), press[4] ? 1 : -1);

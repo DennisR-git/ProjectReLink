@@ -391,6 +391,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP + 9:   /* (the Insert menu's Restart now: closed as by the player, then started again: host/hos_relaunch.c) */
         hos_relaunch_ask();
         /* fall through */
+    case WM_APP + 10:   /* (the Insert menu's Quit game: closed as by the player, gpu/vk/vk_menu.cpp) */
     case WM_CLOSE:
         rx_close_asked();   /* (a start still preparing the shaders keeps what it made) */
         hos_window_closed_exit();
