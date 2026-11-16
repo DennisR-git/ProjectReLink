@@ -17,3 +17,6 @@ int prompts_position_of_pad(int pad);
 /* nn_fs.c OpenFile: the file to read instead of guest's, 1 when there is one (the game's External font, with Xbox or
    PlayStation prompts chosen and no mod giving it) */
 int hos_prompts_redirect(const char *guest, char *out, size_t cap);
+/* rx_backend.c rx_start: the renderer told again what the font was given, when it was decided before the renderer started
+   (gpu/vk/prompt_tex.h: the HUD cross's letters follow it) */
+void hos_prompts_announce(void);

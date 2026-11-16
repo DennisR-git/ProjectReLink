@@ -325,6 +325,7 @@ int prompts_make(const char *dir, const char *family, const int binding[HOS_SW_N
 #ifndef PROMPTS_CORE_ONLY
 #include "hos.h"
 #include "hos_paths.h"
+#include "../gpu/vk/prompt_tex.h"   /* (HOS_PROMPTS_TEX_ID: the HUD cross's letters, which the renderer replaces) */
 #include <ctype.h>
 #include <windows.h>
 
@@ -358,6 +359,18 @@ static int chosen_family(const char *game_dir, char sep, const char **from) {
 
 int hos_mods_romfs(const char *rel, char *out, size_t cap);   /* mods.c */
 int hos_binding(int set, int button, int slot);              /* nn_hid.c */
+void rx_option_set(int id, int value);                       /* rx_backend.c */
+
+/* What the font was given, for the renderer's HUD cross letters (gpu/vk/prompt_tex.h): HOS_PROMPTS_TEX_VALUE, -1 not
+   decided yet */
+static volatile LONG tex_value = -1;
+
+/* The renderer told what the font was given (the family, 0 when the game's own font stays, and Switch A, B, X and Y's
+   inputs); rx_backend.c rx_start calls it again once the renderer is there, for a font opened before that */
+void hos_prompts_announce(void) {
+    const LONG v = InterlockedCompareExchange(&tex_value, -1, -1);
+    if (v >= 0) rx_option_set(HOS_PROMPTS_TEX_ID, (int)v);
+}
 
 /* nn_fs.c OpenFile, for a read: the file to open instead of guest's, 1 when there is one. Decided at the font's first
    open; a later open of it gets the same answer */
@@ -380,6 +393,8 @@ int hos_prompts_redirect(const char *guest, char *out, size_t cap) {
         if (slash) *slash = 0;
         const char *from = "";
         const int fam = slash ? chosen_family(game, sep, &from) : 0;
+        int binding[HOS_SW_N];
+        for (int i = 0; i < HOS_SW_N; i++) binding[i] = hos_binding(HOS_BIND_PAD, i, 0);
         if (!slash) {
             hos_log("prompts: the game folder is not known: the game's own button font");
         } else if (fam == 0) {
@@ -393,8 +408,6 @@ int hos_prompts_redirect(const char *guest, char *out, size_t cap) {
             if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) {
                 hos_log("prompts: no %s (the build did not make the button fonts): the game's own button font", path);
             } else {
-                int binding[HOS_SW_N];
-                for (int i = 0; i < HOS_SW_N; i++) binding[i] = hos_binding(HOS_BIND_PAD, i, 0);
                 snprintf(path, sizeof path, "%s%ccache", dir, sep);
                 CreateDirectoryA(path, NULL);
                 snprintf(path, sizeof path, "%s%ccache%cExternal.%s.bfotf.zs", dir, sep, sep, family_names[fam]);
@@ -406,6 +419,10 @@ int hos_prompts_redirect(const char *guest, char *out, size_t cap) {
                 }
             }
         }
+        /* (the HUD cross's letters follow what the font was given: the family when the font was made, else the game's own) */
+        InterlockedExchange(&tex_value, HOS_PROMPTS_TEX_VALUE(cache[0] ? fam : 0, binding[HOS_SW_A], binding[HOS_SW_B],
+                                                              binding[HOS_SW_X], binding[HOS_SW_Y]));
+        hos_prompts_announce();
         InterlockedExchange(&state, 2);
     }
     if (!cache[0]) return 0;
