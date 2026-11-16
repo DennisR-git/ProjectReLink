@@ -502,6 +502,16 @@ MENU_HINTS(hn_pad_layout, 0, "The Switch's order: A on the right, B at the botto
            "A at the bottom (action and talk), B on the right, X on the left, Y at the top.",
            "A at the bottom, B on the right; X and Y as on the Switch.",
            "Bindings of your own, from the Controls page.")
+// (relink) Button prompts: the game's button font, made for the family and the bindings at the start (host/prompts.c)
+const char* tx_button_prompts(int v) {
+    static const char* t[] = {"Nintendo", "Xbox", "PlayStation"};
+    return t[std::clamp(v, 0, 2)];
+}
+MENU_HINTS(hn_button_prompts, 0, "The game's own: the Switch's letters.",
+           "A, B, X, Y, LB, RB, LT, RT, Menu and View, drawn by ReLink. The faded letters around the HUD's action button and "
+           "the ocarina's notes keep the Switch's.",
+           "Cross, circle, square, triangle, L1, R1, L2, R2, Options and Create, drawn by ReLink. The faded letters around "
+           "the HUD's action button and the ocarina's notes keep the Switch's.")
 
 Row rows[] = {
     // Graphics (the DLSS model only in a build with DLSS: row_shown)
@@ -559,7 +569,7 @@ Row rows[] = {
     {TAB_GAMEPLAY, "Cycle items", &opts.cycle_items, 0, 4, 1, tx_cycle_items,
      "Changes the item on ZR with a tap of R or L, within its group. Holding R or L still opens the row.", hn_cycle_items},
 
-    // Controls (14 rows)
+    // Controls (15 rows)
     {TAB_CONTROLS, "Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
      "Whether the controller plays the game while another window has the focus.", hn_background},
     {TAB_CONTROLS, "Mouse camera", &opts.mouse_native, 0, 1, 1, tx_mousecam, "How the captured mouse turns the camera.",
@@ -595,6 +605,9 @@ Row rows[] = {
      nullptr, false, true},
     {TAB_CONTROLS, "Layout preset", &opts.pad_layout, 0, 3, 1, tx_pad_layout,
      "Which face button is which. Binding one yourself on the Controls page makes it Custom.", hn_pad_layout},
+    {TAB_CONTROLS, "Button prompts", &opts.button_prompts, 0, 2, 1, tx_button_prompts,   // (relink: host/prompts.c)
+     "The buttons the game's prompts show. They follow the Layout preset and your own bindings. Applies the next time the "
+     "game starts.", hn_button_prompts, true, true},
     {TAB_CONTROLS, "Controls", nullptr, 0, 0, 0, nullptr,   // (relink: opens its page)
      "Which gamepad button and which keys press each of the Switch's buttons."},
     {TAB_GAMEPLAY, "Quit game", nullptr, 0, 0, 0, nullptr,   // (relink, issue 32: asks first, then closes the game)

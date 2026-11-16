@@ -50,6 +50,8 @@ struct Options {
     int deadzone_r = 24;  // (relink) the right stick's
     int fov = 100;        // (relink) the camera's field of view in percent of the game's, 70 to 150 (host/nn_vi.c, nx2/oot_fov.py)
     int pad_layout = 0;   // 0 Nintendo (default), 1 Xbox / PC, 2 Swap Face Buttons, 3 Custom
+    int button_prompts = 0;   // (relink) the game's button prompts: 0 its own (Nintendo), 1 Xbox, 2 PlayStation; read once, at
+                              // the start (host/prompts.c; HOS_BUTTON_PROMPTS over it)
     int gyro = 1;         // motion controls from a pad's gyroscope (host/pad_sdl.c, host/hos_motion.h); on by default
     int gyro_sens_x = 100;   // the motion aim's horizontal sensitivity in percent
     int gyro_sens_y = 100;   // the motion aim's vertical sensitivity in percent
