@@ -138,10 +138,12 @@ and arrival events come from your game files at every build (`teleport_places.bi
 RB, LT, RT, Menu, View) or PlayStation's (cross, circle, square, triangle, L1, R1, L2, R2, Options, Create). Each prompt
 shows the button that presses it, so the letters follow the **Layout preset** and your own bindings: with the Nintendo
 preset, the Switch's A is the right-hand button and shows Xbox's B. The labels are ReLink's own drawings, which every build
-adds to a copy of your game's button font in the `prompts` folder. It applies the next time the game starts. Not changed
-yet: the three faded letters around the HUD's action button and the ocarina's note buttons are pictures, not letters of
-the font, and keep the Switch's; and the font has one colour, so the prompts are not coloured. A mod that replaces the
-button font wins over this row. `HOS_BUTTON_PROMPTS=0`, `xbox` or `playstation` in `relink_env.txt` stands in for it.
+adds to a copy of your game's button font in the `prompts` folder. The three faded letters around the HUD's action
+button, which are pictures and not letters of the font, follow too: the renderer puts ReLink's own labels in their place
+(`prompts\keytex.bin`, made by every build). It applies the next time the game starts. Not changed yet: the ocarina's
+note buttons, pictures as well, keep the Switch's; and the font has one colour, so the prompts are not coloured. A mod
+that replaces the button font wins over this row, and the faded letters then stay the Switch's too.
+`HOS_BUTTON_PROMPTS=0`, `xbox` or `playstation` in `relink_env.txt` stands in for it.
 
 ## Measured frame rates
 
@@ -304,8 +306,9 @@ pages, Y déplace un objet. **Cycle items** change l'objet de ZR d'un appui bref
 
 **Button prompts** (onglet Controls du menu Insert) : les boutons affichés par le jeu sont ceux d'une manette Xbox ou
 PlayStation, dessinés par ReLink, et suivent le **Layout preset** et vos propres assignations ; le réglage s'applique au
-prochain démarrage du jeu. Les trois lettres pâles autour du bouton d'action du HUD et les notes de l'ocarina sont des
-images et gardent les lettres de la Switch, et la police n'a qu'une couleur.
+prochain démarrage du jeu. Les trois lettres pâles autour du bouton d'action du HUD, qui sont des images, suivent aussi
+(ReLink met ses propres dessins à leur place, `prompts\keytex.bin`). Les notes de l'ocarina, des images elles aussi,
+gardent les lettres de la Switch, et la police n'a qu'une couleur.
 
 Il faut Windows 10 ou 11 en 64 bits, un processeur avec AVX2, une carte graphique avec Vulkan 1.3 et les mesh shaders
 (GeForce RTX 20 ou plus récente, Radeon RX 6000 ou plus récente, Intel Arc ; nous n'avons testé que sur NVIDIA), 16 Go de RAM
