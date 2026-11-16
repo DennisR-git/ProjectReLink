@@ -362,6 +362,17 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }
         return 0;
+    case WM_ACTIVATE: {
+        /* (relink, issue 65) While the game's window is the active one, Windows keeps the display on and starts neither the
+           screen saver nor sleep: a controller is not activity for Windows, so with a pad the screen went dark in the middle
+           of a cutscene or a long talk. Let go as soon as the window is not the active one. HOS_KEEP_AWAKE=0: off */
+        static int keep = -1;
+        if (keep < 0) keep = !(getenv("HOS_KEEP_AWAKE") && atoi(getenv("HOS_KEEP_AWAKE")) == 0);
+        if (keep && renderer)
+            SetThreadExecutionState(LOWORD(wp) != WA_INACTIVE ? ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED
+                                                              : ES_CONTINUOUS);
+        break;
+    }
     case WM_KILLFOCUS:
     case WM_CANCELMODE:
         mouse_capture(w, 0);
