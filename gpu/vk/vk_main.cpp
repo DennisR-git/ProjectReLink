@@ -301,6 +301,57 @@ bool pick_device() {
     return true;
 }
 
+// (relink, issue 640) What the translated shaders take for granted (vk_shader.cpp make_profile and host_info: no device asked) and
+// this GPU lacks, said once at start. A shader that uses one of these anyway is invalid for the driver, which may refuse its pipeline
+// or fault in its compiler. The GTX 10 cards' logs ended on a fallback compute pipeline that "could not be made", on drivers whose
+// features nobody here could read: this line names those missing, in the log a player already sends, to compare with ours
+void log_shader_needs(const VkPhysicalDeviceFeatures& f, const VkPhysicalDeviceVulkan11Features& f11,
+                      const VkPhysicalDeviceVulkan12Features& f12, const VkPhysicalDeviceVulkan13Features& f13) {
+    VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+    VkPhysicalDeviceVulkan11Properties p11{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_PROPERTIES};
+    p11.pNext = &p12;
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    p2.pNext = &p11;
+    vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+    const VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+    const VkSubgroupFeatureFlags ops = VK_SUBGROUP_FEATURE_BASIC_BIT | VK_SUBGROUP_FEATURE_VOTE_BIT | VK_SUBGROUP_FEATURE_BALLOT_BIT |
+                                       VK_SUBGROUP_FEATURE_SHUFFLE_BIT | VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
+                                       VK_SUBGROUP_FEATURE_ARITHMETIC_BIT | VK_SUBGROUP_FEATURE_QUAD_BIT;
+    const struct { bool have; const char* name; } needs[] = {
+        {f12.shaderFloat16 != VK_FALSE, "shaderFloat16"},
+        {f12.shaderInt8 != VK_FALSE, "shaderInt8"},
+        {f.shaderInt16 != VK_FALSE, "shaderInt16"},
+        {f.shaderInt64 != VK_FALSE, "shaderInt64"},
+        {f.shaderFloat64 != VK_FALSE, "shaderFloat64"},
+        {f12.storageBuffer8BitAccess && f12.uniformAndStorageBuffer8BitAccess, "8-bit storage"},
+        {f11.storageBuffer16BitAccess && f11.uniformAndStorageBuffer16BitAccess, "16-bit storage"},
+        {f12.shaderBufferInt64Atomics != VK_FALSE, "shaderBufferInt64Atomics"},
+        {f12.shaderSharedInt64Atomics != VK_FALSE, "shaderSharedInt64Atomics"},
+        {f13.shaderDemoteToHelperInvocation != VK_FALSE, "shaderDemoteToHelperInvocation"},
+        {f.shaderStorageImageReadWithoutFormat && f.shaderStorageImageWriteWithoutFormat, "storage images without format"},
+        {f.shaderImageGatherExtended != VK_FALSE, "shaderImageGatherExtended"},
+        {f.multiViewport != VK_FALSE, "multiViewport"},
+        {f12.shaderOutputViewportIndex && f12.shaderOutputLayer, "shaderOutputViewportIndex/Layer"},
+        {f12.shaderSampledImageArrayNonUniformIndexing != VK_FALSE, "shaderSampledImageArrayNonUniformIndexing"},
+        {f.fragmentStoresAndAtomics && f.vertexPipelineStoresAndAtomics, "stores and atomics in vertex/fragment stages"},
+        {p12.shaderDenormPreserveFloat32 != VK_FALSE, "shaderDenormPreserveFloat32"},
+        {p12.shaderDenormFlushToZeroFloat32 != VK_FALSE, "shaderDenormFlushToZeroFloat32"},
+        {p12.shaderSignedZeroInfNanPreserveFloat16 && p12.shaderSignedZeroInfNanPreserveFloat32, "shaderSignedZeroInfNanPreserve 16/32"},
+        {p12.denormBehaviorIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE, "denormBehaviorIndependence"},
+        {p12.roundingModeIndependence != VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE, "roundingModeIndependence"},
+        {(p11.subgroupSupportedStages & stages) == stages, "subgroups in vertex/fragment/compute"},
+        {(p11.subgroupSupportedOperations & ops) == ops, "subgroup vote/ballot/shuffle/arithmetic/quad"},
+    };
+    std::string missing;
+    for (const auto& n : needs)
+        if (!n.have) missing += missing.empty() ? n.name : std::string(", ") + n.name;
+    // (an RTX 3060 Ti, driver 0x9a170000, reports neither of the two fp32 denormal modes and runs every program: a name here is
+    // where to look, not a fault by itself)
+    logf("vk: shader features the translation assumes and this GPU does not report: %s (subgroup ops %#x on stages %#x; shared "
+         "memory %u bytes)", missing.empty() ? "none" : missing.c_str(), (unsigned)p11.subgroupSupportedOperations,
+         (unsigned)p11.subgroupSupportedStages, dev.props.limits.maxComputeSharedMemorySize);
+}
+
 bool create_device() {
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(dev.physical, nullptr, &n, nullptr);
@@ -463,6 +514,7 @@ bool create_device() {
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT afloat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
     if (dev.float_atomic_add) *tail = &afloat, tail = &afloat.pNext;
     vkGetPhysicalDeviceFeatures2(dev.physical, &f);
+    log_shader_needs(f.features, f11, f12, f13);
     dev.float_atomic_add = dev.float_atomic_add && afloat.shaderBufferFloat32AtomicAdd;
     if (dev.float_atomic_add) logf("vk: native float32 atomic add on storage buffers (VK_EXT_shader_atomic_float)");
     dev.max_reconvergence = dev.max_reconvergence && ucf.shaderSubgroupUniformControlFlow && maxr.shaderMaximalReconvergence;
