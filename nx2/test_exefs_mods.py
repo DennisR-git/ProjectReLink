@@ -438,18 +438,24 @@ class Hash(Fixture):
             "static void each(void *a, const char *rel, uint64_t size) { (void)a; printf(\"file %s %llu\\n\", rel, (unsigned long long)size); }",
             "int main(int argc, char **argv) { uint64_t h = 0; int n = argc > 1 ? hos_exefs_patch_hash(argv[1], &h, each, 0) : 0;",
             "  if (n) printf(\"hash %016llx\\n\", (unsigned long long)h); else printf(\"hash none\\n\"); return 0; }", ""]))
-        r = subprocess.run([cc, "-O2", "-Wall", "-Werror", main_c, os.path.join(ROOT, "host", "mods_exefs.c"), "-o", exe],
-                           capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        out = subprocess.run([exe, self.mods], capture_output=True).stdout.decode("utf-8").splitlines()
-        files = exefs_mods.patch_files(self.mods)
-        contents = {rel: read(p) for rel, p, _ in files}
-        want = ["file %s %d" % (rel, len(contents[rel])) for rel in sorted(contents, key=lambda k: exefs_mods._fold(k))]
-        want.append("hash " + exefs_mods.files_hash(contents))
-        self.assertEqual(out, want)
-        self.assertEqual(len(files), 5)   # (B-mod, a-mod's two, Ünïcode mod, deep; not notes.txt, sub.ips, _off, .hidden)
-        empty = subprocess.run([exe, os.path.join(self.tmp, "nothing")], capture_output=True).stdout.decode().split()
-        self.assertEqual(empty, ["hash", "none"])
+        # (the game's two ways: Windows' wide-character calls, and the POSIX ones Linux builds, here on MinGW's dirent.h, whose
+        # names are in the ANSI code page: the mod with letters outside ASCII is for the first only)
+        for variant, flags in (("windows", []), ("posix", ["-DMODS_EXEFS_POSIX"])):
+            if variant == "posix":
+                shutil.rmtree(os.path.join(self.mods, "Ünïcode mod"))
+            r = subprocess.run([cc, "-O2", "-Wall", "-Werror"] + flags + [main_c, os.path.join(ROOT, "host", "mods_exefs.c"), "-o", exe],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            out = subprocess.run([exe, self.mods], capture_output=True).stdout.decode("utf-8").splitlines()
+            files = exefs_mods.patch_files(self.mods)
+            contents = {rel: read(p) for rel, p, _ in files}
+            want = ["file %s %d" % (rel, len(contents[rel])) for rel in sorted(contents, key=lambda k: exefs_mods._fold(k))]
+            want.append("hash " + exefs_mods.files_hash(contents))
+            self.assertEqual(out, want, variant)
+            # (B-mod, a-mod's two, Ünïcode mod, deep; not notes.txt, sub.ips, _off, .hidden)
+            self.assertEqual(len(files), 5 if variant == "windows" else 4)
+            empty = subprocess.run([exe, os.path.join(self.tmp, "nothing")], capture_output=True).stdout.decode().split()
+            self.assertEqual(empty, ["hash", "none"], variant)
         self.assertEqual(exefs_mods.files_hash({}), "none")
 
 

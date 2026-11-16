@@ -12,12 +12,18 @@
    ASCII letters in lower case (then as it is), the path's bytes, a zero byte, the file's size as 8 bytes little-endian, and
    the file's bytes (a file that cannot be read counts as empty).
 
-   No hos.h here: nx2/test_exefs_mods.py builds this file alone, with a test main, and checks it against the Python. */
+   No hos.h here: nx2/test_exefs_mods.py builds this file alone, with a test main, and checks it against the Python, both
+   ways: Windows' wide-character calls, and the POSIX ones Linux uses (-DMODS_EXEFS_POSIX: MinGW's dirent.h on Windows). */
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(MODS_EXEFS_POSIX)
+#define MODS_EXEFS_WIN32 1
+#else
+#define MODS_EXEFS_WIN32 0
+#endif
+#if MODS_EXEFS_WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -44,7 +50,7 @@ static void list_add(PatchList *l, const char *rel, const pchar *path) {
     }
     l->v[l->n].rel = (char *)malloc(strlen(rel) + 1);
     strcpy(l->v[l->n].rel, rel);
-#ifdef _WIN32
+#if MODS_EXEFS_WIN32
     l->v[l->n].path = (pchar *)malloc((wcslen(path) + 1) * sizeof(pchar));
     wcscpy(l->v[l->n].path, path);
 #else
@@ -79,7 +85,7 @@ static int patch_name(const char *name) {   /* (UTF-8) ends in .ips or .pchtxt, 
     return 0;
 }
 
-#ifdef _WIN32
+#if MODS_EXEFS_WIN32
 static int exists(const pchar *p) { return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
 static void utf8(const wchar_t *w, char *out, int cap) {
     if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL)) out[0] = 0;
@@ -192,7 +198,7 @@ static uint64_t fnv(uint64_t h, const void *data, size_t n) {
    none (the report's "none"). each(arg, rel, size), when given, is called for each file in the hash's order */
 int hos_exefs_patch_hash(const char *root, uint64_t *hash, void (*each)(void *arg, const char *rel, uint64_t size), void *arg) {
     PatchList l = {0};
-#ifdef _WIN32
+#if MODS_EXEFS_WIN32
     pchar wroot[PATH_CAP];
     if (!MultiByteToWideChar(CP_UTF8, 0, root, -1, wroot, PATH_CAP)) return 0;
     if (!exists(wroot)) return 0;
