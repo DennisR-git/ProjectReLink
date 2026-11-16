@@ -212,20 +212,34 @@ at arrivals. The shaders are prepared again at the first start after this update
 Not reached or not measured yet: a steady 60 everywhere (the Market stays below, and so do a few places at native
 resolution), boss fights, sessions longer than half an hour, and AMD and Intel cards.
 
-## If the game slows down with adult Link: check your dump
+## Black cliffs, blurry rocks, missing models, a slow adult Link: check your dump
 
-Some dumps hold a few damaged textures. The game then never finishes loading the model that needs one: the fairy fountains'
-floor and walls are not drawn, and as an adult the model is loaded again and again for ever, which keeps more than one CPU
-core busy. Since 0.7.2 every install and update does the repair below by itself (the mod `mods\00-dump-repair` in the game
-folder). Two tools in this repository deal with it, from your own files (nothing of the game is in them):
+Some dumps hold damaged texture files: their first kilobytes are zeros, as the dumper read them. Which files, and how
+many, differs from one dump to another (ours has 3 of 20,667). The game cannot read such a file, and what it does then
+depends on what the file was:
+
+- a piece of an area's baked lighting (`RBake_Scene_...`): everything it lights is drawn **black** (a whole cliff side);
+- a texture of a model: the model **never finishes loading**. Rocks and walls are missing and the smooth, blurry ground
+  under them shows instead; and the game loads the model again and again for ever, which keeps more than one CPU core
+  busy (the fairy fountains as an adult: frames lost everywhere).
+
+Every install and update checks the dump and writes a small mod, `mods\00-dump-repair` in the game folder, that stands in
+for the damaged files (since 0.7.2 for two files it knew by name; since 0.7.9 for every damaged texture it finds). A
+stand-in is an intact relative of the same kind and size from your own files, under the damaged file's name: the same
+piece of lighting of the other age (child for adult), or the nearest texture of the same family. It is a relative, not
+the real texture: lighting from the other age can be a little off, and a piece whose relative has another layout stays
+partly dark. `mods\00-dump-repair\README.txt` lists what was damaged, what stands in for it, and what has no stand-in.
+Only a new dump of the game brings the real files back.
+
+Two tools in this repository do it by hand, from your own files (nothing of the game is in them):
 
 ```powershell
 python -I tools/dump_check.py "C:\Games\ReLink\romfs\Tex"
 python -I tools/dump_repair.py "C:\Games\ReLink\romfs" "C:\Games\ReLink\mods\00-dump-repair"
 ```
 
-The first counts the damaged files; the second writes a small mod that stands in for the ones it knows with an intact
-texture of the same family. They need the `zstandard` package, which ReLink's own Python has
+The first counts the damaged files; the second writes the mod, and needs no rebuild: the game reads mods when it starts.
+They need the `zstandard` package, which ReLink's own Python has
 (`%LOCALAPPDATA%\ReLink\versions\<version>\ReLink\tools\python\python.exe`).
 
 ## Mods
