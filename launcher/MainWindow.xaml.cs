@@ -30,6 +30,16 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        // (a snapshot is for tests and pictures: its window is made off the screen, out of the taskbar and without taking the
+        // focus. On the screen it flashed open and shut at every picture, which looked like the launcher starting and dying)
+        if (Arg("--snapshot") != null)
+        {
+            WindowStartupLocation = WindowStartupLocation.Manual;
+            Left = -32000;
+            Top = -32000;
+            ShowInTaskbar = false;
+            ShowActivated = false;
+        }
         staff = new Staff(StaffCanvas);
         Scene.Draw(Sky, 1120, 700, Scene.Hour());
         skyTimer.Tick += (_, _) => Scene.Draw(Sky, 1120, 700, Scene.Hour());
