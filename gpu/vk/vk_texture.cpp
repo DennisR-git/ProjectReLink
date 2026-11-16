@@ -220,6 +220,28 @@ bool remade_skip_old() {
     static const bool on = getenv("RX_VK_REMADE_SKIP") && atoi(getenv("RX_VK_REMADE_SKIP")) != 0;
     return on;
 }
+// (relink, issue 47) Textures the GPU drew whose texels existed nowhere else when the budget evicted them: storage, size and
+// format -> when and why. One made again at that storage and sampled before anything draws it shows whatever its new image holds:
+// the terrain tiles' normal maps, streaks over the ground. RX_VK_LOG_REMADE's list looks 600 frames ahead only, and the tiles come
+// back thousands of frames later, so this one keeps them until then. Always on: written only for such evictions, bounded
+struct Lost {
+    uint64_t frame;
+    int why;
+    uint32_t gen;   // (the memory generation then: the CPU writing that storage since gives the game's own texels again)
+};
+const char* const kLostWhy[] = {"finalized, not recognised as one to keep", "finalized, past RX_VK_KEEP_FINALIZED_MB",
+                                "finalized, over 4 MB", "live, not written back into its memory"};
+std::mutex lost_mu;
+std::unordered_map<uint64_t, Lost> lost_at;
+std::atomic<size_t> lost_n{0};
+std::atomic<int64_t> st_lost[4], st_lost_sampled{0}, st_lost_drawn{0};
+void lost_note(const Texture& t, uint64_t frame, int why) {
+    st_lost[why]++;
+    std::lock_guard lk(lost_mu);
+    if (lost_at.size() > 20000) lost_at.clear();   // (a bound)
+    lost_at[evicted_key(t.gpu, t.width, t.height, t.nvn_format)] = {frame, why, memory_generation()};
+    lost_n.store(lost_at.size(), std::memory_order_relaxed);
+}
 
 struct Dead {
     uint64_t value;
@@ -2282,6 +2304,31 @@ unsigned view_layer(const nvn_view* v) {
     return v && v->set_layers ? v->min_layer : 0;
 }
 
+// (relink, issue 47) a texture just made at the storage of a drawn texture evicted with its texels (lost_note). Made to be sampled,
+// nothing has drawn it, and the CPU has not written that storage since: what it shows is not what the GPU drew there
+static void lost_made(Texture& t, bool for_sampling) {
+    if (!lost_n.load(std::memory_order_relaxed)) return;
+    Lost l;
+    {
+        std::lock_guard lk(lost_mu);
+        auto it = lost_at.find(evicted_key(t.gpu, t.width, t.height, t.nvn_format));
+        if (it == lost_at.end()) return;
+        l = it->second;
+        lost_at.erase(it);
+        lost_n.store(lost_at.size(), std::memory_order_relaxed);
+    }
+    static thread_local Ranges since;
+    if (!for_sampling || (t.guest && t.gpu < (1ull << 40) && texture_dirty(t, l.gen, since))) {
+        st_lost_drawn++;   // (drawn into first, or the game wrote new texels there)
+        return;
+    }
+    const int64_t n = ++st_lost_sampled;
+    if (n <= 100 || n % 100 == 0)
+        logf("vk: texture #%u %#llx %ux%u NVN %#x made again %llu frames after its eviction and sampled before any draw: the "
+             "texels the GPU drew are gone (%s; %lld so far)", t.id, (unsigned long long)t.gpu, t.width, t.height, t.nvn_format,
+             (unsigned long long)(frame_no - l.frame), kLostWhy[l.why], (long long)n);
+}
+
 Texture* texture_get(const nvn_tex* t, bool for_sampling) {
     PROF_HOT(PROF_TEXGET);
     if (!t || !t->gpu || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return nullptr;
@@ -2315,6 +2362,7 @@ Texture* texture_get(const nvn_tex* t, bool for_sampling) {
     if (it == textures.end()) {
         tex = create(k, t, fi.format, fi.astc, bw, bh, bpb);
         if (!tex) return nullptr;
+        lost_made(*tex, for_sampling);   // (issue 47: at the storage of a drawn texture evicted with its texels)
         static const int64_t log_from = getenv("RX_VK_LOG_MADE") ? atoll(getenv("RX_VK_LOG_MADE")) : -1;
         static int made_logged;
         if (log_from >= 0 && (int64_t)frame_no >= log_from && made_logged++ < 300) {
@@ -3400,7 +3448,15 @@ void texture_rendered(Texture* tex) {
         for (auto it = gpu_owned.lower_bound(lo); it != gpu_owned.end() && it->first < hi;)
             it = it->second.first <= hi ? gpu_owned.erase(it) : std::next(it);
         gpu_owned[lo] = {hi, memory_generation()};
-        if (gpu_owned.size() > 65536) gpu_owned.erase(gpu_owned.begin());   // (bounded; the oldest addresses go)
+        if (gpu_owned.size() > 65536) {   // (bounded; the lowest addresses go)
+            gpu_owned.erase(gpu_owned.begin());
+            // (relink, issue 47, a diagnosis: a texture made again over storage that left the list is uploaded from the game's
+            // memory, which never held what the GPU drew there)
+            static int64_t dropped;
+            if (dropped++ % 20000 == 0)
+                logf("vk: the list of storage render targets took is full (65536 ranges): its lowest addresses leave it (%lld so far)",
+                     (long long)dropped);
+        }
     }
 }
 uint64_t texture_frame_no() {
@@ -4069,7 +4125,7 @@ void texture_frame(uint64_t completed) {
     // may have put other things there since, and a write-back over scene data once crashed it)
     static const uint64_t keep_finalized_max =
         (uint64_t)(getenv("RX_VK_KEEP_FINALIZED_MB") ? std::max(0, atoi(getenv("RX_VK_KEEP_FINALIZED_MB"))) : 512) << 20;
-    const auto keep_finalized = [&](const Texture* tex) {
+    const auto keep_finalized_old = [&](const Texture* tex) {
         if (!keep_finalized_max || !tex->gpu_written || !tex->released || !tex->first_written ||
             tex->first_written != tex->last_written || tex->bytes > (4ull << 20))
             return false;
@@ -4077,11 +4133,71 @@ void texture_frame(uint64_t completed) {
         if (g == gpu_owned.end() || g->second.first != tex->gpu + std::max<uint64_t>(tex->guest_size, 1)) return false;
         return !drawn_over(tex) && !drawn_over_shifted(tex);
     };
-    uint64_t finalized_kept = 0;
-    size_t finalized_kept_n = 0;
+    // (relink, issue 47) The rule above knew a texture to keep by two signs that fail on their own: drawn in one frame alone (a
+    // tile drawn over two frames, or drawn again later before it was finalized, was not), and its storage still listed under its
+    // own range as the render targets' (a list of 65536 ranges whose lowest addresses leave it when it is full, which the
+    // transient targets of shifting heaps fill in minutes). Either one failing, a finalized texture went at the next eviction
+    // without its texels written anywhere (the write-back is for live ones), and made again it was empty: the striped ground in
+    // Dodongo's Cavern after 5 to 15 minutes, on a 12 GB card whose budget the system's commit headroom had cut (issue 47; an AMD
+    // log of issue 59 shows the budget at 3072 MB on a 16 GB card, its 22 kept tiles gone at once). Now a finalized texture the
+    // GPU drew is kept as long as nothing took its storage since: no render target drew over it (same start, shifted, or any
+    // other range overlapping it registered after it was finalized) and the CPU did not write it (then it is uploaded from
+    // there when sampled again anyway). Same cap, RX_VK_KEEP_FINALIZED_MB, the least recently used going beyond it.
+    // RX_VK_KEEP_DRAWN=0: the rule above alone, as before
+    static const bool keep_drawn = !getenv("RX_VK_KEEP_DRAWN") || atoi(getenv("RX_VK_KEEP_DRAWN")) != 0;
+    const auto storage_taken = [&](const Texture* tex) {
+        const uint64_t lo = tex->gpu, hi = tex->gpu + std::max<uint64_t>(tex->guest_size, 1);
+        auto it = gpu_owned.upper_bound(lo);
+        if (it != gpu_owned.begin()) --it;
+        for (; it != gpu_owned.end() && it->first < hi; ++it)
+            if (it->second.first > lo && !(it->first == lo && it->second.first == hi) && it->second.second > tex->release_gen)
+                return true;
+        return false;
+    };
+    const auto rewritten = [&](Texture* tex) {
+        if (!tex->released || !tex->guest || tex->gpu >= (1ull << 40)) return false;   // (a virtual pool's: its page walk is the
+        static thread_local Ranges r;                                                    // sampling's to do)
+        return texture_dirty(*tex, std::max(tex->upload_gen, tex->release_gen), r);
+    };
+    const auto keep_finalized = [&](Texture* tex) {
+        if (!keep_drawn) return keep_finalized_old(tex);
+        if (!keep_finalized_max || !tex->gpu_written || !tex->released || tex->bytes > (4ull << 20)) return false;
+        return !drawn_over(tex) && !drawn_over_shifted(tex) && !storage_taken(tex) && !rewritten(tex);
+    };
+    // (what the old rule would have let go of these: drawn over more than one frame, its storage no longer listed as its own)
+    const auto old_misses = [&](const Texture* tex, bool* frames, bool* unlisted) {
+        *frames = !tex->first_written || tex->first_written != tex->last_written;
+        const auto g = gpu_owned.find(tex->gpu);
+        *unlisted = g == gpu_owned.end() || g->second.first != tex->gpu + std::max<uint64_t>(tex->guest_size, 1);
+    };
+    static std::unordered_set<uint32_t> caught_ids;   // (the textures it kept that the old rule would have evicted)
+    uint64_t finalized_kept = 0, newly_kept_b = 0;
+    size_t finalized_kept_n = 0, newly_kept_n = 0, newly_frames = 0, newly_unlisted = 0;
     if (keep_finalized_max)
         for (auto& [last, tex] : order)
-            if (keep_finalized(tex)) finalized_kept += tex->bytes, finalized_kept_n++;
+            if (keep_finalized(tex)) {
+                finalized_kept += tex->bytes, finalized_kept_n++;
+                if (keep_drawn && !keep_finalized_old(tex)) {
+                    bool frames = false, unlisted = false;
+                    old_misses(tex, &frames, &unlisted);
+                    newly_kept_n++, newly_kept_b += tex->bytes, newly_frames += frames, newly_unlisted += unlisted;
+                }
+            }
+    if (frame_no % 600 == 0) {   // (issue 47: what the eviction keeps and loses of what the GPU drew; only when there is any)
+        static int64_t was = -1;
+        const int64_t lost = st_lost[0] + st_lost[1] + st_lost[2] + st_lost[3];
+        const int64_t now = lost * 7 + st_lost_sampled * 3 + (int64_t)caught_ids.size() * 5 + (int64_t)newly_kept_n;
+        if ((lost || newly_kept_n || !caught_ids.empty()) && now != was) {
+            was = now;
+            logf("vk: drawn textures: kept by RX_VK_KEEP_DRAWN that the old rule lets go: %zu now (%llu KB; drawn over more than one "
+                 "frame %zu, storage not listed as its own %zu), %zu kept from an eviction so far; evicted with no other copy of their "
+                 "texels: %lld (finalized not recognised %lld, past the cap %lld, over 4 MB %lld; live, not written back %lld), made "
+                 "again since and sampled before any draw %lld, drawn first %lld", newly_kept_n,
+                 (unsigned long long)(newly_kept_b >> 10), newly_frames, newly_unlisted, caught_ids.size(), (long long)lost,
+                 (long long)st_lost[0].load(), (long long)st_lost[1].load(), (long long)st_lost[2].load(),
+                 (long long)st_lost[3].load(), (long long)st_lost_sampled.load(), (long long)st_lost_drawn.load());
+        }
+    }
     if (finalized_kept && frame_no % 600 == 0) {
         std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, std::pair<size_t, uint64_t>> kinds;   // (w, h, layers, NVN format)
         for (auto& [last, tex] : order)
@@ -4135,8 +4251,22 @@ void texture_frame(uint64_t completed) {
         static const bool keep_over_only = getenv("RX_VK_KEEP_RENDERED_OVER") != nullptr;
         const uint64_t keep_rendered = keep_rendered::presents(known, used, allowed, keep_over_only);
         const bool overwritten = shifted || drawn_over(tex);   // (above)
+        bool past_cap = false;
         if (finalized_kept && keep_finalized(tex)) {   // (above. Oldest first: beyond the cap the least recently used go)
-            if (finalized_kept <= keep_finalized_max) continue;
+            if (finalized_kept <= keep_finalized_max) {
+                if (keep_drawn && !sweep && !keep_finalized_old(tex) && caught_ids.size() < 100000 && caught_ids.insert(tex->id).second) {
+                    bool frames = false, unlisted = false;   // (issue 47: one the old rule evicted here)
+                    old_misses(tex, &frames, &unlisted);
+                    if (caught_ids.size() <= 60)
+                        logf("vk: texture #%u %#llx %ux%u x%u NVN %#x the GPU drew, finalized, unused for %llu frames: kept, not evicted "
+                             "(the old rule let it go: %s%s%s; %zu so far)", tex->id, (unsigned long long)tex->gpu, tex->width,
+                             tex->height, tex->layers, tex->nvn_format, (unsigned long long)(frame_no - last),
+                             frames ? "drawn over more than one frame" : "", frames && unlisted ? ", " : "",
+                             unlisted ? "its storage not listed as its own" : "", caught_ids.size());
+                }
+                continue;
+            }
+            past_cap = true;
             finalized_kept -= tex->bytes;
             static int logged;
             if (logged++ < 100)
@@ -4179,11 +4309,17 @@ void texture_frame(uint64_t completed) {
         // tiled pattern over the Deku Tree's planks and Hyrule Field's path, with a 16 GB card's textures at the 6 GB budget
         // (issue 386). RX_VK_EVICT_NO_FLUSH=1: not written back, as before)
         static const bool no_flush = getenv("RX_VK_EVICT_NO_FLUSH") != nullptr;
+        bool written_back = false;
         if (!no_flush && !overwritten && tex->gpu_written && !tex->released && flushable(*tex) &&
             flush_texture(*tex, tex->gpu, tex->gpu + tex->guest_size)) {
+            written_back = true;
             static std::atomic<int64_t> flushed{0};
             if (++flushed % 50 == 1) logf("vk: textures the GPU drew, written back into their memory before eviction: %lld so far", (long long)flushed.load());
         }
+        // (issue 47: its texels nowhere else, and nothing took its storage: noted, to be told if it is made again and sampled)
+        if (tex->gpu_written && !overwritten && !written_back &&
+            !(tex->released && (storage_taken(tex) || rewritten(tex))))
+            lost_note(*tex, frame_no, !tex->released ? 3 : past_cap ? 1 : tex->bytes > (4ull << 20) ? 2 : 0);
         if (shifted) n_dead++, b_dead += tex->bytes;
         watch_tex(tex, "evicted");
         if (!tex->gpu_written && tex->uploaded && !remade_skip_old()) {   // (above: made again, it is uploaded from memory)
