@@ -38,8 +38,10 @@ static class Game
     public static bool KeepsGameFiles(string folder) =>
         Directory.Exists(Path.Combine(folder, ".relink_exefs")) && Directory.Exists(Path.Combine(folder, "romfs"));
 
-    /// The prepared shaders, beside the game's program (gpu/vk: the translated programs and their index, the driver's
+    /// The prepared shaders, in the game folder itself (gpu/vk: the translated programs and their index, the driver's
     /// pipeline cache, the stamp of the preparation and its markers). Without them the next start prepares them all again.
+    /// (In the folder, not beside bin\relink-game.exe: the renderer names them from game_module_path, gpu/vk/vk_paths.h, which
+    /// answers with the folder above bin; a player's log: "program cache E:\games\relink\relink_programs.bin")
     /// Not the lists of what play has used (relink_pipeline_states.bin, relink_computes.bin) nor anything the build made
     /// (relink_shaders.bin, the _shipped files)
     static readonly string[] PreparedShaderFiles =
@@ -53,7 +55,7 @@ static class Game
     {
         int n = 0;
         long bytes = 0;
-        var dir = Path.GetDirectoryName(Exe(folder)) ?? folder;
+        var dir = folder;
         foreach (var name in PreparedShaderFiles)
         {
             var f = new FileInfo(Path.Combine(dir, name));
@@ -65,7 +67,7 @@ static class Game
     /// The prepared shaders deleted (the game must not be running): null, or why a file could not go
     public static string? DeletePreparedShaders(string folder)
     {
-        var dir = Path.GetDirectoryName(Exe(folder)) ?? folder;
+        var dir = folder;
         foreach (var name in PreparedShaderFiles)
         {
             var path = Path.Combine(dir, name);
