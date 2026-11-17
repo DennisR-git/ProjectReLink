@@ -15,6 +15,8 @@
    HOS_NAMES_NATIVE: 1 (default) native; 0 the lifted code; 2 each native iteration predicted, the lifted one run and the two
    compared where the loop goes next (registers, slots and flags). */
 #include "hos.h"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>   /* (GetTickCount64: loop_watch) */
 #include <stdlib.h>
 #include <string.h>
 
@@ -88,6 +90,7 @@ static int element(const uint64_t *x, uint64_t mid, uint64_t vt_a, uint64_t *n0,
     return 0;
 }
 
+static __thread uint64_t names_last_tgt;   /* (the name the last iteration compared with: loop_watch) */
 /* One iteration of the first loop, from 0x805afbd4: -1 left to the lifted code (s unchanged), 0 back at its head, 1 out */
 static int step_lower(Ctx *c, St *s) {
     uint64_t *x = s->x;
@@ -95,6 +98,7 @@ static int step_lower(Ctx *c, St *s) {
     uint64_t n0, n1, n2, key, tgt;
     if (element(x, mid, x[7], &n0, &n1, &n2, &key, &tgt, (uint32_t)x[22])) return -1;
     St t = *s;
+    names_last_tgt = tgt;
     if (str_cmp(c, &t, key, tgt, (uint32_t)x[27])) return -1;
     *s = t;
     x[0] = n0, x[1] = n1, x[2] = n2, x[28] = mid;
@@ -118,6 +122,7 @@ static int step_upper(Ctx *c, St *s, int at_head) {
     uint64_t n0, n1, n2, key, tgt;
     if (element(x, mid, x[5], &n0, &n1, &n2, &key, &tgt, (uint32_t)x[7])) return -1;
     St t = *s;
+    names_last_tgt = tgt;
     if (str_cmp(c, &t, key, tgt, (uint32_t)x[22])) return -1;
     *s = t;
     x[0] = n0, x[1] = n1, x[2] = n2, x[26] = mid;
@@ -155,7 +160,31 @@ static int names_mode(void) {
 }
 
 static volatile long st_heads, st_steps, st_left;
+/* (relink, 17/11) A search the game repeats without end: a player's scene load (Discord, Nax: entering the Market with a
+   randomizer's data and not its code patch) sat in OptimizeChangeBanc doing 1.46 million searches a second for minutes, and
+   the log only said how many. Each thread counts its searches over 5 s; past 2 million in that time it says, once for each
+   name, the name it looks for (the last search's): what the game cannot find */
+static void loop_watch(void) {
+    static __thread long n;
+    static __thread unsigned long long since;
+    static __thread uint64_t told_tgt;
+    const unsigned long long now = GetTickCount64();
+    if (!since || now - since > 5000) since = now, n = 0;
+    if (++n != 2000000 || !names_last_tgt || names_last_tgt == told_tgt) return;
+    told_tgt = names_last_tgt;
+    char name[96];
+    int k = 0;
+    for (; k < (int)sizeof name - 1; k++) {
+        const uint32_t ch = ld8(names_last_tgt + (uint64_t)k);
+        if (!ch) break;
+        name[k] = ch >= 32 && ch < 127 ? (char)ch : '?';
+    }
+    name[k] = 0;
+    hos_log("names: this thread searched 2000000 times in under 5 s, the last for \"%s\": a load that keeps looking for "
+            "something it cannot find (a mod's data without what it needs?)", name);
+}
 static void count(long steps, int left) {
+    loop_watch();
     __atomic_add_fetch(&st_steps, steps, __ATOMIC_RELAXED);
     if (left) __atomic_add_fetch(&st_left, 1, __ATOMIC_RELAXED);
     if (__atomic_add_fetch(&st_heads, 1, __ATOMIC_RELAXED) % 100000 == 0)
