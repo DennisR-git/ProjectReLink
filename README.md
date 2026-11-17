@@ -59,7 +59,8 @@ start, unless `RX_VK_LEAN_PIPELINES=0` in `relink_env.txt` brings back the older
 
 - 64-bit Windows 10 or 11, and a CPU with AVX2.
 - A graphics card with Vulkan 1.3 and mesh shaders, with an up-to-date driver: NVIDIA GeForce RTX 20 series or newer, AMD
-  Radeon RX 6000 series or newer, Intel Arc. We only tested on NVIDIA.
+  Radeon RX 6000 series or newer, Intel Arc. We only tested on NVIDIA. Since 0.7.9 a card without mesh shaders (GeForce GTX
+  10 series) gets a picture too, as an experiment: about half the frame rate, and some large rocks missing.
 - 8 GB of video memory recommended, 16 GB of RAM or more.
 - About 60 GB free while it installs, and an internet connection for the download.
 
@@ -352,9 +353,16 @@ prochain démarrage du jeu. Les trois lettres pâles autour du bouton d'action d
 (ReLink met ses propres dessins à leur place, `prompts\keytex.bin`). Les notes de l'ocarina, des images elles aussi,
 gardent les lettres de la Switch, et la police n'a qu'une couleur.
 
+**Depuis la 0.7.9** : **30, smooth** (lanceur, onglet Smoothness, Frames per second) garde chaque image à l'écran le même
+temps sur les PC qui ne tiennent pas 60 ; **Field of view** (menu Insert, Graphics, 70 à 150 %) règle l'angle de la caméra et
+**Left / Right stick dead zone** (Controls, 0 à 50 %) la zone morte des sticks ; **F12** enregistre l'image du jeu en PNG
+dans le dossier `screenshots` du jeu ; les patchs de code des mods (`mods\<nom>\exefs\`, formats IPS et pchtxt) sont
+appliqués quand le lanceur reconstruit le jeu (**Build again**).
+
 Il faut Windows 10 ou 11 en 64 bits, un processeur avec AVX2, une carte graphique avec Vulkan 1.3 et les mesh shaders
 (GeForce RTX 20 ou plus récente, Radeon RX 6000 ou plus récente, Intel Arc ; nous n'avons testé que sur NVIDIA), 16 Go de RAM
-et environ 60 Go libres pendant l'installation.
+et environ 60 Go libres pendant l'installation. Depuis la 0.7.9, une carte sans mesh shaders (GeForce GTX 10) obtient aussi
+une image, à titre expérimental : environ la moitié des images par seconde, et de gros rochers absents.
 
 Le premier démarrage est long, une seule fois (environ 16 minutes sur notre PC) : le jeu prépare ses shaders, construit ses
 pipelines graphiques pour le cache du pilote et fabrique les pipelines de calcul dont on sait que le jeu se sert, avec un
