@@ -344,16 +344,60 @@ def tree_rss(pid):
     return n
 
 
+class ProcessEntry(ctypes.Structure):   # (Windows' PROCESSENTRY32W, for the process tree under a compiler)
+    _fields_ = [("size", ctypes.c_uint32), ("usage", ctypes.c_uint32), ("pid", ctypes.c_uint32), ("heap", ctypes.c_size_t),
+                ("module", ctypes.c_uint32), ("threads", ctypes.c_uint32), ("parent", ctypes.c_uint32), ("prio", ctypes.c_long),
+                ("flags", ctypes.c_uint32), ("exe", ctypes.c_wchar * 260)]
+
+
+def win_tree_ws(pid):
+    """(Windows) The working set of a process and the processes it started, in bytes. llvm-mingw's clang.exe is a 14 KB wrapper
+    that runs the compiler (clang-<n>.exe) as a child: the wrapper alone read 4 MB for a compiler holding 1.4 GB, so the memory
+    gate counted every running compiler twice (in the free memory, and again as all of its need still to come) and a 4-thread
+    PC with 16 GB ran 2 compilers where 4 fit"""
+    k = ctypes.WinDLL("kernel32")
+    k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    k.OpenProcess.restype = ctypes.c_void_p
+    snap = k.CreateToolhelp32Snapshot(0x2, 0)   # (TH32CS_SNAPPROCESS)
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return 0
+    kids = {}
+    try:
+        e = ProcessEntry()
+        e.size = ctypes.sizeof(ProcessEntry)
+        ok = k.Process32FirstW(ctypes.c_void_p(snap), ctypes.byref(e))
+        while ok:
+            kids.setdefault(e.parent, []).append(e.pid)
+            ok = k.Process32NextW(ctypes.c_void_p(snap), ctypes.byref(e))
+    finally:
+        k.CloseHandle(ctypes.c_void_p(snap))
+    total, todo, seen = 0, [pid], set()
+    while todo:
+        p = todo.pop()
+        if p in seen:
+            continue
+        seen.add(p)
+        todo += kids.get(p, [])
+        h = k.OpenProcess(0x1000, False, p)   # (PROCESS_QUERY_LIMITED_INFORMATION)
+        if not h:
+            continue
+        try:
+            c = ProcessMemory()
+            c.cb = ctypes.sizeof(ProcessMemory)
+            if ctypes.WinDLL("psapi").GetProcessMemoryInfo(ctypes.c_void_p(h), ctypes.byref(c), c.cb):
+                total += c.ws
+        finally:
+            k.CloseHandle(ctypes.c_void_p(h))
+    return total
+
+
 def rss_mb(proc):
-    """A running compiler's resident memory in MB (0: not known, or not started yet)"""
+    """A running compiler's resident memory in MB, with the processes it started (0: not known, or not started yet)"""
     if proc is None:
         return 0
     try:
         if os.name == "nt":
-            c = ProcessMemory()
-            c.cb = ctypes.sizeof(ProcessMemory)
-            ok = ctypes.WinDLL("psapi").GetProcessMemoryInfo(ctypes.c_void_p(int(proc._handle)), ctypes.byref(c), c.cb)
-            return c.ws >> 20 if ok else 0
+            return win_tree_ws(proc.pid) >> 20
         return tree_rss(proc.pid) >> 20
     except (OSError, ValueError, AttributeError, IndexError):
         return 0
