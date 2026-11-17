@@ -576,6 +576,29 @@ def flag_text(fl):
     return " ".join(kept)
 
 
+def vk_jobs_key(vk_jobs):
+    """(relink) What the Vulkan back end is built from, as one key (tools/prebuilt/relink_vk.dll.key): each file's path under the
+    tools, its bytes, its flags (flag_text, the profile's path left out: its contents are in -DRX_VK_PROFILE_SHA1) and its headers,
+    the CPM packages' versions, and the compiler's version"""
+    h, seen = hashlib.sha1(), {}
+    compilers = sorted({j[0] for j in vk_jobs})
+    for c in compilers:
+        ver = subprocess.run([c, "--version"], capture_output=True, text=True, errors="replace").stdout.splitlines()[:1]
+        h.update(("%s %s\n" % (os.path.basename(c).lower(), " ".join(ver))).encode())
+    for name in ("vulkanheaders", "spirv-headers", "vulkanmemoryallocator"):
+        p = cpm_package(name)
+        h.update(("%s=%s\n" % (name, os.path.basename(p) if p else "")).encode())
+    for c, src, obj, fl, deps in sorted(vk_jobs, key=lambda j: os.path.basename(j[2])):
+        if id(deps) not in seen:
+            seen[id(deps)] = hashlib.sha1(deps).digest()
+        with open(src, "rb") as f:
+            body = hashlib.sha1(f.read()).digest()
+        rel = os.path.relpath(src, kit.ROOT).replace(os.sep, "/")
+        text = flag_text([f for f in fl if not f.startswith("-fprofile-instr-use=")])
+        h.update(("%s\0%s\0%s\0%s\0" % (rel, os.path.basename(c).lower(), os.path.basename(obj), text)).encode() + body + seen[id(deps)])
+    return h.hexdigest()
+
+
 def object_key(src, fl, deps):
     """What an object depends on: its source, the flags (flag_text), and the headers."""
     return hashlib.sha1(open(src, "rb").read() + flag_text(fl).encode() + deps).hexdigest()
@@ -1018,6 +1041,27 @@ def main():
             for f in ("win32_posix.c", "gdi_posix.c"):
                 vk_jobs.append((cc, os.path.join(POSIX, f), os.path.join(obj_dir, "vk_posix_" + f[:-2] + ".o"), cflags, pdeps))
         jobs += vk_jobs
+    # (relink) The Vulkan back end the release built already: tools/prebuilt/relink_vk.dll and its key, made by the workflow from
+    # these same tools (.github/workflows/windows.yml). Taken as it is when its key is this build's (vk_jobs_key: the sources, the
+    # flags, the profile, the headers, the CPM packages, the compiler), and its ~500 files are not compiled here: ~520 of a first
+    # build's ~12300 compile seconds, minutes on a 4-thread CPU. Any difference (NVIDIA DLSS's SDK, another CPU level, a profile
+    # of one's own, a source changed) compiles it here as before. RELINK_VK_PREBUILT_OFF=1: always compiled here
+    vk_key = vk_jobs_key(vk_jobs) if vk_jobs and not LINUX else None
+    if vk_key and not vk_prebuilt and not os.environ.get("RX_VK_ONLY") and \
+            os.environ.get("RELINK_VK_PREBUILT_OFF", "0") in ("", "0"):
+        pre = os.path.join(kit.ROOT, "prebuilt", VK_LIB)
+        try:
+            with open(pre + ".key") as f:
+                have = f.read().strip()
+        except OSError:
+            have = ""
+        if have == vk_key and os.path.isfile(pre):
+            print("the Vulkan back end: the release's own build of it (%s: the same sources, flags and profile)" % pre, flush=True)
+            built_vk = {j[2] for j in vk_jobs}
+            jobs = [j for j in jobs if j[2] not in built_vk]
+            vk_jobs, vk_prebuilt = [], pre
+        elif have:
+            print("the Vulkan back end: compiled here (the release's build of it is of other sources, flags or profile)", flush=True)
     vk_only = bool(os.environ.get("RX_VK_ONLY"))   # (the renderer alone, the game's objects as they are)
     if vk_only:
         jobs = list(vk_jobs)
@@ -1186,6 +1230,12 @@ def main():
         if LINUX and not check_vk_symbols(vdll):
             return 1
         print("linked %s: %d MB (%.0fs)" % (vdll, os.path.getsize(vdll) >> 20, time.time() - t))
+        if vk_key:   # (what it was built from: the workflow ships the two as tools/prebuilt, vk_jobs_key)
+            with open(vdll + ".key", "w", newline="\n") as f:
+                f.write(vk_key + "\n")
+    elif vk_prebuilt and not LINUX and a.standalone and not a.only and os.path.isfile(vk_prebuilt + ".key"):
+        import shutil
+        shutil.copyfile(vk_prebuilt + ".key", os.path.join(out, VK_LIB + ".key"))
     if a.dll and not a.only:
         dll = os.path.join(out, "relink_game.dll")   # (+ relink_game.map: crash offsets -> f_<guest address>)
         t = time.time()
