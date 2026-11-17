@@ -1264,6 +1264,18 @@ void state_record(const Program& p, const NvnState& s, const Targets& at, VkPrim
     }
     if (state_file && state_seen.insert(h).second) fwrite(&r, sizeof r, 1, state_file), fflush(state_file);
 }
+/// (relink) The workers of the shader preparation before the game (the first start, and after an update that changed the translator):
+/// RX_VK_PREPARE_THREADS=<n>, else every CPU thread but one, at most 32. They were half of them, for the PC's sake (on all of them
+/// at High the driver's compiles froze it); they run below normal, so the loading screen and the desktop still get the CPU they
+/// ask for, and the half left idle made a 4-thread PC's first start twice as long
+unsigned prepare_threads() {
+    static const unsigned n = [] {
+        const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
+        if (const char* e = getenv("RX_VK_PREPARE_THREADS"); e && atoi(e) > 0) return std::min((unsigned)atoi(e), 64u);
+        return std::clamp(cpus > 1 ? cpus - 1 : 1u, 1u, 32u);
+    }();
+    return n;
+}
 /// (prepare_run, the seed open) every pipeline of the state lists (the player's own and the shipped one): its program translated
 /// when the program cache lacks it, then noted in relink_pipelines.bin for precompile_run to build. RX_VK_NO_STATE_LIST=1: off
 void state_list_prepare(void (*progress)(size_t done, size_t total)) {
@@ -1315,7 +1327,7 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
+    for (unsigned i = 0; i < prepare_threads(); i++) threads.emplace_back(worker);
     for (std::thread& t : threads) t.join();
     // then each pipeline, noted as a draw would note it
     std::unordered_set<uint64_t> keys;
@@ -1354,7 +1366,7 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
         }
     };
     threads.clear();
-    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(variant_worker);
+    for (unsigned i = 0; i < prepare_threads(); i++) threads.emplace_back(variant_worker);
     for (std::thread& t : threads) t.join();
     size_t noted_n = 0, no_variant = 0;
     auto s = std::make_unique<NvnState>();
@@ -7756,7 +7768,7 @@ bool prepare_run(void (*progress)(size_t done, size_t total), bool background) {
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
     // (in play: a quarter of the CPUs, two to four, the game's own threads before them)
-    const unsigned workers = background ? std::clamp(cpus / 4, 2u, 4u) : std::clamp(cpus / 2, 1u, 32u);
+    const unsigned workers = background ? std::clamp(cpus / 4, 2u, 4u) : prepare_threads();
     for (unsigned i = 0; i < workers; i++) threads.emplace_back(worker);
     while (done.load() < total && !prepare_stopped()) {
         if (progress) progress(done.load() / 3, programs);   // (in programs, as the log counts them, not programs times variants)
@@ -8261,7 +8273,7 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     };
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
-    for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
+    for (unsigned i = 0; i < prepare_threads(); i++) threads.emplace_back(worker);
     while (next.load() < keys.size() + threads.size() && !prepare_stopped() && !out_of_time.load()) {
         if (progress) progress(done.load(), predicted.size());
         Sleep(100);
