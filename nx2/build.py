@@ -405,9 +405,9 @@ def rss_mb(proc):
 
 def mem_need(src):
     """What compiling a file takes at its peak, in MB, a little over. Measured on a cold build (clang 23, x86-64): a chunk of lifted
-    code 0.4 GB + 50 MB per MB of C + 250 MB per MB of its largest function (1.5 GB for 24 MB of small functions, 2.2 GB for a 6 MB
-    function alone); a hot piece 0.8-1.3 GB whatever its size (-O2, the profile, inlining); the runtime's C files ~0.2 GB, the C++
-    files up to ~1 GB"""
+    code 0.15 GB + 58 MB per MB of C + 250 MB per MB of its largest function (17/11, the peak commit of the compiler under
+    llvm-mingw's wrapper: 7.3 MB of C 434 MB, 12.6 MB 747 MB, 23.9 MB 1411 MB; a 6 MB function alone 2.2 GB); a hot piece 0.8-1.3
+    GB whatever its size (-O2, the profile, inlining); the runtime's C files ~0.2 GB, the C++ files up to ~1 GB"""
     name = os.path.basename(src)
     if name.startswith("code_hot"):
         return COMPILER_MB
@@ -417,7 +417,7 @@ def mem_need(src):
         # (each function from the newline before its definition, as this was first measured)
         starts = [m.start() - 1 for m in lifted_c.HEAD_BYTES.finditer(text)] + [len(text)]
         largest = max([b - a for a, b in zip(starts, starts[1:])] or [0])
-        return int(400 + 50 * len(text) / (1 << 20) + 250 * largest / (1 << 20))
+        return int(150 + 58 * len(text) / (1 << 20) + 250 * largest / (1 << 20))
     return 1000 if src.endswith(".cpp") else 400
 
 
