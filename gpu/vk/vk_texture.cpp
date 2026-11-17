@@ -288,6 +288,10 @@ const uint64_t kSpareBytes = (uint64_t)(getenv("RX_VK_SPARE_MB") ? std::max(16, 
 // for 54-57 on the same route)
 uint64_t commit_left_bytes = UINT64_MAX, commit_total_bytes = 0, ram_total_bytes = 0;
 #ifdef _WIN32
+/// (relink, issue 33) The page files' maximum sizes in MB, where they are sized by hand ("c:\pagefile.sys <min> <max>"): one
+/// whose maximum is above its minimum grows up to it as commits need it, so the commit left is what is left now plus the
+/// room up to that maximum. 0: none sized so (or not known)
+uint64_t pagefile_max_mb = 0;
 /// (igpu-fix) Whether a page file is sized by Windows ("System managed size": "c:\pagefile.sys 0 0" or "?:\pagefile.sys" in
 /// PagingFiles): Windows grows it as commits need it, so what is left to commit now is not the limit it looks like
 bool pagefile_grows() {
@@ -301,12 +305,16 @@ bool pagefile_grows() {
         const bool ok = RegQueryValueExA(k, "PagingFiles", nullptr, &type, (LPBYTE)buf, &n) == ERROR_SUCCESS && type == REG_MULTI_SZ;
         RegCloseKey(k);
         if (!ok) return false;
+        bool managed = false;
         for (const char* e = buf; *e; e += strlen(e) + 1) {
             unsigned lo = 1, hi = 1;
             const char* sp = strchr(e, ' ');
-            if (e[0] == '?' || (sp && sscanf(sp, "%u %u", &lo, &hi) == 2 && lo == 0 && hi == 0)) return true;
+            const bool sized = sp && sscanf(sp, "%u %u", &lo, &hi) == 2;
+            if (e[0] == '?' || (sized && lo == 0 && hi == 0)) managed = true;
+            else if (sized) pagefile_max_mb += hi;
         }
-        return false;
+        if (managed) pagefile_max_mb = 0;
+        return managed;
     }();
     return grows;
 }
@@ -315,15 +323,25 @@ uint64_t commit_short(uint64_t frame) {
 #ifdef _WIN32
     // (igpu-fix) 512 MB where Windows grows the page file: with 2048 a ROG Xbox Ally X sat at 1.4 GB left, and its texture budget
     // was cut under what the scene draws, the textures in use let go and made again every few frames
+    // (relink, 17/11, issue 33: on every GPU, not only AMD's integrated ones. An RTX 3050 (8 GB) on a 32 GB PC whose page file
+    // Windows grows sat at 0.7-1.9 GB left from the first area on (NVIDIA backs every byte of VRAM with commit): with 2048 the
+    // textures were held at 3 GB, 50-444 of them let go and made again every 10 s instead of 3, the slowest frame of each 10 s
+    // 95-145 ms instead of 30-50, and the commit left no higher, the same textures made again at once. The page file grew from
+    // 39 to 41 GB meanwhile, as Windows does. A page file sized by hand counts up to its maximum (pagefile_max_mb))
     static const uint64_t headroom = (uint64_t)(getenv("RX_VK_COMMIT_FREE_MB") ? std::max(0, atoi(getenv("RX_VK_COMMIT_FREE_MB")))
-                                                : pagefile_grows() && amd_igpu() ? 512 : 2048) << 20;
+                                                : pagefile_grows() ? 512 : 2048) << 20;
     static uint64_t asked = UINT64_MAX;
     if (asked == UINT64_MAX || frame - asked >= 30) {
         asked = frame;
         MEMORYSTATUSEX ms{};
         ms.dwLength = sizeof ms;
-        if (GlobalMemoryStatusEx(&ms))
+        if (GlobalMemoryStatusEx(&ms)) {
             commit_left_bytes = ms.ullAvailPageFile, commit_total_bytes = ms.ullTotalPageFile, ram_total_bytes = ms.ullTotalPhys;
+            // (a page file sized by hand grows up to its maximum: the room up to it is left to commit too)
+            pagefile_grows();
+            const uint64_t most = ms.ullTotalPhys + (pagefile_max_mb << 20);
+            if (pagefile_max_mb && most > ms.ullTotalPageFile) commit_left_bytes += most - ms.ullTotalPageFile;
+        }
     }
     return headroom && commit_left_bytes < headroom ? headroom - commit_left_bytes : 0;
 #else
