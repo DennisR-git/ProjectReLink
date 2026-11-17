@@ -160,18 +160,25 @@ static int names_mode(void) {
 }
 
 static volatile long st_heads, st_steps, st_left;
-/* (relink, 17/11) A search the game repeats without end: a player's scene load (Discord, Nax: entering the Market with a
-   randomizer's data and not its code patch) sat in OptimizeChangeBanc doing 1.46 million searches a second for minutes, and
-   the log only said how many. Each thread counts its searches over 5 s; past 2 million in that time it says, once for each
-   name, the name it looks for (the last search's): what the game cannot find */
+/* (relink, 17/11) A search the game repeats without end: a player's scene load (Discord, Nax, entering the Market) sat in
+   OptimizeChangeBanc doing 1.46 million searches a second for minutes while the picture stood still, and the log only said
+   how many. That thread does bursts of millions of searches in normal play too (every area it prepares: 2 million in under
+   5 s in nearly every run here, with or without mods), so only a burst that does not stop is told: a thread that searched
+   a million times or more in each of 12 windows of 5 s in a row (a minute), once a minute at most, with the name its last
+   search looked for */
 static void loop_watch(void) {
     static __thread long n;
-    static __thread unsigned long long since;
-    static __thread uint64_t told_tgt;
+    static __thread int busy_windows;
+    static __thread unsigned long long since, told_at;
     const unsigned long long now = GetTickCount64();
-    if (!since || now - since > 5000) since = now, n = 0;
-    if (++n != 2000000 || !names_last_tgt || names_last_tgt == told_tgt) return;
-    told_tgt = names_last_tgt;
+    if (!since) since = now;
+    if (now - since > 5000) {
+        busy_windows = n >= 1000000 ? busy_windows + 1 : 0;
+        since = now, n = 0;
+    }
+    ++n;
+    if (busy_windows < 12 || !names_last_tgt || (told_at && now - told_at < 60000)) return;
+    told_at = now;
     char name[96];
     int k = 0;
     for (; k < (int)sizeof name - 1; k++) {
@@ -180,8 +187,8 @@ static void loop_watch(void) {
         name[k] = ch >= 32 && ch < 127 ? (char)ch : '?';
     }
     name[k] = 0;
-    hos_log("names: this thread searched 2000000 times in under 5 s, the last for \"%s\": a load that keeps looking for "
-            "something it cannot find (a mod's data without what it needs?)", name);
+    hos_log("names: this thread has searched without a pause for %d s (a million times or more every 5 s), the last for \"%s\": "
+            "a scene load that does not finish", busy_windows * 5, name);
 }
 static void count(long steps, int left) {
     loop_watch();
