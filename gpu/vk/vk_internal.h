@@ -65,6 +65,8 @@ struct Device {
     VkPhysicalDeviceVulkan12Features vk12{};
     VkPhysicalDeviceVulkan13Features vk13{};
     VkShaderStageFlags sg32_stages = 0;   // (stages that run at 32 lanes when asked: the size the translated programs assume)
+    bool big_warp = false;   // (graphics stages that may run wider than 32 lanes, not held to 32: AMD's. The translation then
+                             // keeps each 32-lane group apart: Profile::warp_size_potentially_larger_than_guest)
     uint32_t max_push_descriptors = 0;
     // no window (HOS_HEADLESS): presents go to an image of their own, which RX_VK_SHOTS can write out
     bool offscreen = false;

@@ -601,8 +601,14 @@ bool create_device() {
         const bool pin = f13.subgroupSizeControl && sc.minSubgroupSize <= 32 && sc.maxSubgroupSize >= 32 && !getenv("RX_VK_NO_SUBGROUP_PIN");
         dev.sg32_stages = pin ? sc.requiredSubgroupSizeStages : 0;
         amd_gcn = dev.props.vendorID == 0x1002 && sc.minSubgroupSize == 64 && sc.maxSubgroupSize == 64;   // (issue 43)
-        logf("vk: subgroups: default %u lanes, %u-%u, pinned to 32 on stages %#x", sg.subgroupSize, sc.minSubgroupSize, sc.maxSubgroupSize,
-             (unsigned)dev.sg32_stages);
+        // (relink, Discord: Artspear, the dogs drawn without textures on an RX 6600) AMD's RDNA cards hold only compute work to 32
+        // lanes (requiredSubgroupSizeStages 0x20): their drawing stages run 64 wide where the driver likes, and a program's lane
+        // votes, ballots and shuffles, written for 32, mixed two groups. Such GPUs translate with the wide-warp form
+        const VkShaderStageFlags drawing = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        dev.big_warp = std::max(sg.subgroupSize, sc.maxSubgroupSize) > 32 && (dev.sg32_stages & drawing) != drawing &&
+                       !getenv("RX_VK_NO_BIG_WARP");
+        logf("vk: subgroups: default %u lanes, %u-%u, pinned to 32 on stages %#x%s", sg.subgroupSize, sc.minSubgroupSize, sc.maxSubgroupSize,
+             (unsigned)dev.sg32_stages, dev.big_warp ? "; the drawing stages may run wider: translated for it" : "");
     }
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
         logf("vk: the GPU lacks dynamic rendering, synchronization2 or timeline semaphores");
