@@ -40,6 +40,7 @@
 #include "vk_dump.h"
 #include "vk_gprof.h"
 #include "vk_jobs.h"
+#include "vk_mesh_split.h"
 #include "vk_shader.h"
 #include "vk_texture.h"
 #include "movie_upscale_policy.h"
@@ -5620,13 +5621,28 @@ thread_local KeptVertex kept_vb[16];
 // program reuses draw after draw; the commands are ordered, so each dispatch runs after the last draw that read them.
 namespace {
 struct FallbackBuffers {
-    VkBuffer records = VK_NULL_HANDLE, payload = VK_NULL_HANDLE;
-    VmaAllocation records_mem = nullptr, payload_mem = nullptr;
-    uint64_t records_address = 0, payload_address = 0;
+    VkBuffer records = VK_NULL_HANDLE, payload = VK_NULL_HANDLE, args = VK_NULL_HANDLE;
+    VmaAllocation records_mem = nullptr, payload_mem = nullptr, args_mem = nullptr;
+    uint64_t records_address = 0, payload_address = 0, args_address = 0;
     bool ok = false, tried = false;
 };
 TLS_OBJECT(fallback_buffers, std::unordered_map<const Program*, FallbackBuffers>)
-thread_local uint32_t fallback_vertex_count = 0;
+// (relink, issue 640) A draw asks for more workgroups than the records' slots hold (a task draw of up to 444 task workgroups where a
+// dispatch holds 32: Kokiri's cliffs and the rocks round the village's entrance were cut): it runs in batches, each the compute
+// dispatches and the vertex draw of as many as the slots hold, the program reading its workgroup index plus the batch's first
+// (MESH_FALLBACK_BASE_PUSH_OFFSET). An indirect draw's count is the GPU's: its batches' arguments are made there (vk_mesh_split.h),
+// as many batches as the count the CPU sees could need, with room to spare, up to kFallbackBatches
+constexpr uint32_t kFallbackBatches = 16;
+constexpr uint32_t kFallbackDirectBatches = 64;   // (a direct draw's, counted on the CPU: 2048 task workgroups; past them it is cut)
+struct FallbackPlan {
+    FallbackBuffers* f = nullptr;
+    uint32_t batches = 0, batch = 0;
+    uint32_t per_batch = 0;   // (task workgroups, or mesh workgroups without a task, a batch runs)
+    uint32_t threads = 1;     // (slots a workgroup takes)
+    uint32_t groups = 0;      // (a direct draw's workgroups)
+    bool indirect = false;
+};
+thread_local FallbackPlan fallback_plan;
 
 uint64_t fallback_buffer_address(VkBuffer buffer) {
     VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
@@ -5657,7 +5673,12 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
         if (!create_buffer(payload, usage, false, f.payload, f.payload_mem, &mapped)) return false;
         f.payload_address = fallback_buffer_address(f.payload);
     }
-    if (!f.records_address) return false;
+    {   // (an indirect draw's batches' arguments, vk_mesh_split.h)
+        const uint64_t args = ((uint64_t)kMeshSplitHeadWords + (uint64_t)kFallbackBatches * kMeshSplitBatchWords) * 4;
+        if (!create_buffer(args, usage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, f.args, f.args_mem, &mapped)) return false;
+        f.args_address = fallback_buffer_address(f.args);
+    }
+    if (!f.records_address || !f.args_address) return false;
     f.ok = true;
     out = &f;
     return true;
@@ -5719,53 +5740,114 @@ bool fallback_compute_pipelines(Program& p) {
     return true;
 }
 
-/// (relink, issue 640, RX_VK_LOG_FALLBACK=1) What the fallback's mesh draws ask for against what it runs: task workgroups (or mesh
-/// workgroups without a task) asked and dispatched, the draws cut, the indirect draws' entries past the first. The indirect counts are
-/// read from guest memory as the CPU sees them (the GPU's culling may have written others since). 30 cut draws, then a line every
-/// 4000 fallback draws
-void fallback_note(const Program& p, const DrawArgs& d, uint32_t capacity) {
+/// (relink, issue 640, RX_VK_LOG_FALLBACK=1) What the fallback's mesh draws ask for against what their batches run: task workgroups
+/// (or mesh workgroups without a task) asked and runnable, the draws cut, the indirect draws' entries past the first. An indirect
+/// draw's count is read from guest memory as the CPU sees it (the GPU's culling may have written another since), which is also what
+/// its batches are counted from. 30 cut draws, then a line every 4000 fallback draws
+void fallback_note(const Program& p, const DrawArgs& d, const FallbackPlan& plan, uint32_t hint) {
     static const bool on = getenv("RX_VK_LOG_FALLBACK") && atoi(getenv("RX_VK_LOG_FALLBACK")) != 0;
     if (!on) return;
-    const uint32_t threads = p.fallback_task ? std::max(1u, p.fallback_task_threads) : 1u;
-    const uint32_t most = p.fallback_task ? std::max(1u, capacity / threads) : capacity;   // (workgroups one dispatch runs)
-    uint64_t asked = 0, run = 0;
+    uint64_t asked = 0;
     uint32_t entries = 1;
     if (d.indirect) {
         entries = (uint32_t)std::max(d.max, 1);
         const uint32_t stride = d.stride > 0 ? (uint32_t)d.stride : 8;
-        for (uint32_t i = 0; i < std::min(entries, 64u); i++) {
+        asked = hint;
+        for (uint32_t i = 1; i < std::min(entries, 64u); i++) {
             uint32_t count = 0;
             host->gpu_read(d.indirect + (uint64_t)i * stride, &count, 4);
             asked += count;
-            if (i == 0) run = std::min(count, most);
         }
     } else {
-        asked = (uint32_t)std::max(d.groups[0], 0);
-        run = std::min<uint64_t>(asked, most);
+        asked = plan.groups;
     }
-    static std::atomic<uint64_t> draws{0}, cut{0}, indirect{0}, multi{0}, asked_all{0}, run_all{0}, most_asked{0};
+    const uint64_t run = std::min<uint64_t>(d.indirect ? hint : asked, (uint64_t)plan.batches * plan.per_batch);
+    static std::atomic<uint64_t> draws{0}, cut{0}, indirect{0}, multi{0}, asked_all{0}, run_all{0}, most_asked{0}, batches{0};
     const uint64_t n = ++draws;
-    indirect += d.indirect != 0, multi += entries > 1, asked_all += asked, run_all += run;
+    indirect += d.indirect != 0, multi += entries > 1, asked_all += asked, run_all += run, batches += plan.batches;
     uint64_t was = most_asked.load();
     while (asked > was && !most_asked.compare_exchange_weak(was, asked)) {}
     if (asked > run) {
         static std::atomic<int> told{0};
         cut++;
         if (told++ < 30)
-            logf("vk: fallback: draw of %016llx cut: %s%s, %llu %s workgroups asked in %u entr%s, %llu run (a dispatch holds %u; groups word %d)",
+            logf("vk: fallback: draw of %016llx cut: %s%s, %llu %s workgroups asked in %u entr%s, %llu run (%u batches of %u)",
                  (unsigned long long)p.key, d.indirect ? "indirect" : "direct", p.fallback_task ? ", task" : "", (unsigned long long)asked,
-                 p.fallback_task ? "task" : "mesh", entries, entries == 1 ? "y" : "ies", (unsigned long long)run, most, d.groups[0]);
+                 p.fallback_task ? "task" : "mesh", entries, entries == 1 ? "y" : "ies", (unsigned long long)run, plan.batches, plan.per_batch);
     }
     if (n % 4000 == 0)
-        logf("vk: fallback: %llu mesh draws, %llu cut, %llu indirect (%llu with more than one entry); workgroups asked %llu, run %llu, "
-             "largest draw %llu", (unsigned long long)n, (unsigned long long)cut.load(), (unsigned long long)indirect.load(),
-             (unsigned long long)multi.load(), (unsigned long long)asked_all.load(), (unsigned long long)run_all.load(),
-             (unsigned long long)most_asked.load());
+        logf("vk: fallback: %llu mesh draws in %llu batches, %llu cut, %llu indirect (%llu with more than one entry); workgroups asked "
+             "%llu, run %llu, largest draw %llu", (unsigned long long)n, (unsigned long long)batches.load(), (unsigned long long)cut.load(),
+             (unsigned long long)indirect.load(), (unsigned long long)multi.load(), (unsigned long long)asked_all.load(),
+             (unsigned long long)run_all.load(), (unsigned long long)most_asked.load());
 }
 
-/// The dispatches of a mesh draw, outside any render pass, and the vertex count its graphics draw then covers.
+/// The words of batch b's arguments in an indirect draw's buffer (vk_mesh_split.h), in bytes
+VkDeviceSize fallback_args_at(uint32_t b, uint32_t word) {
+    return ((VkDeviceSize)kMeshSplitHeadWords + (VkDeviceSize)b * kMeshSplitBatchWords + word) * 4;
+}
+
+/// Batch b of the draw fallback_record planned: its dispatches, outside any render pass, the program reading its workgroup index plus
+/// the batch's first. The records and payloads are the program's, used again by each batch: the last batch's vertex draw read them
+/// before they are cleared
+bool fallback_batch(VkCommandBuffer cmd, Program& p, uint32_t b) {
+    const FallbackPlan& plan = fallback_plan;
+    FallbackBuffers* f = plan.f;
+    if (!f || b >= plan.batches) return false;
+    fallback_payload_address = f->payload_address;
+    fallback_records_address = f->records_address;
+    const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+    end_pass(cmd);
+    full_barrier(cmd);
+    vkCmdFillBuffer(cmd, f->records, 0, (VkDeviceSize)capacity * 4, 0);   // (the slots this batch runs)
+    // (the payloads too: a mesh workgroup the task did not start still runs, and reads its payload's words)
+    if (f->payload) vkCmdFillBuffer(cmd, f->payload, 0, VK_WHOLE_SIZE, 0);
+    full_barrier(cmd);
+    if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) return false;
+    push_constants(cmd, p, nullptr);
+    const uint32_t base = b * plan.per_batch;
+    vkCmdPushConstants(cmd, p.layout, p.push_stages, Shader::Backend::SPIRV::MESH_FALLBACK_BASE_PUSH_OFFSET, 4, &base);
+    size_t stages[2] = {p.stages.size(), p.stages.size()};
+    for (size_t i = 0; i < p.stages.size(); i++) {
+        if (p.stages[i].vk_stage != VK_SHADER_STAGE_COMPUTE_BIT) continue;
+        if (stages[0] == p.stages.size()) stages[0] = i;
+        else stages[1] = i;
+    }
+    const uint32_t n = plan.indirect ? 0 : std::min(plan.groups - std::min(plan.groups, base), plan.per_batch);
+    const auto send = [&](size_t stage, uint32_t word, uint32_t count) {
+        if (stage >= p.fallback_compute.size() || !p.fallback_compute[stage]) return false;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.fallback_compute[stage]);
+        if (plan.indirect) vkCmdDispatchIndirect(cmd, f->args, fallback_args_at(b, word));
+        else if (count) vkCmdDispatch(cmd, count, 1, 1);
+        return true;
+    };
+    if (p.fallback_task) {   // (a task workgroup's slots are its index in the batch * threads + thread)
+        if (!send(stages[0], kMeshSplitTaskWord, n)) return false;
+        full_barrier(cmd);
+        if (!send(stages[1], kMeshSplitMeshWord, n * plan.threads)) return false;   // (a slot each; the task's flags cull those it did not start)
+    } else if (!send(stages[0], kMeshSplitMeshWord, n)) {
+        return false;
+    }
+    full_barrier(cmd);
+    return true;
+}
+
+/// Batch b's vertex draw, in the open pass: one vertex a corner of each primitive its slots may hold
+void fallback_draw(VkCommandBuffer cmd, const Program& p, uint32_t b) {
+    const FallbackPlan& plan = fallback_plan;
+    if (plan.indirect) {
+        vkCmdDrawIndirect(cmd, plan.f->args, fallback_args_at(b, kMeshSplitDrawWord), 1, 16);
+        return;
+    }
+    const uint32_t base = b * plan.per_batch;
+    const uint32_t n = std::min(plan.groups - std::min(plan.groups, base), plan.per_batch);
+    const uint64_t vertices = (uint64_t)n * plan.threads * p.fallback_vertices_per_workgroup;
+    if (vertices) vkCmdDraw(cmd, (uint32_t)std::min<uint64_t>(vertices, 0xFFFFFFFFu), 1, 0, 0);
+}
+
+/// A mesh draw's plan (its batches; an indirect draw's arguments made on the GPU from its count), and its first batch's dispatches
 bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
-    fallback_note(p, d, Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY);
+    fallback_plan = {};
     if (d.count_addr) {   // (more than one draw in the records: each its own dispatch, not one)
         static std::atomic<int> told{0};
         if (told++ < 2) logf("vk: fallback: a mesh draw with a count buffer is left out (issue 640)");
@@ -5773,66 +5855,40 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     }
     FallbackBuffers* f = nullptr;
     if (!fallback_buffers_of(p, f) || !fallback_compute_pipelines(p)) return false;
-    fallback_payload_address = f->payload_address;
-    fallback_records_address = f->records_address;
     const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
-    end_pass(cmd);
-    vkCmdFillBuffer(cmd, f->records, 0, (VkDeviceSize)capacity * 4, 0);   // (the slots this draw runs)
-    // (the payloads too: a mesh workgroup the task did not start still runs, and reads its payload's words)
-    if (f->payload) vkCmdFillBuffer(cmd, f->payload, 0, VK_WHOLE_SIZE, 0);
-    full_barrier(cmd);
-    if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) return false;
-    push_constants(cmd, p, nullptr);
-    size_t stages[2] = {p.stages.size(), p.stages.size()};
-    for (size_t i = 0; i < p.stages.size(); i++) {
-        if (p.stages[i].vk_stage != VK_SHADER_STAGE_COMPUTE_BIT) continue;
-        if (stages[0] == p.stages.size()) stages[0] = i;
-        else stages[1] = i;
-    }
-    const bool indirect{d.indirect && mesh_conv_buf != VK_NULL_HANDLE};
-    const uint32_t groups{(uint32_t)std::clamp(d.groups[0], 0, (int)capacity)};
-    // (a task workgroup's slots are wg * threads + thread: those past the buffer are not started)
-    // (an indirect draw's task workgroups are counted on the GPU, and its groups word is 0: its mesh stage was dispatched for no
-    // slot at all, and every indirect task + mesh draw drew nothing (RX_VK_LOG_FALLBACK=1: Kokiri's cliffs and the rocks round the
-    // village's entrance, 107 to 130 task workgroups a draw). All the slots then: those its task did not start cull themselves)
-    const uint32_t slots{p.fallback_task
-                             ? d.indirect ? capacity
-                                          : (uint32_t)std::min<uint64_t>(
-                                                (uint64_t)groups * std::max(1u, p.fallback_task_threads), capacity)
-                             : 0};
-    auto send = [&](size_t stage, bool mesh_stage) {
-        if (stage >= p.fallback_compute.size() || !p.fallback_compute[stage]) return false;
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.fallback_compute[stage]);
-        if (mesh_stage && p.fallback_task) {
-            if (!slots) return true;
-            vkCmdDispatch(cmd, slots, 1, 1);   // (one workgroup a slot; the task's flags cull those it did not start)
-        } else if (d.indirect) {
-            if (!indirect) {
-                static std::atomic<int> told{0};
-                if (told++ < 2) logf("vk: fallback: an indirect mesh draw with no converted arguments is left out");
-                return false;
-            }
-            vkCmdDispatchIndirect(cmd, mesh_conv_buf, mesh_conv_off);
-        } else {
-            const uint32_t most{p.fallback_task ? (uint32_t)std::max(1u, capacity / std::max(1u, p.fallback_task_threads))
-                                                : groups};
-            const uint32_t n{mesh_stage ? groups : std::min(groups, most)};
-            if (!n) return true;
-            vkCmdDispatch(cmd, n, 1, 1);
-        }
-        return true;
-    };
-    if (p.fallback_task) {
-        if (!send(stages[0], false)) return false;
+    FallbackPlan plan;
+    plan.f = f;
+    plan.threads = p.fallback_task ? std::max(1u, p.fallback_task_threads) : 1u;
+    plan.per_batch = std::max(1u, capacity / plan.threads);
+    plan.indirect = d.indirect != 0;
+    uint32_t hint = 0;
+    if (plan.indirect) {
+        VkPipeline split = VK_NULL_HANDLE;
+        VkPipelineLayout split_layout = VK_NULL_HANDLE;
+        if (!mesh_split_pipeline(&split, &split_layout)) return false;
+        const BufferRef src = gpu_buffer_bind(d.indirect, 4, false);
+        if (!src) return false;
+        host->gpu_read(d.indirect, &hint, 4);   // (the count as the CPU sees it, a frame or so old: a quarter more, and a batch)
+        const uint64_t want = (uint64_t)hint + hint / 4 + plan.per_batch;
+        plan.batches = (uint32_t)std::clamp<uint64_t>((want + plan.per_batch - 1) / plan.per_batch, 1, kFallbackBatches);
+        end_pass(cmd);
+        full_barrier(cmd);   // (the count's writer before the copy, and the last draw's reads of the arguments)
+        const VkBufferCopy count{src.offset, 0, 4};
+        vkCmdCopyBuffer(cmd, src.buffer, f->args, 1, &count);
         full_barrier(cmd);
-        if (!send(stages[1], true)) return false;
-        fallback_vertex_count = slots * p.fallback_vertices_per_workgroup;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, split);
+        const MeshSplitPush push{f->args_address, plan.per_batch, plan.threads, p.fallback_vertices_per_workgroup, plan.batches};
+        vkCmdPushConstants(cmd, split_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, &push);
+        vkCmdDispatch(cmd, (plan.batches + 63) / 64, 1, 1);
+        full_barrier(cmd);
     } else {
-        if (!send(stages[0], true)) return false;
-        fallback_vertex_count = (d.indirect ? capacity : groups) * p.fallback_vertices_per_workgroup;
+        plan.groups = (uint32_t)std::max(d.groups[0], 0);
+        plan.batches = std::min((plan.groups + plan.per_batch - 1) / plan.per_batch, kFallbackDirectBatches);
     }
-    full_barrier(cmd);
-    return true;
+    fallback_note(p, d, plan, hint);
+    fallback_plan = plan;
+    if (!plan.batches) return true;   // (no workgroup: nothing to draw)
+    return fallback_batch(cmd, p, 0);
 }
 } // namespace
 
@@ -6152,7 +6208,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     PROF_HOT(PROF_DRAW);
     FINE_N(FC_DRAWS, 1);
     stats_tick();
-    mesh_indirect_convert(cmd, d);   // (EvilOOT: before the pass opens; sets mesh_conv_buf for the mesh draw below)
+    // (EvilOOT: before the pass opens; sets mesh_conv_buf for the mesh draw below. relink, issue 640: not with the no-mesh fallback,
+    // whose batches read the count themselves: it was a pass ended, three barriers and a copy for nothing at each indirect draw)
+    if (!dev.mesh_fallback) mesh_indirect_convert(cmd, d);
     handle_memo_next();
     VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     if (!d.mesh && !topology(d.prim, topo)) {
@@ -6752,7 +6810,18 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_N(FC_MESH_COUNTED, d.count_addr != 0);
         FINE_N(FC_MESH_FIRST, d.first_task != 0);
         if (p.fallback) {   // (relink: the generated vertex stage reads the records; one vertex a corner)
-            if (fallback_vertex_count) vkCmdDraw(cmd, fallback_vertex_count, 1, 0, 0);
+            // (issue 640: batch by batch, each batch's dispatches out of the pass, then its draw in it. The graphics pipeline and
+            // descriptors stay bound across the passes; the push constants, which the dispatches set, are set again. The draw's
+            // occlusion query ends with the first batch's pass: a query cannot span two)
+            for (uint32_t b = 0; b < fallback_plan.batches; b++) {
+                if (b) {
+                    if (occ_guard.pool) vkCmdEndQuery(cmd, occ_guard.pool, occ_guard.q), occ_guard.pool = VK_NULL_HANDLE;
+                    if (!fallback_batch(cmd, p, b)) break;
+                    begin_pass(cmd, at);
+                    push_constants(cmd, p, &at);
+                }
+                fallback_draw(cmd, p, b);
+            }
             st_mesh++;
             st_draws++, ps.draws++;
             return;
