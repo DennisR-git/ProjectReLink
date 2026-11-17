@@ -5626,7 +5626,26 @@ struct FallbackBuffers {
     uint64_t records_address = 0, payload_address = 0, args_address = 0;
     bool ok = false, tried = false;
 };
-TLS_OBJECT(fallback_buffers, std::unordered_map<const Program*, FallbackBuffers>)
+// (relink, issue 114) One set of buffers for every program and every replay thread, as large as the largest program asked. They were a
+// program's own on each replay thread: ~45 MB of records a mesh program (1024 slots of 378 vertices of 29 words), five threads, a
+// hundred programs in Kokiri Forest: 8.3 GB of video memory used of 7.2 allowed on an 8 GB card (forced on an RTX 3060 Ti, gx01), the
+// textures then held to 471 MB and spilled to system memory, and a GTX 1080 fell from 30 to 1 frame a second. Sharing them is what a
+// program's draws already did: each batch clears and writes them between full barriers, which order it after every earlier command
+// on the queue, of any thread's command buffer. Outgrown buffers are kept: commands recorded with them may not have run yet
+struct FallbackPool {
+    std::mutex mu;
+    FallbackBuffers cur;
+    uint64_t records = 0, payload = 0;   // (cur's sizes)
+    uint64_t failed = 0;                 // (records of this size or more could not be made: not tried again at each draw)
+    std::vector<FallbackBuffers> old;
+    std::atomic<uint64_t> gen{0};        // (cur's generation: a thread's copy is good while it is the same)
+};
+FallbackPool& fallback_pool() {
+    static FallbackPool* pool = new FallbackPool;   // (never freed: the buffers live as long as the device)
+    return *pool;
+}
+thread_local FallbackBuffers fallback_cur;   // (the draw's: a copy, the same for all its batches)
+thread_local uint64_t fallback_cur_gen = ~0ull, fallback_cur_records = 0, fallback_cur_payload = 0;
 // (relink, issue 640) A draw asks for more workgroups than the records' slots hold (a task draw of up to 444 task workgroups where a
 // dispatch holds 32: Kokiri's cliffs and the rocks round the village's entrance were cut): it runs in batches, each the compute
 // dispatches and the vertex draw of as many as the slots hold, the program reading its workgroup index plus the batch's first
@@ -5651,36 +5670,54 @@ uint64_t fallback_buffer_address(VkBuffer buffer) {
 }
 
 bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
-    auto& f = fallback_buffers()[&p];
-    if (f.ok) {
-        out = &f;
-        return true;
-    }
-    if (f.tried) return false;
-    f.tried = true;
     const uint64_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
     if (!p.fallback_vertices_per_workgroup || !p.fallback_record_words) return false;
     const uint64_t records = capacity * 4 +
                              capacity * (uint64_t)p.fallback_vertices_per_workgroup * p.fallback_record_words * 4;
     if (records > (512ull << 20)) return false;
-    void* mapped = nullptr;
-    const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    if (!create_buffer(records, usage, false, f.records, f.records_mem, &mapped)) return false;
-    f.records_address = fallback_buffer_address(f.records);
-    if (p.fallback_task) {
-        const uint64_t payload = capacity * 4 + capacity * (uint64_t)p.fallback_payload_words * 4;
-        if (!create_buffer(payload, usage, false, f.payload, f.payload_mem, &mapped)) return false;
-        f.payload_address = fallback_buffer_address(f.payload);
+    const uint64_t payload = p.fallback_task ? capacity * 4 + capacity * (uint64_t)p.fallback_payload_words * 4 : 0;
+    FallbackPool& pool = fallback_pool();
+    if (fallback_cur.ok && fallback_cur_gen == pool.gen.load(std::memory_order_acquire) && records <= fallback_cur_records &&
+        payload <= fallback_cur_payload) {
+        out = &fallback_cur;
+        return true;
     }
-    {   // (an indirect draw's batches' arguments, vk_mesh_split.h)
-        const uint64_t args = ((uint64_t)kMeshSplitHeadWords + (uint64_t)kFallbackBatches * kMeshSplitBatchWords) * 4;
-        if (!create_buffer(args, usage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, f.args, f.args_mem, &mapped)) return false;
-        f.args_address = fallback_buffer_address(f.args);
+    std::lock_guard lk(pool.mu);
+    if (!pool.cur.ok || records > pool.records || payload > pool.payload) {
+        const uint64_t want_r = std::max(records, pool.records), want_p = std::max(payload, pool.payload);
+        if (pool.failed && want_r >= pool.failed) return false;
+        FallbackBuffers made;
+        void* mapped = nullptr;
+        const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                         VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        bool ok = create_buffer(want_r, usage, false, made.records, made.records_mem, &mapped);
+        if (ok) made.records_address = fallback_buffer_address(made.records);
+        if (ok && want_p) {
+            ok = create_buffer(want_p, usage, false, made.payload, made.payload_mem, &mapped);
+            if (ok) made.payload_address = fallback_buffer_address(made.payload);
+        }
+        if (ok) {   // (an indirect draw's batches' arguments, vk_mesh_split.h)
+            const uint64_t args = ((uint64_t)kMeshSplitHeadWords + (uint64_t)kFallbackBatches * kMeshSplitBatchWords) * 4;
+            ok = create_buffer(args, usage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, made.args, made.args_mem, &mapped);
+            if (ok) made.args_address = fallback_buffer_address(made.args);
+        }
+        if (!ok || !made.records_address || !made.args_address) {
+            static std::atomic<int> told{0};
+            if (told++ < 4) logf("vk: fallback: buffers of %llu MB of records could not be made", (unsigned long long)(want_r >> 20));
+            pool.failed = pool.failed ? std::min(pool.failed, want_r) : want_r;
+            return false;   // (what was made of them is let go with the device)
+        }
+        made.ok = true;
+        if (pool.cur.ok) pool.old.push_back(pool.cur);
+        pool.cur = made, pool.records = want_r, pool.payload = want_p;
+        pool.gen.fetch_add(1, std::memory_order_release);
+        logf("vk: fallback: records %llu MB, payloads %llu KB, shared by every mesh program (%zu outgrown sets kept)",
+             (unsigned long long)(want_r >> 20), (unsigned long long)(want_p >> 10), pool.old.size());
     }
-    if (!f.records_address || !f.args_address) return false;
-    f.ok = true;
-    out = &f;
+    fallback_cur = pool.cur;
+    fallback_cur_gen = pool.gen.load(std::memory_order_acquire);
+    fallback_cur_records = pool.records, fallback_cur_payload = pool.payload;
+    out = &fallback_cur;
     return true;
 }
 
@@ -5801,7 +5838,7 @@ bool fallback_batch(VkCommandBuffer cmd, Program& p, uint32_t b) {
     full_barrier(cmd);
     vkCmdFillBuffer(cmd, f->records, 0, (VkDeviceSize)capacity * 4, 0);   // (the slots this batch runs)
     // (the payloads too: a mesh workgroup the task did not start still runs, and reads its payload's words)
-    if (f->payload) vkCmdFillBuffer(cmd, f->payload, 0, VK_WHOLE_SIZE, 0);
+    if (f->payload && p.fallback_task) vkCmdFillBuffer(cmd, f->payload, 0, VK_WHOLE_SIZE, 0);
     full_barrier(cmd);
     if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) return false;
     push_constants(cmd, p, nullptr);
