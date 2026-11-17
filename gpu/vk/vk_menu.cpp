@@ -40,6 +40,7 @@
 #include "oot_tp_places.h"   // (relink: the Travel page's places)
 #include "prompt_tex.h"   // (relink: the HUD cross's letters follow the button font)
 #include "vk_screenshot.h"   // (relink: F12)
+#include "hdr_out.h"   // (relink: the bitmaps in HDR10 when the window is)
 #include "vk_startup_paint.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 #include "vk_dlss.h"
@@ -515,6 +516,26 @@ MENU_HINTS(hn_button_prompts, 0, "The game's own: the Switch's letters.",
            "Cross, circle, square, triangle, L1, R1, L2, R2, Options and Create, drawn by ReLink, the faded letters around "
            "the HUD's action button too. The ocarina's notes keep the Switch's.")
 
+// (relink) The keys ReLink's own keyboard actions can take (Menu key, Screenshot key, Fullscreen key), by index: kept in
+// relink_options.ini as these indexes: the list must not change (None is its length). F1 opens the menu too while no other of these rows is F1 (keyboards without Insert)
+const int kHotkeys[] = {VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6, VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12, VK_INSERT, VK_PAUSE,
+                        VK_SCROLL};
+constexpr int kHotkeyNone = (int)(sizeof kHotkeys / sizeof kHotkeys[0]);
+const char* tx_hotkey(int v) {
+    if (v < 0 || v >= kHotkeyNone) return "None";
+    if (kHotkeys[v] == VK_INSERT) return "Insert";
+    if (kHotkeys[v] == VK_PAUSE) return "Pause";
+    if (kHotkeys[v] == VK_SCROLL) return "Scroll Lock";
+    static char b[8];
+    return snprintf(b, sizeof b, "F%d", kHotkeys[v] - VK_F1 + 1), b;
+}
+MENU_HINTS(hn_hotkey, 0, nullptr)
+
+// (relink) HDR: what On does, and what it does not when Windows' HDR is off (hdr_output then stays false: the picture is SDR)
+MENU_HINTS(hn_hdr, 0, "SDR, as before.",
+           "The game draws in HDR10 at the display's peak brightness; its interface at the paper white (hdr_paper_white in "
+           "relink_options.ini, 203 nits). With Windows' HDR off the picture stays SDR.")
+
 Row rows[] = {
     // Graphics (the DLSS model only in a build with DLSS: row_shown)
     {TAB_GRAPHICS, "Quality preset", &opts.preset, 0, 5, 1, tx_preset,
@@ -522,6 +543,9 @@ Row rows[] = {
      hn_preset},
     {TAB_GRAPHICS, "Fullscreen", &opts.fullscreen, 0, 1, 1, tx_onoff,
      "Fills the whole screen with the game, without the window's border. The same as F11.", nullptr, false, true},
+    {TAB_GRAPHICS, "HDR", &opts.hdr, 0, 1, 1, tx_onoff,
+     "The game's own HDR picture, as on an HDR TV. Needs Windows' HDR on for this display. Applies after a restart.", hn_hdr,
+     true, true},
     {TAB_GRAPHICS, "GPU device", &opts.gpu_device, 0, 8, 1, tx_gpu,
      "Which graphics card the game runs on. Applies after a restart.", hn_gpu, true, true},
     {TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
@@ -570,6 +594,14 @@ Row rows[] = {
      "Hold R or L for a wheel of your items: point at one with either stick and let go to equip it.", hn_item_wheel},
     {TAB_GAMEPLAY, "Cycle items", &opts.cycle_items, 0, 4, 1, tx_cycle_items,
      "Changes the item on ZR with a tap of R or L, within its group. Holding R or L still opens the row.", hn_cycle_items},
+    // (relink) the keyboard's own keys of ReLink: kHotkeys
+    {TAB_GAMEPLAY, "Menu key", &opts.key_menu, 0, kHotkeyNone - 1, 1, tx_hotkey,
+     "The key that opens and closes this menu. A controller's Home button, or Select and Start together, opens it too.",
+     hn_hotkey, false, true},
+    {TAB_GAMEPLAY, "Screenshot key", &opts.key_shot, 0, kHotkeyNone, 1, tx_hotkey,
+     "Saves a picture of the game, without this menu, in the game folder's screenshots folder.", hn_hotkey, false, true},
+    {TAB_GAMEPLAY, "Fullscreen key", &opts.key_full, 0, kHotkeyNone, 1, tx_hotkey,
+     "Switches between the window and fullscreen. Alt+Enter does too.", hn_hotkey, false, true},
 
     // Controls (17 rows)
     {TAB_CONTROLS, "Controller in background", &opts.pad_background, 0, 1, 1, tx_onoff,
@@ -938,6 +970,7 @@ void save() {
         for (const Row& r : rows)
             if (r.value) fprintf(f, "%s=%d\n", ini_key(r), *r.value);
         if (!mic_want.empty()) fprintf(f, "microphone_device=%s\n", mic_want.c_str());   // (relink: also while it is unplugged)
+        fprintf(f, "hdr_paper_white=%d\n", opts.hdr_paper_white);   // (relink: HDR, no row of its own)
         // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
         // host/nn_hid.c binds_load)
         fprintf(f, "options_version=3\n");
@@ -1157,9 +1190,13 @@ void gdi_draw(Bitmap& out, uint32_t w, uint32_t h, void (*paint)(HDC, uint32_t, 
             }
         }
     }
-    for (size_t i = 0; i < out.px.size(); i += 4) {
-        if (rgba) std::swap(out.px[i], out.px[i + 2]);
-        out.px[i + 3] = 255;
+    if (hdr_output()) {   // (relink) the window's images are HDR10 words: the bitmap as such, at the paper white (hdr_out.h)
+        hdr_out::bgra8_to_hdr10(out.px.data(), out.px.size() / 4, hdr_paper_white_nits());
+    } else {
+        for (size_t i = 0; i < out.px.size(); i += 4) {
+            if (rgba) std::swap(out.px[i], out.px[i + 2]);
+            out.px[i + 3] = 255;
+        }
     }
     out.version++;
     SelectObject(dc, old);
@@ -2096,6 +2133,11 @@ void startup_screen(const StartupView* view) {
     startup_on.store(true, std::memory_order_release);
 }
 
+int hotkey_vk(int index) { return index >= 0 && index < kHotkeyNone ? kHotkeys[index] : 0; }
+int hdr_paper_white_nits() {
+    static const int env = getenv("HOS_HDR_PAPER_WHITE") && *getenv("HOS_HDR_PAPER_WHITE") ? atoi(getenv("HOS_HDR_PAPER_WHITE")) : 0;
+    return std::clamp(env > 0 ? env : opts.hdr_paper_white, 80, 500);
+}
 void menu_init() {
     static bool done;
     if (done) return;
@@ -2132,6 +2174,7 @@ void menu_init() {
             has_resolution |= !strcmp(line, "resolution");
             v2 |= !strcmp(line, "options_version");
             if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
+            if (!strcmp(line, "hdr_paper_white")) opts.hdr_paper_white = std::clamp(atoi(eq + 1), 80, 500);   // (relink: HDR)
             if (!strcmp(line, "microphone_device")) {   // (relink: the microphone, by its name)
                 mic_want = mic_key(eq + 1);
                 while (!mic_want.empty() && (mic_want.back() == '\n' || mic_want.back() == '\r')) mic_want.pop_back();
@@ -2363,10 +2406,16 @@ void menu_tick() {
     fullscreen_tick();
     enum { K_N = 17 };
     static bool held[K_N];
-    static const int keys[K_N] = {VK_INSERT, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_F1,   // (F1: for keyboards without Insert)
-                                  VK_RETURN, VK_DELETE, VK_BACK,
-                                  'Q', 'E', VK_TAB,   // (the tabs: Q and E, Tab and Shift+Tab)
-                                  VK_PRIOR, VK_NEXT, VK_HOME, VK_END};   // (the long lists: a page, the ends)
+    static int keys[K_N] = {VK_INSERT, VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_ESCAPE, VK_F1,   // (F1: for keyboards without Insert)
+                            VK_RETURN, VK_DELETE, VK_BACK,
+                            'Q', 'E', VK_TAB,   // (the tabs: Q and E, Tab and Shift+Tab)
+                            VK_PRIOR, VK_NEXT, VK_HOME, VK_END};   // (the long lists: a page, the ends)
+    {   // (relink) the Menu key row; F1 as well unless another of ReLink's keys is F1 (then a key nothing is: Insert's place
+        // left as it is would open the menu twice when the Menu key row is Insert)
+        const int menu = hotkey_vk(opts.key_menu), f1_taken = hotkey_vk(opts.key_shot) == VK_F1 || hotkey_vk(opts.key_full) == VK_F1;
+        keys[0] = menu ? menu : VK_INSERT;
+        keys[6] = keys[0] == VK_F1 || f1_taken ? 0xFF : VK_F1;   // (0xFF: no key)
+    }
     HWND fg = GetForegroundWindow();
     DWORD pid = 0;
     if (fg) GetWindowThreadProcessId(fg, &pid);
@@ -2380,7 +2429,7 @@ void menu_tick() {
     }
     // (relink) F12: a screenshot of the game's picture (vk_screenshot.h), menu open or not; not while a control waits for
     // its key in the menu (the key is that control's then)
-    if (host && host->take_key_press && host->take_key_press(VK_F12) && mine && !listening)
+    if (hotkey_vk(opts.key_shot) && host && host->take_key_press && host->take_key_press(hotkey_vk(opts.key_shot)) && mine && !listening)
         screenshot_want.store(true, std::memory_order_relaxed);
     // (relink) the gamepads, by position: Home, or Select and Start together, as Insert; the D-pad as the arrows,
     // the bottom face button as Enter, the right one as Esc (not while a binding waits for its button)

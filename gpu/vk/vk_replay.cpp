@@ -34,6 +34,7 @@
 #include "vk_dump.h"
 #include "vk_gprof.h"
 #include "vk_framegen.h"
+#include "hdr_out.h"   // (relink: the F12 screenshot of an HDR picture)
 #include "vk_menu.h"
 #include "oot_cheat_items.h"   // (relink: OOT_CHEAT_ITEM_BASE, OOT_CHEAT_AGE_ID: the item wheel's counts and pages)
 #include "oot_wheel_state.h"   // (relink: the Item wheel and Cycle items rows' option ids)
@@ -3266,6 +3267,7 @@ struct ScreenShot {
     void* map = nullptr;
     uint32_t w = 0, h = 0;
     bool pending = false;
+    bool hdr = false;   // (relink: the picture's HDR10 words read as they are, made sRGB on the CPU: hdr_out.h)
     uint64_t value = 0;
 };
 ScreenShot screen_shot;
@@ -3276,6 +3278,7 @@ void screenshot_capture(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t 
         const size_t bytes = (size_t)s.w * s.h * 4;
         invalidate_mapped(s.buf_alloc, bytes);
         std::vector<uint8_t> px((const uint8_t*)s.map, (const uint8_t*)s.map + bytes);
+        if (s.hdr) hdr_out::hdr10_to_rgba8(px.data(), (size_t)s.w * s.h, hdr_paper_white_nits());
         menu_store_screenshot(std::move(px), s.w, s.h);
         destroy_image(s.image, s.image_alloc);
         destroy_buffer(s.buf, s.buf_alloc);
@@ -3287,7 +3290,8 @@ void screenshot_capture(VkCommandBuffer cmd, VkImage src, uint32_t sw, uint32_t 
     s.w = cropped ? (uint32_t)crop[2] : sw, s.h = cropped ? (uint32_t)crop[3] : sh;
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType = VK_IMAGE_TYPE_2D;
-    ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    s.hdr = hdr_output();   // (relink: the game's window textures hold PQ then: kept 10-bit, not truncated by the blit)
+    ci.format = s.hdr ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R8G8B8A8_UNORM;
     ci.extent = {s.w, s.h, 1};
     ci.mipLevels = ci.arrayLayers = 1;
     ci.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -4597,6 +4601,10 @@ void fill_replay_table(MkwVkRenderer& t) {
         if (id == HOS_OPT_TELEPORT_PICTURES) return menu_teleport_captures_on();   // (relink: host/hos_main.c oot_capture_tick)
         if (id == HOS_OPT_LOW_CAP_MFPS) return low_cap_repeats() > 1 ? low_cap_mfps.load(std::memory_order_relaxed) : 0;
         if (id == HOS_OPT_FOV) return opts.fov;   // (relink: host/nn_vi.c, nx2/oot_fov.py)
+        if (id == HOS_OPT_HDR) return hdr_output() ? 1 : 0;   // (relink: host/nn_vi.c QueryDisplayHdrStatus)
+        if (id == HOS_OPT_HDR_PEAK) return hdr_peak_nits();
+        if (id == HOS_OPT_HDR_PAPER_WHITE) return hdr_paper_white_nits();
+        if (id == HOS_OPT_KEY_FULLSCREEN) return hotkey_vk(opts.key_full);   // (relink: host/display.c)
         if (id == HOS_OPT_PRESENTS_SHOWN) return presents_shown.load(std::memory_order_acquire) & 0x3fffffff;   // (relink: host/nn_vi.c)
         return id == 0 ? opts.realtime : id == 1 ? menu_is_open() : id == 2 ? resolution_auto() && !dlss_full_scale() : id == 3 ? (dlss_full_scale() ? 10000 : resolution_scale()) : id == 4 ? opts.pad_background : id == 5 ? opts.text_speed : id == 6 ? opts.mouse_native :
                id == 7 ? opts.mouse_sens : id == 8 ? opts.mouse_invert : id == 9 ? opts.rumble : id == HOS_OPT_DEADZONE_L ? opts.deadzone_l : id == HOS_OPT_DEADZONE_R ? opts.deadzone_r : id == 16 ? opts.invert_cam_x : id == 17 ? opts.invert_cam_y : id == HOS_OPT_GYRO ? opts.gyro : id == HOS_OPT_GYRO_SENS_X ? opts.gyro_sens_x : id == HOS_OPT_GYRO_SENS_Y ? opts.gyro_sens_y : id == HOS_OPT_GYRO_INV_X ? opts.gyro_inv_x : id == HOS_OPT_GYRO_INV_Y ? opts.gyro_inv_y :
