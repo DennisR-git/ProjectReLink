@@ -2938,7 +2938,80 @@ void cut_cpu_words(const Pool& p, std::vector<VkBufferCopy>& runs) {
 // (Extracted from the table, not erased: the node, and the Pool in it, stay where they were, so the mirror's lists and
 // a parallel replay thread's pool cache still point at a live one.)
 std::deque<std::map<uint64_t, Pool>::node_type> retired_pools;
-size_t retired_pools_count() { return retired_pools.size(); }
+// (relink, 0.7.9.2) The retired pools nothing needs any more: their import given back, no mirror, no shadow, nothing pending,
+// the GPU past them. Each area change retires ~30 pools (798 in a 10-minute tour of six places, lv01_base, every one given
+// back) and each stayed in retired_pools for the whole session, walked at every submission (retired_imports_give_back), for
+// every range the game frees (release_uncovered: up to 512 a submission while an area loads, under pools_mu), at each of the
+// game threads' frees (memory_guest_imported, under pools_mu) and at every mirror made: the longer the game ran, the longer
+// each of those walks. Such a node moves here, alive at the same address (pointers to it may be kept elsewhere), and its
+// per-page vectors are let go. RX_VK_RETIRED_COMPACT=0: as before (every node stays in retired_pools)
+std::deque<std::map<uint64_t, Pool>::node_type> retired_done;
+size_t retired_pools_count() { return retired_pools.size() + retired_done.size(); }
+std::atomic<int64_t> st_retired_walk_ns{0};   // (time in the walks over retired_pools, for the imports line)
+uint64_t st_retired_vec_bytes = 0;            // (per-page vectors let go with the nodes moved to retired_done)
+bool retired_idle(const Pool& p) {
+    return !p.memory && p.pieces.empty() && !p.buffer && p.mstate == Pool::MIRROR_NONE && !p.mirror && !p.shadow &&
+           !p.inherit_pending && !p.trimmed && !p.wb_pending_n && p.retired_value <= mem_completed && p.last_value <= mem_completed;
+}
+template <class T> uint64_t vec_let_go(std::vector<T>& v) {
+    const uint64_t b = v.capacity() * sizeof(T);
+    std::vector<T>().swap(v);
+    return b;
+}
+void retired_compact() {   // (pools_mu held)
+    static const bool on = !getenv("RX_VK_RETIRED_COMPACT") || atoi(getenv("RX_VK_RETIRED_COMPACT")) != 0;
+    if (!on) return;
+    {   // (nothing should bring a node back to use: none is reachable from the pools' table or the caches emptied at its
+        // retirement. Checked anyway, on the newest 256 moved, every 600 submissions: one in use goes back to the walked list)
+        static uint64_t checked_at;
+        if (mirror_epoch - checked_at >= 600 && !retired_done.empty()) {
+            checked_at = mirror_epoch;
+            const size_t from = retired_done.size() > 256 ? retired_done.size() - 256 : 0;
+            for (size_t i = from; i < retired_done.size();) {
+                if (retired_idle(retired_done[i].mapped())) { i++; continue; }
+                static int told;
+                if (told++ < 4) logf("vk: a retired pool %#llx in use again: walked again", (unsigned long long)retired_done[i].mapped().lo);
+                retired_pools.push_back(std::move(retired_done[i]));
+                retired_done.erase(retired_done.begin() + (ptrdiff_t)i);
+            }
+        }
+    }
+    bool any = false;
+    for (const auto& nh : retired_pools)
+        if (retired_idle(nh.mapped())) { any = true; break; }
+    if (!any) return;
+    std::deque<std::map<uint64_t, Pool>::node_type> keep;
+    for (auto& nh : retired_pools) {
+        Pool& p = nh.mapped();
+        if (!retired_idle(p)) { keep.push_back(std::move(nh)); continue; }
+        st_retired_vec_bytes += vec_let_go(p.shadow_known) + vec_let_go(p.wb_pending) + vec_let_go(p.wb_mixed) +
+                                vec_let_go(p.wb_gen) + vec_let_go(p.wb_cpu_frame) + vec_let_go(p.wb_flushing) +
+                                vec_let_go(p.wb_flush_words) + vec_let_go(p.pieces);
+        retired_done.push_back(std::move(nh));
+    }
+    retired_pools.swap(keep);
+}
+// (relink, test) RX_VK_TEST_RETIRED_PAD=<n>: n idle retired pools at the first submission, scattered among other allocations as a
+// session's are, to see now what a long session's list costs (with RX_VK_RETIRED_COMPACT=0) and that the compaction takes it away
+void retired_test_pad() {   // (pools_mu held)
+    static bool done;
+    if (done) return;
+    done = true;
+    const char* e = getenv("RX_VK_TEST_RETIRED_PAD");
+    const int n = e ? atoi(e) : 0;
+    if (n <= 0) return;
+    std::map<uint64_t, Pool> tmp;
+    std::vector<void*> junk;
+    junk.reserve((size_t)n);
+    for (int i = 0; i < n; i++) {
+        Pool& p = tmp.emplace((uint64_t)i, Pool{}).first->second;
+        p.lo = p.hi = 0;
+        junk.push_back(malloc(256 + (size_t)(i % 13) * 192));
+        retired_pools.push_back(tmp.extract((uint64_t)i));
+    }
+    for (void* j : junk) free(j);
+    logf("vk: test: %d idle retired pools added (RX_VK_TEST_RETIRED_PAD)", n);
+}
 
 void retire_pool(std::map<uint64_t, Pool>::iterator it) {
     Pool* old = &it->second;
@@ -3290,9 +3363,12 @@ int memory_guest_imported(uint64_t lo, uint64_t hi) {
         if (it->second.hi > lo) return 1;
         if (it->second.hi + (1ull << 30) < lo) break;   // (imports are at most 1 GB: none further down reaches lo)
     }
+    const auto walk_t0 = std::chrono::steady_clock::now();
+    int found = 0;
     for (const auto& nh : retired_pools)
-        if (nh.mapped().memory && nh.mapped().lo < hi && lo < nh.mapped().hi) return 1;
-    return 0;
+        if (nh.mapped().memory && nh.mapped().lo < hi && lo < nh.mapped().hi) { found = 1; break; }
+    st_retired_walk_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walk_t0).count();
+    return found;
 }
 
 bool mirror_make(Pool& pool);   // (below)
@@ -3546,6 +3622,8 @@ void retired_imports_give_back() {   // (pools_mu held)
     uint64_t live_bytes = 0, retired_bytes = 0;
     size_t retired_alive = 0;
     for (auto& [lo, p] : imported) live_bytes += p.hi - p.lo;
+    retired_test_pad();
+    const auto walk_t0 = std::chrono::steady_clock::now();
     for (auto& nh : retired_pools) {
         Pool& p = nh.mapped();
         if (!p.memory) continue;
@@ -3559,12 +3637,18 @@ void retired_imports_give_back() {   // (pools_mu held)
         }
         retired_alive++, retired_bytes += p.hi - p.lo;
     }
+    st_retired_walk_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walk_t0).count();
+    retired_compact();
     static uint64_t logged_epoch;
     if (mirror_epoch - logged_epoch >= 1200) {
         logged_epoch = mirror_epoch;
         logf("vk: imports: %zu live (%llu MB), %zu retired still imported (%llu MB), %llu retired given back (%llu MB)",
              imported.size(), (unsigned long long)(live_bytes >> 20), retired_alive, (unsigned long long)(retired_bytes >> 20),
              (unsigned long long)st_retired_imports_freed, (unsigned long long)(st_retired_import_bytes_freed >> 20));
+        // (relink) the retired pools walked and set aside (retired_compact), and the time their walks took since the last line
+        logf("vk: retired pools: %zu walked, %zu set aside (%llu KB of their vectors let go); %.2f ms in their walks over the "
+             "last 1200 submissions; page generation %u", retired_pools.size(), retired_done.size(),
+             (unsigned long long)(st_retired_vec_bytes >> 10), st_retired_walk_ns.exchange(0) / 1e6, gen_now);
     }
 }
 void mirror_free(Pool& p) {
@@ -3678,8 +3762,12 @@ void release_uncovered(uint64_t lo, uint64_t hi) {   // (pools_mu held)
         if (it->second.hi + (1ull << 30) < lo) break;   // (imports are at most 1 GB: none further down reaches lo)
         note(it->second.lo, it->second.hi);
     }
-    for (const auto& nh : retired_pools)
-        if (nh.mapped().memory) note(nh.mapped().lo, nh.mapped().hi);
+    {
+        const auto walk_t0 = std::chrono::steady_clock::now();
+        for (const auto& nh : retired_pools)
+            if (nh.mapped().memory) note(nh.mapped().lo, nh.mapped().hi);
+        st_retired_walk_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walk_t0).count();
+    }
     for (const DeadImport& d : dead_imports) note(d.lo, d.lo + d.bytes);
     for (const auto& nh : evicted_pools) note(nh.mapped().lo, nh.mapped().hi);
     std::sort(held.begin(), held.end());
