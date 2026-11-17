@@ -44,6 +44,7 @@
 #include "vk_texture.h"
 #include "movie_upscale_policy.h"
 #include "skip_code.h"
+#include "direct_ub_snapshot.h"
 
 #include "shaders/clear_f_frag_spv.h"
 #include "shaders/clear_i_frag_spv.h"
@@ -121,14 +122,15 @@ const char* const kFineT[] = {"banks", "c1", "user uniform buffers", "storage bu
                                       "bind descriptors", "of it the push call", "push constants", "dynamic state", "vertex+index binds",
                                       "draw call"};
 enum FineC { FC_DRAWS, FC_BUILDS, FC_DESCS, FC_WRITES, FC_BANK_CALLS, FC_BANK_GEN, FC_BANK_FILLS, FC_BANK_FILL_BYTES, FC_BANK_SAME,
-             FC_BANK_NEW, FC_BANK_NEW_BYTES, FC_C1_CALLS, FC_UBO_CALLS, FC_UBO_OVERLAY, FC_UBO_STREAM, FC_PUSH_FULL, FC_PUSH_DELTA,
-             FC_PUSH_NONE, FC_PUSH_WRITES, FC_PUSH_DESCS, FC_BIND_PIPE, FC_DYN_FAST, FC_DYN_FULL, FC_DYN_CALLS, FC_VBIND, FC_IBIND,
-             FC_PUSHC, FC_PIPE_FAST, FC_PIPE_MAP, FC_POOL_SETS, FC_POOL_DESCS, FC_SSBO_DESCS, FC_COUNT };
+             FC_BANK_NEW, FC_BANK_NEW_BYTES, FC_C1_CALLS, FC_UBO_CALLS, FC_UBO_OVERLAY, FC_UBO_STREAM, FC_UBO_REUSE, FC_PUSH_FULL,
+             FC_PUSH_DELTA, FC_PUSH_NONE, FC_PUSH_WRITES, FC_PUSH_DESCS, FC_BIND_PIPE, FC_DYN_FAST, FC_DYN_FULL, FC_DYN_CALLS,
+             FC_VBIND, FC_IBIND, FC_PUSHC, FC_PIPE_FAST, FC_PIPE_MAP, FC_POOL_SETS, FC_POOL_DESCS, FC_SSBO_DESCS, FC_COUNT };
 const char* const kFineC[] = {"draws", "descriptor builds", "descriptors", "descriptor writes", "bank calls",
                                       "bank kept by its stage's generation", "bank fills", "bank bytes filled", "bank refills equal",
                                       "bank copies into the stream", "bank bytes copied", "c1 calls", "user uniform buffer calls",
                                       "uniform ranges copied with an update's overlay", "uniform ranges copied into the stream",
-                                      "full pushes", "pushes of changed writes only", "pushes of nothing (all as pushed)",
+                                      "direct uniform snapshots reused", "full pushes", "pushes of changed writes only",
+                                      "pushes of nothing (all as pushed)",
                                       "writes pushed", "descriptors pushed", "pipeline binds", "dynamic state from the draw before",
                                       "dynamic state worked out", "dynamic state commands", "vertex stream binds", "index buffer binds",
                                       "push constants", "pipeline keys from the fast pair", "pipeline keys from the thread's map",
@@ -401,6 +403,9 @@ struct RecordingRes {
     uint64_t before = 0;           // (what the recording used of the streams before this one)
     uint32_t idle = 0;             // (recordings of the slot that stayed in the first stream)
     std::unordered_map<const void*, std::pair<VkBuffer, uint64_t>> c1_at;   // (c1 of a stage: uploaded once a recording)
+    // Direct (non-mirrored) uniform ranges copied once for each submitted-memory
+    // view and again after an inline update or another submit in this recording.
+    mkwvk::direct_ub::Cache<VkBuffer> direct_ub_at;
 };
 // (a recording's first stream: one for each of the kRecordings slots. RX_VK_STREAM_MB=<n>: that size, 2 by default; a recording
 // that needs more is given a bigger stream for the rest of it (RX_VK_STREAM_GROW_OFF=1: draws are skipped instead, and the default
@@ -2339,21 +2344,42 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
                 FINE_N(FC_UBO_OVERLAY, 1);
                 return {cur->stream, at, n};
             }
-        // (RX_VK_UB_SNAPSHOT=1: the contents as they are now, in the stream, not the pool the GPU reads later)
-        static const bool snapshot = getenv("RX_VK_UB_SNAPSHOT") != nullptr;
+        // A direct import aliases guest RAM. The CPU may start its next frame
+        // after present while this frame is still on the GPU, so a descriptor
+        // cannot safely retain that live range. A VRAM mirror is queue-ordered
+        // and remains zero-copy. RX_VK_UB_SNAPSHOT=0 / 1 overrides automatic.
+        static const mkwvk::direct_ub::Mode snapshot = mkwvk::direct_ub::mode(getenv("RX_VK_UB_SNAPSHOT"));
         // (relink: a 2D draw's uniform buffer too, with RX_VK_CAPTURE_UI_UBO=1 only: they are many small ones spread over a
         // transient arena (~900 ranges, 12 MB noted in a minute on the platform, hs460), and the HUD's records are storage buffers)
         static const bool ui_ubo = getenv("RX_VK_CAPTURE_UI_UBO") != nullptr;
         if ((ui_draw_now && ui_ubo) || compute_now) memory_note_ui_buffer(u.addr, n);
-        BufferRef b = snapshot ? BufferRef{} : gpu_buffer_bind(u.addr, n, false);
-        if (b && b.offset % align == 0) return {b.buffer, b.offset, n};
+        BufferRef b = snapshot == mkwvk::direct_ub::Mode::forced ? BufferRef{} : gpu_buffer_bind(u.addr, n, false);
+        const bool keep_copy = mkwvk::direct_ub::should_snapshot(snapshot, b.direct);
+        if (b && b.offset % align == 0 && !keep_copy) return {b.buffer, b.offset, n};
+        const uint64_t generation = ub_generation(), capture_view = memory_capture_view();
+        if (keep_copy) {
+            static std::atomic_flag told = ATOMIC_FLAG_INIT;
+            if (!told.test_and_set())
+                logf("vk: direct uniform buffers copied into the recording stream (RX_VK_UB_SNAPSHOT=0: direct, 1: all)");
+            VkBuffer buffer = VK_NULL_HANDLE;
+            uint64_t at = 0;
+            if (cur->direct_ub_at.find(u.addr, n, generation, capture_view, &buffer, &at)) {
+                FINE_N(FC_UBO_REUSE, 1);
+                return {buffer, at, n};
+            }
+        }
         const uint64_t at = stream_alloc(n, align);   // (unaligned or outside the pools: copied into the stream)
         if (at == UINT64_MAX) return bi;
         FINE_N(FC_UBO_STREAM, 1);
         // (as the submission had it, not as the game has rewritten it since: the captures' pages)
         memory_read_as_submitted(u.addr, cur->mapped + at, n);
+        if (keep_copy && !cur->direct_ub_at.keep(u.addr, n, generation, capture_view, cur->stream, at)) {
+            static std::atomic_flag full_told = ATOMIC_FLAG_INIT;
+            if (!full_told.test_and_set())
+                logf("vk: direct uniform-buffer snapshot cache full; extra bindings will be copied again");
+        }
         static int64_t copied;
-        if (++copied % 5000 == 1)
+        if (!keep_copy && ++copied % 5000 == 1)
             logf("vk: uniform buffer %#llx +%#llx copied into the stream (%s; %lld so)", (unsigned long long)u.addr,
                  (unsigned long long)n, b ? "unaligned" : "outside the pools", (long long)copied);
         return {cur->stream, at, n};
@@ -3841,6 +3867,15 @@ thread_local DynState last_dyn;
 thread_local bool last_dyn_valid = false;
 #define DYN_CHANGED(f) ((!last_dyn_valid || std::memcmp(&d.f, &last_dyn.f, sizeof d.f)) && (FINE_X(FC_DYN_CALLS, 1), true))
 
+// A renderer helper may bind its own graphics pipeline, dynamic state, vertex/index streams and push descriptors.
+// Forget every cached guest draw binding before the next draw; otherwise it can skip commands whose Vulkan state the
+// helper replaced. This is deliberately separate from descriptors_disturbed(), which also covers compute-only helpers.
+void graphics_state_disturbed() {
+    last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
+    vertex_set.on = false, last_ib.on = false;
+    descriptors_disturbed();
+}
+
 /// The inputs a draw's dynamic state is built from. Most draws repeat the draw before them.
 bool dyn_same(const float* fp, int nf, const uint32_t* up, int nu, const uint8_t* raw, int nb, const float* cfp,
               const uint32_t* cup, const uint8_t* craw) {
@@ -4408,6 +4443,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
              (unsigned long long)stream_grown.load(), (unsigned long long)(stream_extra.load() >> 20));
     r.used = 0, r.before = 0;
     r.c1_at.clear();
+    r.direct_ub_at.reset();
     cur = &r;
     pass() = Pass{};
     work_since_barrier = false;
@@ -7143,11 +7179,21 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
             const VkImageView input_view = texture_view(src, &in, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample, &input_format);
             const VkImageView output_view = texture_view(dst, &out, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage,
                                                          &output_format, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
-            if (input_format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && output_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
-                typed_upscale(cmd, input_view, output_view, dst, 0, key, "generic RGB9E5 fallback", false)) {
-                full_barrier(cmd);
-                texture_written(dst);
-                return true;
+            if (input_format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && output_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32) {
+                // A gameplay network that did not translate reaches this stub before dispatch() can call
+                // dlss_stand_in. Give the requested external upscaler the same scene input/output here; if it cannot
+                // take this frame, keep the existing typed fallback as the bounded, visible recovery path.
+                bool external = false;
+                if (dlss_wanted()) {
+                    external = dlss_upscale(cmd, key, gameplay_network(key), src, input_view, dst, output_view, 0);
+                    // dlss_upscale may have drawn actor motion before returning false; either result replaces graphics state.
+                    graphics_state_disturbed();
+                }
+                if (external || typed_upscale(cmd, input_view, output_view, dst, 0, key, "generic RGB9E5 fallback", false)) {
+                    full_barrier(cmd);
+                    texture_written(dst);
+                    return true;
+                }
             }
         }
     }
@@ -7341,8 +7387,7 @@ bool dlss_stand_in(VkCommandBuffer cmd, const NvnState& s, const Program& p) {
     if (out_handle) texture_view_of(out_handle, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage, image_format(od.format), &out, &level);
     const bool done = dlss_upscale(cmd, p.key, gameplay_network(p.key), in, dw().imgs[0].imageView, out, dw().imgs[ntex].imageView, level);
     // (its actor motion may have drawn with a pipeline, viewport and descriptors of its own: the next draw sets all of its again)
-    last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false, last_pipeline = VK_NULL_HANDLE;
-    vertex_set.on = false, last_ib.on = false;
+    graphics_state_disturbed();
     return done;
 }
 /// (relink) After the gameplay upscale wrote its output (the game's network, or DLSS in its place: stood_in),
