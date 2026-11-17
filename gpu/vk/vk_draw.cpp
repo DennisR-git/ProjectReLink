@@ -3729,6 +3729,25 @@ Targets bare_targets(const NvnState& s, Targets at) {
 }
 
 /// Whether the targets of a draw kept a picture from an earlier frame (a draw left out of them shows for one frame)
+/// (relink, 17/11, issue 47 and the Discord's striped ground) Whether a draw left out of these targets is drawn again in the next
+/// frames: every target was drawn in the frame before (the scene's own, redrawn each frame) and the draw covers it, its viewport
+/// and scissor over nine tenths of it. Not a part the game draws once into a target it keeps: a tile, a decal, a shadow of a
+/// cache it updates a piece at a time. Left out, such a piece was never drawn again, and that part of the target kept what was
+/// there before until the area was loaded again: rectangular patches of the wrong texels over the ground, a few minutes into a
+/// place never seen in this session (Flix's route in the Fire Temple, every time after a fresh start; logs with draws left out
+/// in all four reports). Those wait for their pipeline instead
+bool targets_redrawn(const Targets& at, const NvnState& s) {
+    const uint64_t now = texture_frame_no();
+    const auto recent = [&](const Texture* t) { return !t || t->last_written + 1 >= now; };
+    for (int i = 0; i < at.n; i++)
+        if (!recent(at.color[i])) return false;
+    if (!recent(at.depth)) return false;
+    if (!at.width || !at.height) return false;
+    const float w = (float)at.width * 0.9f, h = (float)at.height * 0.9f;
+    if (std::fabs(s.viewport[0][2]) < w || std::fabs(s.viewport[0][3]) < h) return false;
+    if (s.scissor[2] > 0 && s.scissor[3] > 0 && ((float)s.scissor[2] < w || (float)s.scissor[3] < h)) return false;
+    return true;
+}
 bool targets_persistent(const Targets& at) {
     const uint64_t now = texture_frame_no();
     for (int i = 0; i < at.n; i++)
@@ -6266,7 +6285,10 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     // (waited for by default: a draw left out showed as missing geometry in races, where many programs are new;
     // RX_VK_PIPE_SKIP=1: left out when its targets hold an earlier frame's picture, as before)
     static const bool always_wait = getenv("RX_VK_PIPE_SKIP") == nullptr;
-    const bool persistent = targets_persistent(at);
+    // (relink, issue 47: and only where the next frame draws it again, targets_redrawn. RX_VK_SKIP_PARTS=1: as before, any draw
+    // into targets that hold an earlier frame's picture)
+    static const bool skip_parts = getenv("RX_VK_SKIP_PARTS") && atoi(getenv("RX_VK_SKIP_PARTS")) != 0;
+    const bool persistent = targets_persistent(at) && (skip_parts || targets_redrawn(at, s));
     const bool may_skip = !always_wait && persistent;
     // (relink) a bounded wait (RX_VK_PIPE_WAIT_MS, default 8 a frame, 0: as before, unbounded): a draw into targets that already hold
     // an earlier frame's picture waits for its program or pipeline while this frame's waits stay under it, and is left out after
@@ -6299,6 +6321,21 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         st_waits++;
         st_wait_ms += ms, waited_ms += ms;
+        // (relink, issue 47) the draws left out and those the rule above waited for instead, named: 40 lines of each
+        static std::atomic<int> told_out{0}, told_kept{0};
+        // (waited for here, left out after the frame's wait under the rule before: a part of a kept target, with depth)
+        const bool kept_part = !bounded && !skip_parts && wait_ms > 0 && (at.depth || wait_flat) && targets_persistent(at);
+        if ((left_out && told_out.load(std::memory_order_relaxed) < 40) || (kept_part && told_kept.load(std::memory_order_relaxed) < 40)) {
+            (left_out ? told_out : told_kept)++;
+            const Texture* t0t = at.n ? at.color[0] : at.depth;
+            logf("vk: draw of program %016llx %s (%.1f ms waited): %d targets, the first #%u %ux%u NVN %#x drawn at frame %llu (now %llu), "
+                 "pass %ux%u, viewport %.0f %.0f %.0f %.0f, scissor %d %d %d %d",
+                 (unsigned long long)cp->key, left_out ? "left out (not ready)" : "waited for: a part of a target kept from earlier frames",
+                 ms, at.n + (at.depth ? 1 : 0), t0t ? t0t->id : 0u, t0t ? t0t->width : 0u, t0t ? t0t->height : 0u,
+                 t0t ? (unsigned)t0t->nvn_format : 0u, (unsigned long long)(t0t ? t0t->last_written : 0),
+                 (unsigned long long)texture_frame_no(), at.width, at.height, s.viewport[0][0], s.viewport[0][1], s.viewport[0][2],
+                 s.viewport[0][3], s.scissor[0], s.scissor[1], s.scissor[2], s.scissor[3]);
+        }
     };
     if (!cp->ready.load(std::memory_order_acquire)) {
         if (may_skip) return void(st_pending_skips++);
