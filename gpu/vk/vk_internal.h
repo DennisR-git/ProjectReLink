@@ -239,6 +239,9 @@ int vk_value_is_mine(uint64_t v);   // (relink, diagnostic: the calling thread b
 uint64_t vk_present_value();        // (relink: the newest timeline value begun when the last present came)
 void vk_timeline_wait(uint64_t v);
 uint32_t memory_generation();
+/// (relink) bumped each time a pool leaves the table or its buffer is given back (vk_memory.cpp pools_gen): what was made over a
+/// pool's buffer before may be over a destroyed one now (texel_buffer_view)
+uint64_t memory_pools_generation();
 /// 1: a page of [guest, guest + size) was written after generation gen; 0: none was
 bool memory_written_since(uint64_t guest, uint64_t size, uint32_t gen);
 void memory_stamp(uint64_t guest, uint64_t size);   // a write the watch does not see (GPU writes, host writes)

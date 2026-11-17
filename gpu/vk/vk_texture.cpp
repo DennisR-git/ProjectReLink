@@ -4294,11 +4294,34 @@ VkBufferView texel_buffer_view(const nvn_tex* t, const nvn_view* v, bool storage
     const uint64_t size = (uint64_t)std::max(1u, t->d.width) * bpb;
     // (a formatted store into it: textures over that memory are uploaded again once the GPU is done)
     if (storage) texture_gpu_wrote(t->gpu, size);
-    static std::unordered_map<uint64_t, VkBufferView> views;
+    // (relink, 17/11, Discord: kalm, "crashed crossing the finish line of the first race at Lon Lon Ranch", RTX 4060 Ti) The views
+    // were kept by address alone, and returned without asking for the buffer again: the pool under one was then not marked in use
+    // (gpu_buffer's last_value) and could be given back while draws still read it, and once its pool was made again larger or
+    // given back (NVIDIA: retired_imports_give_back destroys the buffer), the view kept pointing into a destroyed buffer. His crash,
+    // symbolized on a build of the same sources and options: the replay's parallel worker, draw, bind_descriptors,
+    // vkCmdPushDescriptorSetKHR, and NVIDIA's driver reading address 0x2d6200, 80 log lines after "pool 0x7fc6000000 remade
+    // larger". Now the buffer is asked for at every call, and a view made over another buffer, another offset or before a pool
+    // left the table is made again; the old one is destroyed once the GPU is past the recording that let it go
+    struct Cached {
+        VkBufferView view;
+        VkBuffer buffer;
+        uint64_t offset, gen;
+    };
+    static std::unordered_map<uint64_t, Cached> views;
+    static std::deque<std::pair<VkBufferView, uint64_t>> old_views;
+    while (!old_views.empty() && old_views.front().second + 2 <= completed_value) {
+        vkDestroyBufferView(dev.device, old_views.front().first, nullptr);
+        old_views.pop_front();
+    }
     const uint64_t key = mix(mix(t->gpu, (uint64_t)f << 1 | storage), size);
+    const uint64_t gen = memory_pools_generation();
+    BufferRef b = gpu_buffer(t->gpu, size);   // (every time: the pool marked in use by this recording)
     auto it = views.find(key);
-    if (it != views.end()) return it->second;
-    BufferRef b = gpu_buffer(t->gpu, size);
+    if (it != views.end()) {
+        if (b && it->second.buffer == b.buffer && it->second.offset == b.offset && it->second.gen == gen) return it->second.view;
+        if (it->second.view) old_views.push_back({it->second.view, rec_value});
+        views.erase(it);
+    }
     VkBufferView bv = VK_NULL_HANDLE;
     if (b && b.offset % std::max<uint64_t>(dev.props.limits.minTexelBufferOffsetAlignment, 1) == 0) {
         VkBufferViewCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO};
@@ -4308,7 +4331,7 @@ VkBufferView texel_buffer_view(const nvn_tex* t, const nvn_view* v, bool storage
         ci.range = std::min<uint64_t>(size, (uint64_t)dev.props.limits.maxTexelBufferElements * bpb);
         vkCreateBufferView(dev.device, &ci, nullptr, &bv);
     }
-    views[key] = bv;
+    views[key] = {bv, b ? b.buffer : VK_NULL_HANDLE, b ? b.offset : 0, gen};
     return bv;
 }
 
