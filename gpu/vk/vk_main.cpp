@@ -1026,6 +1026,9 @@ void prepare_with_screen() {
             prep_stage.store(1);
             predict_run(prep_progress);
         }
+        // (relink, issue 97) an update builds the shipped state list's pipelines too, as the start without a screen does below:
+        // without them the pipelines a scene needs first (Link in water) were built in play, and their draws left out meanwhile
+        if (update && !prepare_stopped()) state_list_run();
         if (!prepare_stopped()) {
             prep_done.store(0), prep_total.store(0);
             prep_stage.store(2);

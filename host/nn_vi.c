@@ -359,6 +359,36 @@ volatile float hos_fov_scale = 1.0f;
    below and never more than 60: unlocked, the step stayed 1/60 s and the whole game ran at fps / 60 times its speed (x1.77
    at 102 fps, x1.24 at 75, measured with HOS_STEP_LOG=1). HOS_STEP_RATE_OLD=1: never set, as before */
 volatile int hos_step_fps = 0;
+/* (relink, issue 120) The water's ripple steps above 60 fps (nx2/oot_ripples.py): the game cuts the frame's step (bits, a
+   float, 1.0 at 60 fps) to an integer, 0 at every frame above 60 fps, and the rings in water stood still. The step is added to
+   a remainder kept for each surface (key) and its whole part handed out, so each surface runs at the game's 60 steps a second.
+   64 slots, the least recently used taken for a new surface (a scene's surfaces each come every frame). HOS_RIPPLES_CUT=1: the
+   game's cut, as before */
+uint32_t hos_ripple_steps(uint64_t key, uint32_t bits) {
+    static int cut = -1;
+    if (cut < 0) cut = getenv("HOS_RIPPLES_CUT") != NULL;
+    float step;
+    memcpy(&step, &bits, 4);
+    if (!(step > 0.0f) || step > 16.0f) return 0;   /* (NaN, none or absurd: nothing, as the cut of a NaN would) */
+    if (cut) return (uint32_t)step;
+    enum { SLOTS = 64 };
+    static uint64_t keys[SLOTS], used[SLOTS], clock;
+    static float rem[SLOTS];
+    static SRWLOCK lock = SRWLOCK_INIT;
+    AcquireSRWLockExclusive(&lock);
+    int at = -1, oldest = 0;
+    for (int i = 0; i < SLOTS; i++) {
+        if (keys[i] == key && used[i]) { at = i; break; }
+        if (used[i] < used[oldest]) oldest = i;
+    }
+    if (at < 0) at = oldest, keys[at] = key, rem[at] = 0.0f;
+    used[at] = ++clock;
+    rem[at] += step;
+    const uint32_t whole = (uint32_t)rem[at];
+    rem[at] -= (float)whole;
+    ReleaseSRWLockExclusive(&lock);
+    return whole;
+}
 /* The Insert menu's Text speed (0 Normal, 1 2x, 2 4x, 3 Instant), HOS_TEXT_SPEED=<0..3> over it: what the time of a letter
    animation's step is multiplied by. Instant: the page at once, as the game's own skip on A */
 static float text_scale(const char *env, int menu) {

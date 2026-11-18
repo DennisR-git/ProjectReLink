@@ -6542,9 +6542,26 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         pe = graphics_pipeline(p, s, at, topo, types);
     }
     if (!pe->ready.load(std::memory_order_acquire)) {
-        if (may_skip) return void(st_pending_skips++);
-        wait_for(pe->ready);
-        if (left_out) return void(st_pending_skips++);
+        // (relink, issue 97) a draw whose stages write memory (storage buffers or images, global stores) makes data later draws or
+        // frames read: left out, that data is missing or stale for as long as its pipeline builds, which an earlier frame's picture
+        // in its targets does not hide. Waited for without bound, like a pass drawn once. RX_VK_SKIP_WRITERS=1: as before
+        static const bool skip_writers = getenv("RX_VK_SKIP_WRITERS") != nullptr;
+        bool writes = false;
+        if (!skip_writers && !p.fallback)   // (a mesh fallback's stages write their own records: not the game's memory)
+            for (const Stage& st : p.stages) {
+                const Shader::Info& in = st.info;
+                writes |= in.stores_global_memory;
+                for (const auto& b : in.storage_buffers_descriptors) writes |= b.is_written;
+                for (const auto& im : in.image_descriptors) writes |= im.is_written;
+                for (const auto& ib : in.image_buffer_descriptors) writes |= ib.is_written;
+            }
+        if (writes) {
+            jobs_wait(pe->ready);
+        } else {
+            if (may_skip) return void(st_pending_skips++);
+            wait_for(pe->ready);
+            if (left_out) return void(st_pending_skips++);
+        }
     }
     const VkPipeline pl = pe->pipeline;
     if (!pl) SKIP_HERE();
