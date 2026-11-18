@@ -562,6 +562,12 @@ bool lookup_tables_on() {
     return on;
 }
 
+/// (relink) the NVIDIA-only inlining of the Deku Tree web program's 128-bit loads (translate_into; disk_stamp)
+bool web_inline_on() {
+    static const bool on = dev.props.vendorID == 0x10DE && !getenv("RX_VK_NO_WEB_INLINE");
+    return on;
+}
+
 Shader::HostTranslateInfo host_info() {
     Shader::HostTranslateInfo h{};
     h.support_float64 = true;
@@ -1094,6 +1100,8 @@ uint64_t disk_stamp() {
         add(&flags, sizeof flags);
         const uint64_t ssbo_align = storage_binding_align();   // (relink: the translator reads storage vectors at this alignment)
         add(&ssbo_align, sizeof ssbo_align);
+        const uint32_t web_inline = web_inline_on() ? 1u : 0u;   // (relink: NVIDIA's Deku Tree web program)
+        add(&web_inline, sizeof web_inline);
         add(mma_order_a.data(), sizeof(uint32_t) * mma_order_a.size());
         add(mma_order_b.data(), sizeof(uint32_t) * mma_order_b.size());
         add(mma_order_c.data(), sizeof(uint32_t) * mma_order_c.size());
@@ -1659,6 +1667,11 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             for (int i = 0; i < 16; i++) vrt.generic_input_types[i] = attribute_type_of(s.vattr[i]);
             vrt.previous_stage_stores.mask.set();
             vrt.convert_depth_mode = host->depth_minus_w() != 0;
+            // (relink) the Deku Tree's floor web (vertex program b449bcdb69b36a8a), NVIDIA: with the 128-bit load helper called, the
+            // compiled shader used one load's result where the SPIR-V names another's (the grid's origin for its size: a cell index out of
+            // range, a dark web). Inlined for that one program. RX_VK_NO_WEB_INLINE=1: off (a translation setting: in disk_stamp)
+            constexpr uint64_t kDekuWebVertexCode = 0xb449bcdb69b36a8aull;
+            vrt.inline_global_128_loads = web_inline_on() && vsc->key == kDekuWebVertexCode;
             Stage v;
             v.nvn_stage = 0;
             const std::vector<uint32_t> vspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), vrt, vs->program, bindings);
