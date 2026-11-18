@@ -370,8 +370,12 @@ bool create_device() {
     // (RX_VK_FORCE_MESH_FALLBACK=1, a test: mesh shaders not used where they are, so the no-mesh fallback the GTX 10xx and RX 5000
     // cards run (issue 640) can be tried on any GPU)
     bool force_fallback = false;
+    // (relink, RX_VK_MESH_FALLBACK_TASK_ONLY=1) a finer rule than the whole fallback: the GPU keeps its mesh shaders, and only the
+    // programs with a task stage run as compute (create_device below; vk_shader.cpp's mesh_program_locked picks per program). An
+    // explicit RX_VK_FORCE_MESH_FALLBACK still decides over it
+    const bool task_only = getenv("RX_VK_MESH_FALLBACK_TASK_ONLY") && atoi(getenv("RX_VK_MESH_FALLBACK_TASK_ONLY")) != 0;
 #ifdef _WIN32
-    force_fallback = kMeshFallbackOnAmdNavi2x && amd_navi2x_mesh_fallback(dev.props.vendorID, dev.props.deviceID);
+    force_fallback = kMeshFallbackOnAmdNavi2x && !task_only && amd_navi2x_mesh_fallback(dev.props.vendorID, dev.props.deviceID);
     const char* force_env = getenv("RX_VK_FORCE_MESH_FALLBACK");
     if (force_fallback && !force_env)
         logf("vk: AMD RDNA 2 (device %#x) on Windows: task and mesh programs run as compute shaders, as the driver's mesh path lost the "
@@ -618,6 +622,8 @@ bool create_device() {
     // (relink, issue 640) RDNA1 and older GPUs: no mesh shaders, but task and mesh programs run as compute shaders
     // that write their vertices to buffers, drawn through an ordinary graphics pipeline. It needs buffer device addresses.
     dev.mesh_fallback = !dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
+    dev.task_mesh_fallback = task_only && dev.mesh_shader && f12.bufferDeviceAddress && !getenv("RX_VK_NO_MESH_FALLBACK");
+    if (dev.task_mesh_fallback) logf("vk: native mesh shaders; the programs with a task stage run as compute shaders (RX_VK_MESH_FALLBACK_TASK_ONLY)");
     if (dev.mesh_fallback) logf("vk: no mesh shaders: task and mesh programs run as compute shaders (issue 640 fallback)");
     if (amd_gcn && !dev.mesh_shader)   // (relink, issue 43)
         logf("vk: an AMD GCN GPU (Radeon RX 400 / 500 series or Vega: 64-lane subgroups only, no mesh shaders): below what ReLink "
