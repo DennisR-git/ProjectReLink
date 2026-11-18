@@ -1160,7 +1160,7 @@ bool submitted_page_reuse(uint64_t page, uint32_t page_gen, uint64_t view, uint6
 // (relink) A page no capture holds, as of its write stamp and the capture table's generation: guest memory stands for its next
 // words too, so the read skips pools_mu. 32 of them a thread, by page: a draw's handle program reads a uniform word on one page
 // and a storage word on another, and with one page kept nearly every read missed and took the lock. A page a capture does hold
-// is not kept: its words are copied from the capture at each read (a whole 4 KB copy kept per page cost more than it saved).
+// keeps its copy as before, one page a thread (captured_page): repeated words of it are read without the lock too.
 // RX_VK_SUBMITTED_PAGES=1: one slot for every page.
 struct SubmittedPage {
     uint64_t page = ~0ull;
@@ -1173,12 +1173,30 @@ inline SubmittedPage& submitted_page_for(uint64_t page) {   // (a page and its n
     static const bool one = getenv("RX_VK_SUBMITTED_PAGES") && atoi(getenv("RX_VK_SUBMITTED_PAGES")) == 1;
     return submitted_pages[one ? 0 : (page + (page >> 5) * 13) & (kSubmittedPages - 1)];
 }
+struct CapturedPage {
+    uint64_t page = ~0ull;
+    uint32_t pgen = 0;
+    uint64_t view = 0;
+    uint8_t bytes[4096]{};
+};
+thread_local CapturedPage captured_page;   // (the last page read that a capture held: its copy)
 inline bool submitted_known(uint64_t page, uint32_t pgen, uint64_t view) {
     const SubmittedPage& sp = submitted_page_for(page);
     return submitted_page_reuse(page, pgen, view, sp.page, sp.pgen, sp.view);
 }
 
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
+    if (n && capture_on() && captures_seen.load(std::memory_order_relaxed)) {   // (a captured page read before: its copy)
+        const uint64_t guest = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
+        if (guest && (guest >> kPageShift) == ((guest + n - 1) >> kPageShift)) {
+            const uint64_t page = guest >> kPageShift;
+            if (submitted_page_reuse(page, page_gen(page), cap_view_gen.load(std::memory_order_acquire), captured_page.page,
+                                     captured_page.pgen, captured_page.view)) {
+                std::memcpy(dst, captured_page.bytes + (guest & 4095), (size_t)n);
+                return true;
+            }
+        }
+    }
     if (!host->gpu_read(gpu, dst, n)) return false;
     if (!n || !capture_on() || !captures_seen.load(std::memory_order_relaxed)) return true;
     const uint64_t guest = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
@@ -1205,6 +1223,13 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
             sp.page = page0;
             sp.pgen = page_gen(page0);
             sp.view = view;   // (the generation this read started from: a newer capture makes it stale, not trusted)
+        } else if (page0 == page1) {   // (in a capture: the whole page copied once for the next words of it)
+            const CapEntry e = cap_entry(page0);
+            auto b = e.gen && e.gen == page_gen(page0) ? cap_bufs.find(e.gen) : cap_bufs.end();
+            if (b != cap_bufs.end() && b->second.map) {
+                std::memcpy(captured_page.bytes, (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096, 4096);
+                captured_page.page = page0, captured_page.pgen = e.gen, captured_page.view = view;
+            }
         }
     }
     pages_from += from;
