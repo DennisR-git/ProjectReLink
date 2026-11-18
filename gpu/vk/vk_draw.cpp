@@ -1874,6 +1874,9 @@ uint32_t aniso_override() {
 }
 /// compare: the shader reads depth with a reference (a sampler without one cannot compare)
 VkSampler sampler_make(int id, bool compare);
+// (relink) set by sampler_make when its sampler could not be made and a stand-in is returned: not kept anywhere, asked for again
+// at the next use (RX_VK_SAMPLER_RETRY=0: a failure is kept as it was)
+thread_local bool sampler_stand_in = false;
 // (each texture of each draw found its sampler through reg_mu, a copy of the registration, a hash of it and a map lookup:
 // ~48000 times a frame at 3000 draws. Now a thread's table by id and compare, good while no sampler registration's contents
 // changed (sampler_registrations_generation). RX_VK_SAMPLER_CACHE=0: off)
@@ -1887,10 +1890,11 @@ VkSampler sampler_for(int id, bool compare) {
     Entry& e = table[compare ? 1 : 0][id];
     if (e.gen == gen && e.bias == bias) return e.s;
     const VkSampler made = sampler_make(id, compare);
-    e = {gen, bias, made};
+    if (!sampler_stand_in) e = {gen, bias, made};
     return made;
 }
 VkSampler sampler_make(int id, bool compare) {
+    sampler_stand_in = false;
     nvn_samp_par p{};
     if (!sampler_of(id, &p)) p.minf = NVN_MIN_FILTER_LINEAR, p.magf = NVN_MAG_FILTER_LINEAR, p.lod_max = 1000.0f;
     // (relink) DLSS / FSR drawing: the mipmapped textures' bias lowered by upscaler_lod_bias (vk_dlss.cpp), so the upscaled
@@ -1976,7 +1980,30 @@ VkSampler sampler_make(int id, bool compare) {
         ci.pNext = &rm;
     }
     VkSampler sm = VK_NULL_HANDLE;
-    vkCreateSampler(dev.device, &ci, nullptr, &sm);
+    const VkResult made = vkCreateSampler(dev.device, &ci, nullptr, &sm);
+    static const bool retry = !(getenv("RX_VK_SAMPLER_RETRY") && atoi(getenv("RX_VK_SAMPLER_RETRY")) == 0);
+    if (retry && (made != VK_SUCCESS || !sm)) {
+        // (relink) A failed creation (the driver's limit on samplers, memory) kept as a null sampler dropped every draw with this
+        // state for the rest of the run. Not kept: tried again at the next use, and a plain sampler of a kind a draw can use (nearest
+        // or linear, clamped, comparing or not) stands in meanwhile
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 8)
+            logf("vk: a sampler was not made (%d): a plain one stands in, and it is tried again at its next use", (int)made);
+        static VkSampler plain[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+        VkSampler& pl = plain[compare ? 1 : 0];
+        if (!pl) {
+            VkSamplerCreateInfo pi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            pi.magFilter = pi.minFilter = VK_FILTER_LINEAR;
+            pi.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            pi.addressModeU = pi.addressModeV = pi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            pi.compareEnable = compare ? VK_TRUE : VK_FALSE;
+            pi.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+            pi.maxLod = VK_LOD_CLAMP_NONE;
+            if (vkCreateSampler(dev.device, &pi, nullptr, &pl) != VK_SUCCESS) pl = VK_NULL_HANDLE;
+        }
+        sampler_stand_in = true;
+        return pl;
+    }
     samplers.emplace(key, sm);
     return sm;
 }
