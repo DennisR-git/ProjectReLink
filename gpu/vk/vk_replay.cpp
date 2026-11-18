@@ -668,8 +668,24 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         signals[nsig].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         nsig++;
         std::lock_guard mk(rec_map_mu);
-        for (uint64_t v : rec_open_values) value_rec.emplace(v, seq);
-        if (r.value) value_rec.emplace(r.value, seq);
+        // (relink) A submission recorded in parts (maybe_split, a parallel replay's segments) puts its value on each part, and
+        // emplace kept the FIRST part's recording: the game's wait on the fence came back after the first ~120 draws, and it
+        // wrote the next frame's uniforms and vertices over memory the later parts still read (with no VRAM mirror, an
+        // integrated GPU reading guest memory in place: whole-screen flashes, issue 64). With this on, a value maps to its latest
+        // part. It costs some fps (the wait is longer), so by default it is on for integrated GPUs only;
+        // RX_VK_FENCE_LAST_PART=1 forces it on, 0 off
+        static const bool last_part = [] {
+            const char* e = getenv("RX_VK_FENCE_LAST_PART");
+            if (e && *e) return atoi(e) != 0;
+            return dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        }();
+        const auto finished_in = [&](uint64_t v) {
+            const auto it = value_rec.find(v);
+            if (it == value_rec.end()) value_rec.emplace(v, seq);
+            else if (last_part && it->second < seq) it->second = seq;
+        };
+        for (uint64_t v : rec_open_values) finished_in(v);
+        if (r.value) finished_in(r.value);
         rec_open_values.clear();
         while (value_rec.size() > 8192) value_rec.erase(value_rec.begin());
     }
@@ -933,8 +949,16 @@ struct UbWord {
     bool on = false;
 };
 thread_local UbWord ub_words[128];
+// (relink) The slot of a cached word: uniform buffers often hold the same handle 512 bytes or a page apart, and the low seven
+// word bits alone sent those reads to one slot where they evicted each other; the upper bits are mixed in. The hit test still
+// compares the whole address. RX_VK_UB_WORD_HASH=0: the low bits alone, as before
+uint32_t ub_word_slot(uint64_t addr) {
+    static const bool linear = getenv("RX_VK_UB_WORD_HASH") && atoi(getenv("RX_VK_UB_WORD_HASH")) == 0;
+    const uint64_t word = addr >> 2;
+    return (uint32_t)((linear ? word : word + (word >> 7) + (word >> 14)) & 127);
+}
 bool ub_word_hit(uint64_t addr, size_t lim, uint32_t* out) {
-    UbWord& w = ub_words[(addr >> 2) & 127];
+    UbWord& w = ub_words[ub_word_slot(addr)];
     if (!w.on || w.addr != addr || w.rec != rec_value_now || w.page != memory_page_stamp(addr)) return false;
     if (!ub_gap_holds(addr, 4, 0, lim)) return false;
     *out = w.v;
@@ -1020,7 +1044,7 @@ bool ub_read(uint64_t addr, void* dst, uint64_t n) {
     // in the gap do not walk the list. A word kept from that gap is the capture's own bytes)
     if (ub_gap_holds(addr, n, 0, lim) || ub_try_gap(0, lim, addr, n)) {
         if (n == 4 && page == memory_page_stamp(addr)) {
-            UbWord& w = ub_words[(addr >> 2) & 127];
+            UbWord& w = ub_words[ub_word_slot(addr)];
             uint32_t v = 0;
             std::memcpy(&v, dst, 4);
             w = {};

@@ -7349,10 +7349,24 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             vbufs[b] = r.buffer, voffs[b] = r.offset, vsizes[b] = s.vbuf[b].size ? s.vbuf[b].size : VK_WHOLE_SIZE;
             vstrides[b] = s.vstream[b].stride;
         }
-        if (!last_vb_valid || std::memcmp(vbufs, last_vb.b, sizeof vbufs) || std::memcmp(voffs, last_vb.o, sizeof voffs) ||
-            std::memcmp(vsizes, last_vb.z, sizeof vsizes) || std::memcmp(vstrides, last_vb.s, sizeof vstrides)) {
+        // (relink) only the streams that differ from what this command buffer has are bound: the driver takes every binding it
+        // is handed, and all 16 went in whenever one changed, the unused ones with the zero buffer again. Every other graphics
+        // bind on a replay command buffer (masked clears, a new recording) clears last_vb_valid, so the 16 remembered are what
+        // the command buffer has; with nothing remembered all 16 are bound. RX_VK_VB_RANGE=0: all 16 at each change, as before
+        static const bool vb_all = getenv("RX_VK_VB_RANGE") && atoi(getenv("RX_VK_VB_RANGE")) == 0;
+        uint32_t vb_first = 0, vb_count = 16;
+        if (last_vb_valid && !vb_all) {
+            uint32_t lo = 16, hi = 0;
+            for (uint32_t i = 0; i < 16; i++)
+                if (vbufs[i] != last_vb.b[i] || voffs[i] != last_vb.o[i] || vsizes[i] != last_vb.z[i] || vstrides[i] != last_vb.s[i]) {
+                    if (lo == 16) lo = i;
+                    hi = i + 1;
+                }
+            vb_first = lo == 16 ? 0 : lo, vb_count = lo == 16 ? 0 : hi - lo;
+        }
+        if (vb_count) {
             FINE_N(FC_VBIND, 1);
-            vkCmdBindVertexBuffers2(cmd, 0, 16, vbufs, voffs, vsizes, vstrides);
+            vkCmdBindVertexBuffers2(cmd, vb_first, vb_count, vbufs + vb_first, voffs + vb_first, vsizes + vb_first, vstrides + vb_first);
             std::memcpy(last_vb.b, vbufs, sizeof vbufs), std::memcpy(last_vb.o, voffs, sizeof voffs);
             std::memcpy(last_vb.z, vsizes, sizeof vsizes), std::memcpy(last_vb.s, vstrides, sizeof vstrides);
             last_vb_valid = true;

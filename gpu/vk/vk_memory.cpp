@@ -660,8 +660,20 @@ void stamp_page(uint64_t p, uint32_t g) {
 
 namespace { void cap_view_bump(); }   // (defined with cap_view_gen below, in this file's anonymous namespace)
 const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged();
+// (relink) memory_collect_written takes every page's write mark, then marks the pages in the captured ranges again for the next
+// capture. A submit's capture on the game's thread (capture_make's scan) that came in between found those pages unmarked, left them
+// out, and the work it was taken for read an older copy of them (the ground mist gone for a frame). The collection holds
+// collect_mu over that window and the capture's scan takes it too. Lock order: collect_mu, then cap_ranges_mu (inside
+// capture_ranges_merged) and the host's own locks; capture_make takes collect_mu with none of those held. RX_VK_COLLECT_LOCK=0: no lock.
+std::mutex collect_mu;
+bool collect_lock_on() {
+    static const bool on = [] { const char* e = getenv("RX_VK_COLLECT_LOCK"); return !(e && e[0] == '0'); }();
+    return on;
+}
 void memory_collect_written() {
     uint32_t* pages = nullptr;
+    std::unique_lock<std::mutex> window(collect_mu, std::defer_lock);
+    if (collect_lock_on()) window.lock();
     const int64_t n = host->collect_written(&pages);
     if (n > 0) {
         const uint32_t g = ++gen_now;
@@ -681,6 +693,9 @@ void memory_collect_written() {
             }
             stamp_page(pages[i], g);
         }
+    }
+    if (window.owns_lock()) window.unlock();   // (the marks are back: a capture may scan)
+    if (n > 0) {
         pages_collected += (uint64_t)n;
         cap_view_bump();
     }
@@ -1677,8 +1692,13 @@ std::unique_ptr<Capture> capture_make() {
     captures_seen.store(true, std::memory_order_relaxed);
     const auto t_lock = std::chrono::steady_clock::now();
     uint32_t* pages = nullptr;
-    const int64_t n = mirrored.empty() || !host->collect_written_in ? 0
-                    : host->collect_written_in(reinterpret_cast<const uint64_t(*)[2]>(mirrored.data()), (int)mirrored.size(), &pages);
+    int64_t n = 0;
+    if (!mirrored.empty() && host->collect_written_in) {
+        // (not while the replay's collection is marking some of these pages again: collect_mu, memory_collect_written)
+        std::unique_lock<std::mutex> window(collect_mu, std::defer_lock);
+        if (collect_lock_on()) window.lock();
+        n = host->collect_written_in(reinterpret_cast<const uint64_t(*)[2]>(mirrored.data()), (int)mirrored.size(), &pages);
+    }
     const auto t_scan = std::chrono::steady_clock::now();
     {   // (relink, RX_VK_CAPTURE_STATS=1: where the captures' pages lie, by 16 MB of guest memory, every 600 captures: which
         // pools make a capture's megabytes, to choose what a cheaper capture may leave out)
