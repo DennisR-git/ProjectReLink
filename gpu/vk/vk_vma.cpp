@@ -402,6 +402,18 @@ bool vram_usage(uint64_t* used, uint64_t* budget, uint64_t* block_free) {
             // (the free space in VMA's blocks: the driver counts it as the process's, new allocations take it first)
             f += b[h].statistics.blockBytes - std::min(b[h].statistics.blockBytes, b[h].statistics.allocationBytes);
         }
+    // (relink) AMD's Windows driver reports a process over its allowance as allowed exactly what it uses, so the squeeze rules saw
+    // room and gave nothing back while Windows paged video memory out (1 to 15 s freezes on 8 GB cards). A budget within 16 MB
+    // above the count is taken as past it: a tenth under the count, until the driver reports more room again. One under the
+    // count already, or unknown, is left as it is. RX_VK_ALLOWED_AT_COUNT=0: as the driver says
+    static const bool at_count = !getenv("RX_VK_ALLOWED_AT_COUNT") || atoi(getenv("RX_VK_ALLOWED_AT_COUNT")) != 0;
+    if (at_count && t && u && t >= u && t - u <= (16ull << 20)) {
+        static std::atomic<int> told{0};
+        if (told++ < 8)
+            logf("vk: the driver's allowance is the count itself (%llu MB used of %llu): taken as past it, %llu MB (RX_VK_ALLOWED_AT_COUNT=0: as the driver says)",
+                 (unsigned long long)(u >> 20), (unsigned long long)(t >> 20), (unsigned long long)((u - u / 10) >> 20));
+        t = u - u / 10;
+    }
     *used = u, *budget = t;
     if (block_free) *block_free = f;
     return t != 0;
