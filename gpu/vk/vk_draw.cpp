@@ -8204,7 +8204,20 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
     if (notes.empty() || getenv("RX_VK_NO_PREDICT")) return;
     size_t programs = 0;
-    const std::vector<std::unique_ptr<PipeNote>> predicted = predict_pipelines(notes, &programs);
+    size_t too_big = 0;
+    const std::vector<std::unique_ptr<PipeNote>> predicted = predict_pipelines(notes, &programs, &too_big);
+    // (relink) The driver's compiles take their memory from the system's commit, and a refused allocation hurts the game and every
+    // other program: stop predicting (the rest is built in play) when less than RX_VK_PREDICT_RESERVE_MB (3072; 0: no check) is left
+    static const unsigned long long reserve_mb =
+        getenv("RX_VK_PREDICT_RESERVE_MB") ? strtoull(getenv("RX_VK_PREDICT_RESERVE_MB"), nullptr, 10) : 3072;
+    std::atomic<bool> low_commit{false};
+    const auto commit_short = [&] {
+        if (!reserve_mb) return false;
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof ms;
+        if (!GlobalMemoryStatusEx(&ms)) return false;
+        return (unsigned long long)(ms.ullAvailPageFile >> 20) < reserve_mb;
+    };
     std::unordered_map<uint64_t, std::vector<const PipeNote*>> by_program;
     for (const auto& n : predicted) by_program[n->prog].push_back(n.get());
     std::vector<uint64_t> keys;
@@ -8225,6 +8238,10 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
                 out_of_time = true;
                 return;
             }
+            if (low_commit.load() || commit_short()) {
+                low_commit = true;
+                return;
+            }
             const size_t i = next++;
             if (i >= keys.size()) return;
             const auto& list = by_program[keys[i]];
@@ -8241,14 +8258,16 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
     for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
-    while (next.load() < keys.size() + threads.size() && !prepare_stopped() && !out_of_time.load()) {
+    while (next.load() < keys.size() + threads.size() && !prepare_stopped() && !out_of_time.load() && !low_commit.load()) {
         if (progress) progress(done.load(), predicted.size());
         Sleep(100);
     }
     for (std::thread& t : threads) t.join();
-    logf("vk: predicted %zu pipelines from %zu notes for %zu program variants no note names: %zu made in %.1f s%s", predicted.size(),
+    logf("vk: predicted %zu pipelines from %zu notes for %zu program variants no note names: %zu made in %.1f s%s%s; %zu giant "
+         "programs left to play (RX_VK_PREDICT_MAX_KWORDS)", predicted.size(),
          notes.size(), programs, made.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-         out_of_time.load() ? " (the time budget, RX_VK_PREDICT_S, ran out: the rest are built in play)" : "");
+         out_of_time.load() ? " (the time budget, RX_VK_PREDICT_S, ran out: the rest are built in play)" : "",
+         low_commit.load() ? " (little commit left, RX_VK_PREDICT_RESERVE_MB: the rest are built in play)" : "", too_big);
 }
 
 // (relink) Compute pipelines made ahead. A dispatch's compute pipeline was made where the dispatch was, the first time: 0.5-6 s each
