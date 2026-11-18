@@ -1369,7 +1369,9 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         // trees, the next cells' trees drawn in its place: the wall of trees in the sky. The culling's compute programs, with
         // hundreds of global loads, keep the helper (NVIDIA took 41 s on one inlined, above)
         static const bool tm_inline{!std::getenv("EDEN_NX2_GM_INLINE") || std::getenv("EDEN_NX2_GM_INLINE")[0] != '0'};
-        const bool inline_here{tm_inline && (stage == Stage::Task || stage == Stage::Mesh)};
+        // (relink) and the 128-bit helper where the stage asks (RuntimeInfo::inline_global_128_loads: the Deku Tree's web vertex program)
+        const bool inline_here{tm_inline && (stage == Stage::Task || stage == Stage::Mesh ||
+                                             (shift == 4 && runtime_info.inline_global_128_loads))};
         const Id func_id{OpFunction(type, inline_here ? spv::FunctionControlMask::Inline : gm_ctl, function_type)};
         const Id addr{OpFunctionParameter(U64)};
         define_body(ssbo_member, addr, element_pointer, shift,

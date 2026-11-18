@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <cstdlib>
+#include <algorithm>
 
 #include "vk_loader.h"
 #include "vk_api.h"
@@ -62,6 +63,10 @@ struct Device {
          native_mma = false;    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
     bool eds3_polygon = false, eds3_clamp = false, eds3_blend = false, eds3_a2c = false;
     bool mesh_fallback = false;   // (relink) no VK_EXT_mesh_shader: task and mesh programs as compute shaders (vk_shader.cpp)
+    // (relink, RX_VK_MESH_FALLBACK_TASK_ONLY=1) the GPU has mesh shaders, but the programs with a task stage run as compute: mesh-only
+    // programs stay native
+    bool task_mesh_fallback = false;
+    bool uses_mesh_fallback(bool has_task) const { return mesh_fallback || (task_mesh_fallback && has_task); }
     VkPhysicalDeviceVulkan12Features vk12{};
     VkPhysicalDeviceVulkan13Features vk13{};
     VkShaderStageFlags sg32_stages = 0;   // (stages that run at 32 lanes when asked: the size the translated programs assume)
@@ -88,6 +93,18 @@ struct Device {
     uint32_t present_family = 0;   // (present_queue's family, the swapchain's images shared with it)
 };
 extern Device dev;
+
+// (relink) storage buffers are bound, and translated, at 16 bytes at least: the translator reads 8- and 16-byte accesses as vectors
+// (offset >> 3, >> 4), exact only when the binding starts on 16. AMD and Intel report 4, and an aligned read took the vector before.
+// RX_VK_SSBO_ALIGN16=0: the device's own minimum (A/B; the value is in disk_stamp)
+inline uint64_t storage_binding_align() {
+    static const uint64_t a = [] {
+        const char* e = getenv("RX_VK_SSBO_ALIGN16");
+        const uint64_t floor_ = (e && atoi(e) == 0) ? 4 : 16;
+        return std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, floor_);
+    }();
+    return a;
+}
 
 /// A range of guest memory as the GPU sees it: a buffer (an imported pool), the offset in it, and its device address
 struct BufferRef {

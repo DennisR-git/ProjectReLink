@@ -1731,6 +1731,23 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
 
 /// part: -1 the whole pipeline, or the graphics pipeline library it stands for: 0 vertex input, 1 pre-rasterization, 2 fragment
 /// shader, 3 fragment output
+// (relink) The driver's identity, asked once: AMD's own Windows/amdvlk drivers against Mesa's RADV, which share a vendor id and not a
+// compiler (the AMD-only build rules below were found on the former; RADV reset the GPU on one of them)
+static VkDriverId driver_id_once() {
+    static const VkDriverId id = [] {
+        VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 pr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        pr.pNext = &drv;
+        vkGetPhysicalDeviceProperties2(dev.physical, &pr);
+        return drv.driverID;
+    }();
+    return id;
+}
+static bool amd_own_driver() {
+    const VkDriverId id = driver_id_once();
+    return id == VK_DRIVER_ID_AMD_PROPRIETARY || id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+}
+
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part) {
     const Shader::Info& vs = *vertex_info(p);
     const auto t0 = std::chrono::steady_clock::now();
@@ -1906,14 +1923,24 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         // (-13 here) or takes minutes on some Ocarina shaders it builds in seconds unoptimized (Lichii #200, #210).
         static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
         if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        // (relink) the cloth's colour program (key 5fa56485a6b07619) on AMD's proprietary Windows driver: the optimized pipeline was still pending
+        // after its depth pass had drawn, and parts of the cloth came out white or black. RX_VK_CLOTH_OPT=1: optimized
+        static const bool cloth_opt = getenv("RX_VK_CLOTH_OPT") && atoi(getenv("RX_VK_CLOTH_OPT")) != 0;
+        if (p.key == 0x5fa56485a6b07619ull && !cloth_opt && driver_id_once() == VK_DRIVER_ID_AMD_PROPRIETARY) {
+            ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+            static std::atomic<int> told_cloth{0};
+            if (told_cloth++ < 1) logf("vk: the cloth colour program is built without the driver's optimizer (AMD)");
+        }
         // (from PR 430, YunaraDebugs: on AMD the task and mesh programs (OoT's foliage culling, following pointers through its
         // tables) hung the GPU when the driver's optimizer built them: a device lost one to four minutes into Kokiri, each time with
         // another of them first (RX 6600, issues 461 and 484); never in runs where they were built without it. They are built
         // without it on AMD. RX_VK_MESH_OPT=1: with it, as the others)
+        // (relink) AMD's own drivers only: on Mesa's RADV (Linux) building them without the optimizer reset the GPU, so they are built
+        // with it there, as on other drivers. RX_VK_MESH_OPT_ALL_AMD=1: every AMD driver, as before
         static const bool amd = [] {
             VkPhysicalDeviceProperties pr{};
             vkGetPhysicalDeviceProperties(dev.physical, &pr);
-            return pr.vendorID == 0x1002;
+            return pr.vendorID == 0x1002 && (amd_own_driver() || getenv("RX_VK_MESH_OPT_ALL_AMD"));
         }();
         static const bool mesh_opt = getenv("RX_VK_MESH_OPT") != nullptr;
         if (amd && !mesh_opt) {
@@ -2798,7 +2825,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
         w.descriptorType = type;
         return w;
     };
-    const uint64_t salign = std::max<uint64_t>(dev.props.limits.minStorageBufferOffsetAlignment, 4);
+    const uint64_t salign = storage_binding_align();   // (relink: 16 at least, as translated)
     for (const Stage& st : p.stages) {
         const Shader::Info& info = st.info;
         const int ns = st.nvn_stage;
@@ -5848,6 +5875,7 @@ struct FallbackPool {
     FallbackBuffers cur;
     uint64_t records = 0, payload = 0;   // (cur's sizes)
     uint64_t failed = 0;                 // (records of this size or more could not be made: not tried again at each draw)
+    uint64_t payload_failed = 0;         // (the same for a payload of this size or more, when the records were shared)
     std::vector<FallbackBuffers> old;
     std::atomic<uint64_t> gen{0};        // (cur's generation: a thread's copy is good while it is the same)
 };
@@ -5897,17 +5925,27 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     if (!pool.cur.ok || records > pool.records || payload > pool.payload) {
         const uint64_t want_r = std::max(records, pool.records), want_p = std::max(payload, pool.payload);
         if (pool.failed && want_r >= pool.failed) return false;
+        if (pool.payload_failed && want_p >= pool.payload_failed) return false;
         FallbackBuffers made;
         void* mapped = nullptr;
         const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        bool ok = create_buffer(want_r, usage, false, made.records, made.records_mem, &mapped);
-        if (ok) made.records_address = fallback_buffer_address(made.records);
+        // (relink) Only the payload outgrown: the records' arena and the batch arguments are big enough and are the same for every
+        // program, so the new set takes the current ones and makes just the bigger payload. Each growth made another arena (up to
+        // 64 MB) that nothing used again, 80-195 MB over a session. RX_VK_FALLBACK_REGROW=1: all made again, as before
+        static const bool regrow = getenv("RX_VK_FALLBACK_REGROW") && atoi(getenv("RX_VK_FALLBACK_REGROW")) != 0;
+        const bool share = !regrow && pool.cur.ok && records <= pool.records && pool.cur.records_address && pool.cur.args_address;
+        if (share) {
+            made.records = pool.cur.records, made.records_mem = pool.cur.records_mem, made.records_address = pool.cur.records_address;
+            made.args = pool.cur.args, made.args_mem = pool.cur.args_mem, made.args_address = pool.cur.args_address;
+        }
+        bool ok = share || create_buffer(want_r, usage, false, made.records, made.records_mem, &mapped);
+        if (ok && !share) made.records_address = fallback_buffer_address(made.records);
         if (ok && want_p) {
             ok = create_buffer(want_p, usage, false, made.payload, made.payload_mem, &mapped);
             if (ok) made.payload_address = fallback_buffer_address(made.payload);
         }
-        if (ok) {   // (an indirect draw's batches' arguments, vk_mesh_split.h)
+        if (ok && !share) {   // (an indirect draw's batches' arguments, vk_mesh_split.h)
             const uint64_t args = ((uint64_t)kMeshSplitHeadWords + (uint64_t)kFallbackBatches * kMeshSplitBatchWords) * 4;
             ok = create_buffer(args, usage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, made.args, made.args_mem, &mapped);
             if (ok) made.args_address = fallback_buffer_address(made.args);
@@ -5915,7 +5953,8 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
         if (!ok || !made.records_address || !made.args_address) {
             static std::atomic<int> told{0};
             if (told++ < 4) logf("vk: fallback: buffers of %llu MB of records could not be made", (unsigned long long)(want_r >> 20));
-            pool.failed = pool.failed ? std::min(pool.failed, want_r) : want_r;
+            if (share) pool.payload_failed = pool.payload_failed ? std::min(pool.payload_failed, want_p) : want_p;
+            else pool.failed = pool.failed ? std::min(pool.failed, want_r) : want_r;
             return false;   // (what was made of them is let go with the device)
         }
         made.ok = true;
@@ -5933,15 +5972,38 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
 }
 
 bool fallback_compute_pipelines(Program& p) {
+    // (relink) The lock covers the lookup and the publishing only, not the compiles: one 12 s AMD compile held every recording
+    // thread. A program being built by another thread is waited for (never two builds of one program); other programs go on.
+    // RX_VK_FALLBACK_COMPILE_LOCK=1: one lock around the whole compile, as before
     static std::mutex mu;
-    std::lock_guard lk(mu);
-    if (!p.fallback_compute.empty()) return true;
+    static std::condition_variable built_cv;
+    static std::unordered_set<const Program*> building;
+    static const bool whole = getenv("RX_VK_FALLBACK_COMPILE_LOCK") && atoi(getenv("RX_VK_FALLBACK_COMPILE_LOCK")) != 0;
+    std::unique_lock lk(mu);
     // (relink, issue 60) A program whose compile failed was compiled again at each of its draws, on the recording thread, the
     // driver's state after a fault caught in it unknown (-77): the GTX 1070's log stopped for good right after the first
     // failure. Its draws are now left out without another try. RX_VK_FALLBACK_RETRY=1: tried again at each draw, as before
     static std::unordered_set<const Program*> failed;
     static const bool retry = getenv("RX_VK_FALLBACK_RETRY") && atoi(getenv("RX_VK_FALLBACK_RETRY")) != 0;
-    if (!retry && failed.count(&p)) return false;
+    for (;;) {
+        if (!p.fallback_compute.empty()) return true;
+        if (!retry && failed.count(&p)) return false;
+        if (!building.count(&p)) break;
+        built_cv.wait(lk);
+    }
+    building.insert(&p);
+    if (!whole) lk.unlock();
+    struct Done {   // (publishes or not, the program is no longer being built: whatever way out)
+        std::unique_lock<std::mutex>& lk;
+        const Program* p;
+        bool whole;
+        ~Done() {
+            if (!lk.owns_lock()) lk.lock();
+            building.erase(p);
+            lk.unlock();
+            built_cv.notify_all();
+        }
+    } done{lk, &p, whole};
     std::vector<VkPipeline> made(p.stages.size(), VK_NULL_HANDLE);
     bool any = false;
     for (size_t i = 0; i < p.stages.size(); i++) {
@@ -5975,7 +6037,11 @@ bool fallback_compute_pipelines(Program& p) {
                      (unsigned long long)p.key, (int)r, ms, r == (VkResult)-77 ? ", a fault in the driver" : "");
             for (VkPipeline& m : made)
                 if (m) vkDestroyPipeline(dev.device, m, nullptr), m = VK_NULL_HANDLE;
-            failed.insert(&p);
+            {   // (failed is read under mu)
+                std::unique_lock<std::mutex> fl(mu, std::defer_lock);
+                if (!lk.owns_lock()) fl.lock();
+                failed.insert(&p);
+            }
             return false;
         }
         static std::atomic<int> told_slow{0};
@@ -5984,6 +6050,7 @@ bool fallback_compute_pipelines(Program& p) {
         pcache_built_since_save++;
     }
     if (!any) return false;
+    if (!lk.owns_lock()) lk.lock();   // (publishing; Done lets go of it and wakes the waiters)
     p.fallback_compute = std::move(made);
     return true;
 }

@@ -531,7 +531,7 @@ Shader::Profile make_profile() {
     p.lower_left_origin_mode = false;
     p.need_declared_frag_colors = false;
     p.max_subgroup_size = 32;
-    p.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
+    p.min_ssbo_alignment = storage_binding_align();
     p.support_maximal_reconvergence = dev.max_reconvergence;
     p.support_float32_atomic_add = dev.float_atomic_add && !getenv("EDEN_NX2_NO_FADD");   // (relink: native float adds)
     // (relink) gathers nudged by 1/512 of a texel on AMD's and Intel's drivers, so the four texels a gather picks match Maxwell's at
@@ -562,6 +562,12 @@ bool lookup_tables_on() {
     return on;
 }
 
+/// (relink) the NVIDIA-only inlining of the Deku Tree web program's 128-bit loads (translate_into; disk_stamp)
+bool web_inline_on() {
+    static const bool on = dev.props.vendorID == 0x10DE && !getenv("RX_VK_NO_WEB_INLINE");
+    return on;
+}
+
 Shader::HostTranslateInfo host_info() {
     Shader::HostTranslateInfo h{};
     h.support_float64 = true;
@@ -572,7 +578,7 @@ Shader::HostTranslateInfo host_info() {
     h.needs_demote_reorder = false;
     h.support_snorm_render_buffer = true;
     h.support_viewport_index_layer = true;
-    h.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
+    h.min_ssbo_alignment = storage_binding_align();
     h.support_geometry_shader_passthrough = false;
     h.support_conditional_barrier = true;   // (barriers in loops kept: see the WebGPU renderer's 4f5e3e6)
     h.support_lookup_tables = lookup_tables_on();
@@ -1070,7 +1076,7 @@ uint64_t disk_stamp() {
     const uint32_t depth = host->depth_minus_w() != 0;   // (d3zessete's PR 54: programs made in either depth mode are kept apart)
     add(&depth, sizeof depth);
     // (and a GPU's mesh shaders: a file of native task and mesh programs is no use to the compute fallback, nor its to one)
-    const uint32_t mesh = (dev.mesh_shader ? 1u : 0u) | (dev.mesh_fallback ? 2u : 0u);
+    const uint32_t mesh = (dev.mesh_shader ? 1u : 0u) | (dev.mesh_fallback ? 2u : 0u) | (dev.task_mesh_fallback ? 4u : 0u);
     add(&mesh, sizeof mesh);
     // (the records keep Shader::Info as it lies in memory: a cache written by another C++ library (the MSVC build's, then the
     // llvm-mingw one's libc++) has other layouts, and reading it crashed at start. The library and the sizes, so it starts again)
@@ -1092,6 +1098,10 @@ uint64_t disk_stamp() {
                                (dev.big_warp ? 8u : 0u) | (fetch_bounds ? 16u : 0u) | (nan_bits ? 32u : 0u) |
                                (dev.gather_offset ? 64u : 0u) | (fetch_bounds_buffers ? 128u : 0u);   // (and the vendor fixes: coopmat_init)
         add(&flags, sizeof flags);
+        const uint64_t ssbo_align = storage_binding_align();   // (relink: the translator reads storage vectors at this alignment)
+        add(&ssbo_align, sizeof ssbo_align);
+        const uint32_t web_inline = web_inline_on() ? 1u : 0u;   // (relink: NVIDIA's Deku Tree web program)
+        add(&web_inline, sizeof web_inline);
         add(mma_order_a.data(), sizeof(uint32_t) * mma_order_a.size());
         add(mma_order_b.data(), sizeof(uint32_t) * mma_order_b.size());
         add(mma_order_c.data(), sizeof(uint32_t) * mma_order_c.size());
@@ -1505,7 +1515,7 @@ FILE* own_cache_handle() {
 }
 /// (shader_mu held) When key's records are still on disk: their read handed to a worker, and variants given the stand-in
 /// (mesh: a mesh program's, so that the mesh picks take it)
-bool program_cache_load_async(uint64_t key, std::vector<std::unique_ptr<Program>>& variants, bool mesh) {
+bool program_cache_load_async(uint64_t key, std::vector<std::unique_ptr<Program>>& variants, bool mesh, bool fallback = false) {
     if (!load_async_here || !async_loads_on()) return false;
     disk_init();
     if (!disk_on) return false;
@@ -1519,7 +1529,7 @@ bool program_cache_load_async(uint64_t key, std::vector<std::unique_ptr<Program>
     }
     auto stand_in = std::make_unique<Program>();
     stand_in->key = key;
-    if (mesh) stand_in->mesh = dev.mesh_shader, stand_in->fallback = !dev.mesh_shader;
+    if (mesh) stand_in->mesh = !fallback, stand_in->fallback = fallback;   // (fallback: this program's, a task program on a task-only GPU too)
     Program* raw = stand_in.get();
     variants.push_back(std::move(stand_in));
     {
@@ -1657,6 +1667,11 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
             for (int i = 0; i < 16; i++) vrt.generic_input_types[i] = attribute_type_of(s.vattr[i]);
             vrt.previous_stage_stores.mask.set();
             vrt.convert_depth_mode = host->depth_minus_w() != 0;
+            // (relink) the Deku Tree's floor web (vertex program b449bcdb69b36a8a), NVIDIA: with the 128-bit load helper called, the
+            // compiled shader used one load's result where the SPIR-V names another's (the grid's origin for its size: a cell index out of
+            // range, a dark web). Inlined for that one program. RX_VK_NO_WEB_INLINE=1: off (a translation setting: in disk_stamp)
+            constexpr uint64_t kDekuWebVertexCode = 0xb449bcdb69b36a8aull;
+            vrt.inline_global_128_loads = web_inline_on() && vsc->key == kDekuWebVertexCode;
             Stage v;
             v.nvn_stage = 0;
             const std::vector<uint32_t> vspirv = Shader::Backend::SPIRV::EmitSPIRV(profile(), vrt, vs->program, bindings);
@@ -1777,7 +1792,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         Shader::Backend::Bindings bindings{};
         std::vector<std::vector<uint32_t>> kept;   // (each stage's SPIR-V, for the program cache: mesh programs were never kept,
                                                    // so each was translated and its pipeline built in the middle of play, every run)
-        const bool fallback{dev.mesh_fallback};   // (no mesh shaders: compute stages and a generated vertex stage)
+        const bool fallback{p.fallback};   // (no mesh shaders, or a task program on a GPU that runs those as compute: compute stages and a generated vertex stage; set by the caller)
         std::unique_ptr<Translation> task_t;
         const std::array<u32, 3> mesh_regs = mesh_registers_of(task, mesh);
         if (task) {
@@ -1953,12 +1968,13 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
     if (!mesh) return nullptr;
     const uint64_t key = mesh_key(task, *mesh, fsc, prim, color_types);
     auto& variants = programs[key];
-    if (!program_cache_load_async(key, variants, true)) program_cache_load(key, variants);
+    const bool fallback = dev.uses_mesh_fallback(task != nullptr);   // (this program's path: a task program too, on a task-only GPU)
+    if (!program_cache_load_async(key, variants, true, fallback)) program_cache_load(key, variants);
     const uint64_t codes[4] = {mesh->key, fsc ? fsc->key : 0, task ? task->key : 0, prim ? prim->key : 0};
     for (auto& p : variants)
         if (!p->codes[0]) std::memcpy(p->codes, codes, sizeof codes);
     for (auto& p : variants) {
-        if (p->mesh != dev.mesh_shader || p->fallback != dev.mesh_fallback) continue;   // (another GPU's: native or fallback)
+        if (p->fallback != fallback || p->mesh == fallback) continue;   // (another GPU's: native or fallback)
         if (!p->ready.load(std::memory_order_acquire)) return p.get();
         if (p->failed) return nullptr;
         if (still_valid(s, *p)) return p.get();
@@ -1966,8 +1982,8 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
     miss_note(key, "mesh", mesh->key, fsc ? fsc->key : 0, s, color_types, variants.size());
     auto p = std::make_unique<Program>();
     p->key = key;
-    p->mesh = dev.mesh_shader;   // (not a native mesh program: a fallback one is an ordinary graphics pipeline)
-    p->fallback = !dev.mesh_shader;   // (the GPU has no mesh shaders: its stages are compute and vertex)
+    p->mesh = !fallback;   // (not a native mesh program: a fallback one is an ordinary graphics pipeline)
+    p->fallback = fallback;   // (no mesh shaders, or a task program on a task-only GPU: its stages are compute and vertex)
     std::memcpy(p->codes, codes, sizeof codes);
     Program* raw = p.get();
     variants.push_back(std::move(p));
@@ -2526,7 +2542,8 @@ std::unique_ptr<Program> seed_translate(const SeedStage* const by_stage[8], cons
     p->key = key;
     p->compute = by_stage[5] != nullptr;
     p->mesh = by_stage[7] != nullptr;
-    if (p->mesh)
+    if (p->mesh && dev.task_mesh_fallback && by_stage[6]) p->fallback = true, p->mesh = false;   // (task-only GPUs: as play makes it)
+    if (by_stage[7])
         translate_mesh_into(*p, *blank, by_stage[6] ? &code[6] : nullptr, code[7], nullptr, by_stage[1] ? &code[1] : nullptr, color_types);
     else if (p->compute) {
         seed_cs_control = seed.blob.data() + by_stage[5]->control;
@@ -2712,9 +2729,9 @@ const Program* seed_variant_of(const uint64_t code[3], bool mesh, const uint32_t
     auto p = std::make_unique<Program>();
     p->key = mesh ? mesh_key(by_stage[6] ? &code_of[6] : nullptr, code_of[7], fs, nullptr, color_types)
                   : graphics_key(code_of[0], fs, attributes, color_types);
-    p->mesh = mesh && dev.mesh_shader;   // (as play makes it, mesh_program_locked: a fallback one is an ordinary graphics pipeline)
-    p->fallback = mesh && !dev.mesh_shader;
     if (mesh && !dev.mesh_shader && !dev.mesh_fallback) return nullptr;
+    p->fallback = mesh && dev.uses_mesh_fallback(by_stage[6] != nullptr);   // (as play makes it, mesh_program_locked: a fallback one is an ordinary graphics pipeline)
+    p->mesh = mesh && !p->fallback;
     p->codes[0] = code[0], p->codes[1] = code[1], p->codes[2] = code[2];
     questions_in = &questions, questions_at = 0, answers_in = &answers;
     struct Reset { ~Reset() { questions_in = nullptr, answers_in = nullptr; } } reset;
