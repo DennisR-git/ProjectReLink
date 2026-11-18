@@ -5848,6 +5848,7 @@ struct FallbackPool {
     FallbackBuffers cur;
     uint64_t records = 0, payload = 0;   // (cur's sizes)
     uint64_t failed = 0;                 // (records of this size or more could not be made: not tried again at each draw)
+    uint64_t payload_failed = 0;         // (the same for a payload of this size or more, when the records were shared)
     std::vector<FallbackBuffers> old;
     std::atomic<uint64_t> gen{0};        // (cur's generation: a thread's copy is good while it is the same)
 };
@@ -5897,17 +5898,27 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     if (!pool.cur.ok || records > pool.records || payload > pool.payload) {
         const uint64_t want_r = std::max(records, pool.records), want_p = std::max(payload, pool.payload);
         if (pool.failed && want_r >= pool.failed) return false;
+        if (pool.payload_failed && want_p >= pool.payload_failed) return false;
         FallbackBuffers made;
         void* mapped = nullptr;
         const VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-        bool ok = create_buffer(want_r, usage, false, made.records, made.records_mem, &mapped);
-        if (ok) made.records_address = fallback_buffer_address(made.records);
+        // (relink) Only the payload outgrown: the records' arena and the batch arguments are big enough and are the same for every
+        // program, so the new set takes the current ones and makes just the bigger payload. Each growth made another arena (up to
+        // 64 MB) that nothing used again, 80-195 MB over a session. RX_VK_FALLBACK_REGROW=1: all made again, as before
+        static const bool regrow = getenv("RX_VK_FALLBACK_REGROW") && atoi(getenv("RX_VK_FALLBACK_REGROW")) != 0;
+        const bool share = !regrow && pool.cur.ok && records <= pool.records && pool.cur.records_address && pool.cur.args_address;
+        if (share) {
+            made.records = pool.cur.records, made.records_mem = pool.cur.records_mem, made.records_address = pool.cur.records_address;
+            made.args = pool.cur.args, made.args_mem = pool.cur.args_mem, made.args_address = pool.cur.args_address;
+        }
+        bool ok = share || create_buffer(want_r, usage, false, made.records, made.records_mem, &mapped);
+        if (ok && !share) made.records_address = fallback_buffer_address(made.records);
         if (ok && want_p) {
             ok = create_buffer(want_p, usage, false, made.payload, made.payload_mem, &mapped);
             if (ok) made.payload_address = fallback_buffer_address(made.payload);
         }
-        if (ok) {   // (an indirect draw's batches' arguments, vk_mesh_split.h)
+        if (ok && !share) {   // (an indirect draw's batches' arguments, vk_mesh_split.h)
             const uint64_t args = ((uint64_t)kMeshSplitHeadWords + (uint64_t)kFallbackBatches * kMeshSplitBatchWords) * 4;
             ok = create_buffer(args, usage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, false, made.args, made.args_mem, &mapped);
             if (ok) made.args_address = fallback_buffer_address(made.args);
@@ -5915,7 +5926,8 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
         if (!ok || !made.records_address || !made.args_address) {
             static std::atomic<int> told{0};
             if (told++ < 4) logf("vk: fallback: buffers of %llu MB of records could not be made", (unsigned long long)(want_r >> 20));
-            pool.failed = pool.failed ? std::min(pool.failed, want_r) : want_r;
+            if (share) pool.payload_failed = pool.payload_failed ? std::min(pool.payload_failed, want_p) : want_p;
+            else pool.failed = pool.failed ? std::min(pool.failed, want_r) : want_r;
             return false;   // (what was made of them is let go with the device)
         }
         made.ok = true;
