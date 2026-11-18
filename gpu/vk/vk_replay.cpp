@@ -668,8 +668,24 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         signals[nsig].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         nsig++;
         std::lock_guard mk(rec_map_mu);
-        for (uint64_t v : rec_open_values) value_rec.emplace(v, seq);
-        if (r.value) value_rec.emplace(r.value, seq);
+        // (relink) A submission recorded in parts (maybe_split, a parallel replay's segments) puts its value on each part, and
+        // emplace kept the FIRST part's recording: the game's wait on the fence came back after the first ~120 draws, and it
+        // wrote the next frame's uniforms and vertices over memory the later parts still read (with no VRAM mirror, an
+        // integrated GPU reading guest memory in place: whole-screen flashes, issue 64). With this on, a value maps to its latest
+        // part. It costs some fps (the wait is longer), so by default it is on for integrated GPUs only;
+        // RX_VK_FENCE_LAST_PART=1 forces it on, 0 off
+        static const bool last_part = [] {
+            const char* e = getenv("RX_VK_FENCE_LAST_PART");
+            if (e && *e) return atoi(e) != 0;
+            return dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
+        }();
+        const auto finished_in = [&](uint64_t v) {
+            const auto it = value_rec.find(v);
+            if (it == value_rec.end()) value_rec.emplace(v, seq);
+            else if (last_part && it->second < seq) it->second = seq;
+        };
+        for (uint64_t v : rec_open_values) finished_in(v);
+        if (r.value) finished_in(r.value);
         rec_open_values.clear();
         while (value_rec.size() > 8192) value_rec.erase(value_rec.begin());
     }
