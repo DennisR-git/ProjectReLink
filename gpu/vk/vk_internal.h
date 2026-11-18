@@ -67,6 +67,7 @@ struct Device {
     VkShaderStageFlags sg32_stages = 0;   // (stages that run at 32 lanes when asked: the size the translated programs assume)
     bool big_warp = false;   // (graphics stages that may run wider than 32 lanes, not held to 32: AMD's. The translation then
                              // keeps each 32-lane group apart: Profile::warp_size_potentially_larger_than_guest)
+    bool gather_offset = false;   // (relink: gathers nudged by 1/512 of a texel, AMD's and Intel's drivers: coopmat_init, make_profile)
     uint32_t max_push_descriptors = 0;
     // no window (HOS_HEADLESS): presents go to an image of their own, which RX_VK_SHOTS can write out
     bool offscreen = false;

@@ -112,6 +112,9 @@ struct Code {
     std::vector<uint8_t> c1;
     uint32_t local[3]{};
     uint32_t shared_memory = 0;   // compute: bytes from the NVN2 control section (+0x64; klimovich008's PR 91)
+    // (relink) compute: local memory, bytes a thread, from the control section (+0x68; +0x50 is the same times 32). It was never read:
+    // a compute program that spills (LDL/STL) had no local array, and the back end aborted at its first local access
+    uint32_t local_memory = 0;
     uint32_t texture_bound = ~0u;   // the bank native TEX instructions name (~0: none; TEXS take the stage's own)
     bool isbe = false;              // an NVN2 task (stage 6) or mesh (stage 7) program: it writes the internal stage buffer
     // (task / mesh: control section +0x58 threads 15:0, payload bytes 31:16; +0x60 max primitives 15:0, max vertices
@@ -291,6 +294,7 @@ Code parse_code(const uint8_t* ctl, const std::vector<uint8_t>& area) {
     if (!graphics) {
         std::memcpy(c.local, ctl + 0x58, 12);
         std::memcpy(&c.shared_memory, ctl + 0x64, 4);
+        std::memcpy(&c.local_memory, ctl + 0x68, 4);
     }
     c.ok = true;
     return c;
@@ -384,6 +388,8 @@ public:
         if (st != Shader::Stage::Compute) {
             std::memcpy(&sph, reinterpret_cast<const uint8_t*>(nvn.code.data()), sizeof sph);
             local_memory = static_cast<uint32_t>(sph.LocalMemorySize()) + sph.common3.shader_local_memory_crs_size;
+        } else {
+            local_memory = nvn.local_memory;   // (relink: its control section's: a compute program has no header)
         }
         is_proprietary_driver = true;
     }
@@ -528,6 +534,10 @@ Shader::Profile make_profile() {
     p.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
     p.support_maximal_reconvergence = dev.max_reconvergence;
     p.support_float32_atomic_add = dev.float_atomic_add && !getenv("EDEN_NX2_NO_FADD");   // (relink: native float adds)
+    // (relink) gathers nudged by 1/512 of a texel on AMD's and Intel's drivers, so the four texels a gather picks match Maxwell's at
+    // texel edges (2D, rect and 2D array only: Eden's translator has it, never turned on; coopmat_init decides, RX_VK_GATHER_OFFSET=0/1
+    // forces it; the flag is in disk_stamp)
+    p.need_gather_subpixel_offset = dev.gather_offset;
     return p;
 }
 
@@ -1079,7 +1089,8 @@ uint64_t disk_stamp() {
         // integrated and dedicated GPUs), and RX_VK_NO_INVARIANT / RX_VK_NO_NAN_GUARD did nothing for programs already cached)
         using namespace Shader::Backend::SPIRV;
         const uint32_t flags = (position_invariant ? 1u : 0u) | (frag_nan_guard ? 2u : 0u) | (mma_software ? 4u : 0u) |
-                               (dev.big_warp ? 8u : 0u);
+                               (dev.big_warp ? 8u : 0u) | (fetch_bounds ? 16u : 0u) | (nan_bits ? 32u : 0u) |
+                               (dev.gather_offset ? 64u : 0u) | (fetch_bounds_buffers ? 128u : 0u);   // (and the vendor fixes: coopmat_init)
         add(&flags, sizeof flags);
         add(mma_order_a.data(), sizeof(uint32_t) * mma_order_a.size());
         add(mma_order_b.data(), sizeof(uint32_t) * mma_order_b.size());
@@ -1089,7 +1100,7 @@ uint64_t disk_stamp() {
     // RX_VK_GPU_PROFILE and RX_VK_GPL, none of which the translation reads, and a line of them added to relink_env.txt or taken out
     // prepared every shader again
     for (char** e = _environ; e && *e; e++)
-        for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "RX_VK_LOOKUP", "EDEN_"})
+        for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_CONV", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "RX_VK_LOOKUP", "EDEN_"})
             if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
     return h;
 }

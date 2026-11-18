@@ -2278,7 +2278,9 @@ void EmitContext::DefineMesh(const IR::Program& program) {
     mesh_attribute_words = (std::max)(
         mesh_primitive_base + Common::DivCeil(mesh_info.max_primitives, 32U) * primitive_lines * 32,
         1U);
-    mesh_map_bytes = 4 + mesh_info.Corners() * mesh_info.max_primitives;
+    // (relink) Whole blocks of 32 primitives, like the attributes: the program writes the index bytes of every lane of a block, past
+    // max_primitives too, and sized to max_primitives those writes were clamped onto the last byte (a stray vertex, flashing triangles)
+    mesh_map_bytes = 4 + mesh_info.Corners() * Common::DivCeil(mesh_info.max_primitives, 32U) * 32;
     mesh_shared_u32 = TypePointer(spv::StorageClass::Workgroup, U32[1]);
     mesh_attributes = DefineVariable(*this, TypeArray(U32[1], Const(mesh_attribute_words)),
                                      std::nullopt, spv::StorageClass::Workgroup);
