@@ -4618,6 +4618,7 @@ bool wb_sync_flush(Pool& p, const std::vector<uint64_t>& offs) {
     const struct { uint64_t table; uint32_t count, pad; } pc{t->address, (uint32_t)chunks.size(), 0};
     vkCmdPushConstants(up, wbd_pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
     const uint32_t n = (uint32_t)chunks.size();
+    checkpoint_mark(up, n, 'w');   // (relink) its own marker: a fault in the diff pass no longer reads as the last pool's copy
     vkCmdDispatch(up, std::min<uint32_t>(n, 65535u), (n + 65534u) / 65535u, 1);
     transfer_barrier(up);   // (guest memory with those words, before the copies read it)
     st_wbl_at_sync += (int64_t)offs.size();
@@ -4940,6 +4941,7 @@ void memory_end_submission(VkCommandBuffer cmd) {
                 const struct { uint64_t table; uint32_t count, pad; } pc{t->address, (uint32_t)chunks.size(), 0};
                 vkCmdPushConstants(cmd, wbd_pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
                 const uint32_t n = (uint32_t)chunks.size();
+                checkpoint_mark(cmd, n, 'w');   // (relink) the diff pass has its own marker, apart from the pool copies
                 vkCmdDispatch(cmd, std::min<uint32_t>(n, 65535u), (n + 65534u) / 65535u, 1);
             }
         }

@@ -3427,7 +3427,7 @@ void checkpoint(VkCommandBuffer cmd, const Program& p, char kind, const Targets*
 const char* checkpoint_kind(char c) {
     return c == 'd' ? "draw of program" : c == 'c' ? "dispatch of program" : c == 'i' ? "INDIRECT dispatch of program"
          : c == 'm' ? "mirror sync of pool"
-         : c == 'b' ? "write-back of pool" : c == 'u' ? "upload of texture" : c == 'g' ? "GPU unswizzle of texture"
+         : c == 'b' ? "write-back of pool" : c == 'w' ? "write-back diff pass, chunk count" : c == 'u' ? "upload of texture" : c == 'g' ? "GPU unswizzle of texture"
          : c == 'A' ? "ASTC decode of texture" : c == 'E' ? "BC3 encode into texture" : c == 'R' ? "resize blit for texture"
          : c == 'Z' ? "end of the uploads of texture"
          : c == 'P' ? "PRESENT to the window, present number" : c == 'B' ? "UPLOADS: readback refresh, pools"
@@ -3716,10 +3716,18 @@ void checkpoints_report() {
     // RX_VK_CHECKPOINTS=1 is the NV checkpoints where the driver has them, not the buffer markers)
     logf("vk: device lost: reading %s", dev.checkpoints ? "the checkpoints"
                                         : marker_words ? "the buffer markers"
-                                        : getenv("RX_VK_FAULT_INFO") ? "the fault info"
+                                        : !getenv("RX_VK_FAULT_INFO") || *getenv("RX_VK_FAULT_INFO") != '0' ? "the fault info"
                                         : "nothing: no markers on (RX_VK_CHECKPOINTS=marker, RX_VK_PARALLEL=0 and RX_VK_FAULT_INFO=1 "
                                           "in relink_env.txt name the work that stopped)");
-    struct FaultLast { ~FaultLast() { if (std::getenv("RX_VK_FAULT_INFO")) device_fault_report(); } } fault_last;
+    // (relink) With neither NV checkpoints nor buffer markers (AMD, Intel) the fault info is read without being asked for: it is
+    // all the report has. Not where the checkpoints are, where it has not come back after a fault. RX_VK_FAULT_INFO=0: never
+    struct FaultLast {
+        ~FaultLast() {
+            const char* e = std::getenv("RX_VK_FAULT_INFO");
+            const bool bare = !dev.checkpoints && !marker_words;
+            if (e ? *e != '0' : bare) device_fault_report();
+        }
+    } fault_last;
     const auto watched = [] {
         std::lock_guard lk(watch_mu);
         for (int i = 0; i < 40; i++)
