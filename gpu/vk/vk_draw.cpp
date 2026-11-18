@@ -1731,6 +1731,23 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
 
 /// part: -1 the whole pipeline, or the graphics pipeline library it stands for: 0 vertex input, 1 pre-rasterization, 2 fragment
 /// shader, 3 fragment output
+// (relink) The driver's identity, asked once: AMD's own Windows/amdvlk drivers against Mesa's RADV, which share a vendor id and not a
+// compiler (the AMD-only build rules below were found on the former; RADV reset the GPU on one of them)
+static VkDriverId driver_id_once() {
+    static const VkDriverId id = [] {
+        VkPhysicalDeviceDriverProperties drv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 pr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        pr.pNext = &drv;
+        vkGetPhysicalDeviceProperties2(dev.physical, &pr);
+        return drv.driverID;
+    }();
+    return id;
+}
+static bool amd_own_driver() {
+    const VkDriverId id = driver_id_once();
+    return id == VK_DRIVER_ID_AMD_PROPRIETARY || id == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+}
+
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part) {
     const Shader::Info& vs = *vertex_info(p);
     const auto t0 = std::chrono::steady_clock::now();
@@ -1910,10 +1927,12 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         // tables) hung the GPU when the driver's optimizer built them: a device lost one to four minutes into Kokiri, each time with
         // another of them first (RX 6600, issues 461 and 484); never in runs where they were built without it. They are built
         // without it on AMD. RX_VK_MESH_OPT=1: with it, as the others)
+        // (relink) AMD's own drivers only: on Mesa's RADV (Linux) building them without the optimizer reset the GPU, so they are built
+        // with it there, as on other drivers. RX_VK_MESH_OPT_ALL_AMD=1: every AMD driver, as before
         static const bool amd = [] {
             VkPhysicalDeviceProperties pr{};
             vkGetPhysicalDeviceProperties(dev.physical, &pr);
-            return pr.vendorID == 0x1002;
+            return pr.vendorID == 0x1002 && (amd_own_driver() || getenv("RX_VK_MESH_OPT_ALL_AMD"));
         }();
         static const bool mesh_opt = getenv("RX_VK_MESH_OPT") != nullptr;
         if (amd && !mesh_opt) {
