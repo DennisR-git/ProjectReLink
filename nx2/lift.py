@@ -131,12 +131,14 @@ def exefs_sites():
     import oot_fov
     import oot_step_rate
     import oot_ripples
+    import oot_step_cuts
     return {"widescreen": [oot_wide.MAIN + s[0] for s in oot_wide.SITES],
             "camera jitter (DLSS, FSR)": [oot_wide.MAIN + s[0] for s in oot_jitter.SITES],
             "Occlusion Off": [oot_occlusion.MAIN + o for o in oot_occlusion.OFFSETS],
             "field of view": [oot_fov.MAIN + oot_fov.SITE],
             "the frame rate above 60 fps": [oot_step_rate.MAIN + oot_step_rate.SITE],
-            "water ripples above 60 fps": [oot_ripples.MAIN + oot_ripples.SITE]}
+            "water ripples above 60 fps": [oot_ripples.MAIN + oot_ripples.SITE],
+            **oot_step_cuts.sites()}
 
 
 def main():
@@ -198,6 +200,8 @@ def main():
         oot_step_rate.install(L, img)
         import oot_ripples   # (relink, issue 120) the water's ripple steps carried per surface above 60 fps
         oot_ripples.install(L, img)
+        import oot_step_cuts   # (relink) the pick-up counter, time of day, Deku Tree web, solver steps and sound job above 60 fps
+        oot_step_cuts.install(L, img)
     L.discover(max_insns=a.max_func)
     print("discovered %d functions (%.0fs)" % (len(L.funcs), time.time() - t0))
     # (relink) exefs mods (nx2/exefs_mods.py, OOT_EXEFS_PATCHES: what make_game.py applied to this exefs): which functions
