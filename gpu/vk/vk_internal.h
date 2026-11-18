@@ -121,6 +121,7 @@ bool probe_serial();
 void probe_dump_all(const char* why);
 void probe_log(uint64_t frame);
 void memory_end_submission(VkCommandBuffer cmd);
+bool pools_mirrored();   // (vk_memory.cpp: the buffer pools have VRAM mirrors, the discrete GPUs by default)
 /// (relink, RX_VK_WB_LAZY) pages whose write-back was put off wait for the frame's flush; and that flush queued into the
 /// recording being made (between its memory_begin_submission and memory_end_submission)
 bool memory_wb_pending();
