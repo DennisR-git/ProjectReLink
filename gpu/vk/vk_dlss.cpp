@@ -781,11 +781,6 @@ bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, ui
     else
         snprintf(why, sizeof why, "the render size %ux%u left its range, %ux%u to %ux%u", rw, rh, s.min_rw, s.min_rh,
                  s.feature_rw, s.feature_rh);
-    if (s.feature) {
-        NVSDK_NGX_Handle* old = s.feature;
-        later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });
-        s.feature = nullptr;
-    }
     // (the quality mode whose range of render sizes holds this one: the network's 3/4 is DLSS's MaxQuality range)
     // (DLAA's when the render size is the output's)
     static const NVSDK_NGX_PerfQuality_Value scaled[] = {NVSDK_NGX_PerfQuality_Value_MaxQuality, NVSDK_NGX_PerfQuality_Value_DLAA,
@@ -799,17 +794,47 @@ bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, ui
     unsigned max_w = 0, max_h = 0, min_w = 0, min_h = 0, rec_w = 0, rec_h = 0;
     bool found = aa;
     if (aa) max_w = min_w = ow, max_h = min_h = oh;   // (DLAA: the render size is the output's, one size)
+    struct Range { unsigned w = 0, h = 0, max_w = 0, max_h = 0, min_w = 0, min_h = 0; bool ok = false; } ranges[5];
     for (size_t i = 0; i < nmodes && !found; i++) {
         const NVSDK_NGX_PerfQuality_Value m = modes[i];
         unsigned w = 0, h = 0, xw = 0, xh = 0, nw = 0, nh = 0;
         float sharp = 0;
         if (NVSDK_NGX_FAILED(NGX_DLSS_GET_OPTIMAL_SETTINGS(s.caps, ow, oh, m, &w, &h, &xw, &xh, &nw, &nh, &sharp)) || !w) continue;
+        ranges[i] = {w, h, xw, xh, nw, nh, true};
         if (rw >= nw && rh >= nh && rw <= xw && rh <= xh) {
             mode = m, max_w = xw, max_h = xh, min_w = nw, min_h = nh, rec_w = w, rec_h = h, found = true;
             break;
         }
     }
-    if (!found) return fail("no DLSS mode takes this render size");
+    // (relink) The render resolution's sizes are rounded, and a mode's range can be a single size: at an output not divisible by
+    // 3 the game's third came out a pixel off Ultra Performance's, no mode took it and the game's upscale ran in DLSS's place.
+    // A size within a pixel or two (1/64 of the range's top, 2 at least) of a mode's range is that mode's, its range widened to
+    // the size, if DLSS can scale it at all (the output 1 to 3 times it). RX_VK_DLSS_NEAR_RANGE=0: no such leeway
+    static const bool near_range = !(getenv("RX_VK_DLSS_NEAR_RANGE") && atoi(getenv("RX_VK_DLSS_NEAR_RANGE")) == 0);
+    bool widened = false;
+    if (!found && near_range && rw && rh && rw <= ow && rh <= oh && (uint64_t)rw * 3 >= ow && (uint64_t)rh * 3 >= oh)
+        for (size_t i = 0; i < nmodes && !found; i++) {
+            const Range& g = ranges[i];
+            if (!g.ok || !g.max_w || !g.max_h) continue;
+            const unsigned sw = std::max(2u, g.max_w / 64), sh = std::max(2u, g.max_h / 64);
+            if (rw + sw >= g.min_w && rh + sh >= g.min_h && rw <= g.max_w + sw && rh <= g.max_h + sh) {
+                mode = modes[i], rec_w = g.w, rec_h = g.h, found = widened = true;
+                min_w = std::min(rw, g.min_w), min_h = std::min(rh, g.min_h);
+                max_w = std::max(rw, g.max_w), max_h = std::max(rh, g.max_h);
+            }
+        }
+    if (!found) return fail("no DLSS mode takes this render size");   // (the feature it has stays: let go only once a mode takes a size)
+    if (widened) {
+        static std::atomic<int> told{0};
+        if (told++ < 4)
+            logf("vk: NVIDIA DLSS: %ux%u is a little outside quality mode %d's range (%ux%u to %ux%u): taken by it", rw, rh, (int)mode,
+                 min_w, min_h, max_w, max_h);
+    }
+    if (s.feature) {
+        NVSDK_NGX_Handle* old = s.feature;
+        later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });
+        s.feature = nullptr;
+    }
     // (the DLSS model row's preset for every mode, K by default: NVIDIA's transformer model. 0: NVIDIA's own per mode)
     static_assert(NVSDK_NGX_DLSS_Hint_Render_Preset_K == 11 && NVSDK_NGX_DLSS_Hint_Render_Preset_L == 12 &&
                   NVSDK_NGX_DLSS_Hint_Render_Preset_M == 13 && NVSDK_NGX_DLSS_Hint_Render_Preset_Default == 0);
