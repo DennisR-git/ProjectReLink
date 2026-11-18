@@ -2398,6 +2398,8 @@ void forget_gpu(Texture* tex) {
 bool readback_begin();
 bool readback_submit_wait();
 VkCommandBuffer rb_cmd_for_park();   // (the read-backs' command buffer, below)
+bool readback_busy();                // (relink: an earlier read-back timed out and the GPU still runs it, below)
+void readback_end_buffer(VkBuffer buf, VmaAllocation alloc);   // (relink: a read-back's staging buffer, kept while the GPU may write it)
 struct Parked {
     VkBuffer buf = VK_NULL_HANDLE;
     VmaAllocation alloc = nullptr;
@@ -2511,7 +2513,7 @@ bool park_texture(const Texture& t, uint64_t frame) {
         ok = readback_submit_wait();
     }
     if (!ok) {
-        destroy_buffer(buf, alloc);
+        readback_end_buffer(buf, alloc);
         return false;
     }
     Parked p;
@@ -3752,7 +3754,39 @@ VkCommandPool rb_pool = VK_NULL_HANDLE;
 VkCommandBuffer rb_cmd = VK_NULL_HANDLE;
 VkFence rb_fence = VK_NULL_HANDLE;
 VkCommandBuffer rb_cmd_for_park() { return rb_cmd; }   // (relink: park_texture, above)
+// (relink) A read-back whose wait ran out (5 s) is still on the GPU: its command buffer and fence are in use until rb_fence signals,
+// so the next read-back must not reset them (rb_pending). A wait that failed any other way is a lost device: no more read-backs
+// (rb_lost). RX_VK_RB_KEEP=0: as before, the next read-back reuses them at once
+bool rb_pending = false, rb_lost = false;
+bool rb_keep_on() {
+    static const bool on = !(getenv("RX_VK_RB_KEEP") && atoi(getenv("RX_VK_RB_KEEP")) == 0);
+    return on;
+}
+/// Whether the last read-back is still on the GPU (asked without waiting; a finished one is let go of here)
+bool readback_busy() {
+    if (!rb_keep_on() || !rb_pending) return false;
+    const VkResult r = vkWaitForFences(dev.device, 1, &rb_fence, VK_TRUE, 0);
+    if (r == VK_TIMEOUT) return true;
+    rb_pending = false, rb_lost = r != VK_SUCCESS;
+    return false;
+}
+/// A read-back's staging buffer is let go of: at once, or, when the read-back timed out and the GPU may still write it, once the
+/// GPU is past the next recording
+void readback_end_buffer(VkBuffer buf, VmaAllocation alloc) {
+    if (rb_keep_on() && rb_pending) {
+        Dead d{rec_value + 1, VK_NULL_HANDLE, nullptr, {}, {}};
+        d.buffer = buf, d.buffer_alloc = alloc;
+        dead.push_back(std::move(d));
+        return;
+    }
+    destroy_buffer(buf, alloc);
+}
 bool readback_begin() {
+    if (rb_keep_on()) {
+        if (rb_lost) return false;
+        if (readback_busy()) return false;
+        if (rb_lost) return false;
+    }
     if (!rb_pool) {
         VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
         pi.queueFamilyIndex = dev.queue_family;
@@ -3764,8 +3798,13 @@ bool readback_begin() {
         ai.commandBufferCount = 1;
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if (vkAllocateCommandBuffers(dev.device, &ai, &rb_cmd) != VK_SUCCESS ||
-            vkCreateFence(dev.device, &fi, nullptr, &rb_fence) != VK_SUCCESS)
+            vkCreateFence(dev.device, &fi, nullptr, &rb_fence) != VK_SUCCESS) {
+            // (relink) made again next time, not used half made (a null command buffer or fence under a pool that is set)
+            if (rb_fence) vkDestroyFence(dev.device, rb_fence, nullptr);
+            vkDestroyCommandPool(dev.device, rb_pool, nullptr);
+            rb_pool = VK_NULL_HANDLE, rb_cmd = VK_NULL_HANDLE, rb_fence = VK_NULL_HANDLE;
             return false;
+        }
     }
     vkResetCommandPool(dev.device, rb_pool, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -3794,7 +3833,9 @@ bool readback_submit_wait() {
         queue_flush_locked();
         if (vkQueueSubmit2(dev.queue, 1, &si, rb_fence) != VK_SUCCESS) return false;
     }
-    return vkWaitForFences(dev.device, 1, &rb_fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
+    const VkResult w = vkWaitForFences(dev.device, 1, &rb_fence, VK_TRUE, 5000000000ull);
+    rb_pending = w == VK_TIMEOUT, rb_lost = w != VK_SUCCESS && w != VK_TIMEOUT;
+    return w == VK_SUCCESS;
 }
 /// The image's levels and layers read back, swizzled as the storage lays them out, and written into its memory
 bool flush_texture(Texture& t, uint64_t clip_lo, uint64_t clip_hi) {
@@ -3842,6 +3883,8 @@ bool flush_texture(Texture& t, uint64_t clip_lo, uint64_t clip_hi) {
         checkpoint_note(rb_cmd, t.gpu, 'K', "#%u: END, after the copy", t.id);
         ok = readback_submit_wait();
         if (!ok) logf("vk: READBACK of texture #%u FAILED or timed out (5 s)", t.id);
+        // (relink) the copy may still run: its image lives until the GPU is past the next recording, however it ends up
+        if (!ok && rb_keep_on() && rb_pending) t.last_value = std::max(t.last_value, rec_value + 1);
         if (ok && !uncached) invalidate_mapped(alloc, total);
     }
     if (ok && total <= 64) {   // (RX_VK_LOG_TINY_FLUSH=1: the values of tiny ones, 400 lines: a 1 x 1 luminance)
@@ -3901,7 +3944,7 @@ bool flush_texture(Texture& t, uint64_t clip_lo, uint64_t clip_hi) {
             }
         }
         log_kept();
-        destroy_buffer(buf, alloc);
+        readback_end_buffer(buf, alloc);
         return ok;
     }
     if (ok) {
@@ -3919,7 +3962,7 @@ bool flush_texture(Texture& t, uint64_t clip_lo, uint64_t clip_hi) {
         }
         log_kept();
     }
-    destroy_buffer(buf, alloc);
+    readback_end_buffer(buf, alloc);
     return ok;
 }
 } // namespace
@@ -5290,6 +5333,15 @@ void texture_frame(uint64_t completed) {
             logf("vk: write-back before eviction left out, another image drawn into its storage since: #%u %#llx %ux%u NVN %#x "
                  "(%lld so far)", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->nvn_format,
                  (long long)stale_skipped.load());
+        // (relink) a read-back that timed out is still on the GPU: this texture cannot be copied out yet, and evicted now it would go
+        // with no copy and come back empty. It stays, its texels in its image, for a later pass (RX_VK_RB_KEEP=0: as before)
+        if (!no_flush && !overwritten && tex->gpu_written && readback_busy() &&
+            ((!stale && !tex->released && flushable(*tex)) || !(tex->released && (storage_taken(tex) || rewritten(tex))))) {
+            static std::atomic<int> busy_logged{0};
+            if (busy_logged.fetch_add(1) < 10)
+                logf("vk: texture #%u %#llx kept for a later pass: a read-back is still on the GPU", tex->id, (unsigned long long)tex->gpu);
+            continue;
+        }
         if (!no_flush && !overwritten && !stale && tex->gpu_written && !tex->released && flushable(*tex) &&
             flush_texture(*tex, tex->gpu, tex->gpu + tex->guest_size)) {
             written_back = true;
@@ -5301,6 +5353,8 @@ void texture_frame(uint64_t completed) {
         if (tex->gpu_written && !overwritten && !written_back &&
             !(tex->released && (storage_taken(tex) || rewritten(tex))) && !park_texture(*tex, frame_no))
             lost_note(*tex, frame_no, !tex->released ? 3 : past_cap ? 1 : tex->bytes > (4ull << 20) ? 2 : 0);
+        // (relink) a copy of its image that timed out may still run: the image is let go only once the GPU is past it
+        if (rb_pending && rb_keep_on()) tex->last_value = std::max(tex->last_value, rec_value + 1);
         if (shifted) n_dead++, b_dead += tex->bytes;
         watch_tex(tex, "evicted");
         if (!tex->gpu_written && tex->uploaded && !remade_skip_old()) {   // (above: made again, it is uploaded from memory)
