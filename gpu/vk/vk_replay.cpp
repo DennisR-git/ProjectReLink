@@ -3029,6 +3029,7 @@ struct Frame {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence done = VK_NULL_HANDLE;
     VkSemaphore acquired = VK_NULL_HANDLE;
+    bool unsubmitted = false;   // (relink: its last submit was refused, so `done` was reset and never signalled: not waited for)
 };
 Frame frames[3];
 uint32_t frame_index = 0;
@@ -4111,7 +4112,8 @@ static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4]
     Frame& f = frames[frame_index];
     const int log_slot = frame_index;
     frame_index = (frame_index + 1) % 3;
-    vkWaitForFences(dev.device, 1, &f.done, VK_TRUE, UINT64_MAX);
+    if (!f.unsubmitted) vkWaitForFences(dev.device, 1, &f.done, VK_TRUE, UINT64_MAX);
+    f.unsubmitted = false;
     framelog_collect(log_slot);
     uint32_t index = 0;
 #ifdef _WIN32
@@ -4242,7 +4244,17 @@ static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4]
         std::memcpy(r0, st_reason, sizeof r0);
     }
     reflex_submit_ends();
-    vkQueueSubmit2(dev.queue, 1, &si, f.done);
+    const VkResult blit_res = vkQueueSubmit2(dev.queue, 1, &si, f.done);
+    // (relink) The present below waits for the semaphore this submit signals: with the submit refused it waited for a signal that
+    // never came, on the presents' own queue, where nothing else notices. This frame is not shown (RX_VK_PRESENT_CHECK=0: as before)
+    static const bool check = !(getenv("RX_VK_PRESENT_CHECK") && atoi(getenv("RX_VK_PRESENT_CHECK")) == 0);
+    if (check && blit_res != VK_SUCCESS) {
+        f.unsubmitted = true;
+        static int refused;
+        if (refused++ < 8) logf("vk: the present's blit submit failed (VkResult %d): this frame is not shown", (int)blit_res);
+        if (blit_res == VK_ERROR_DEVICE_LOST) checkpoints_report();
+        return false;
+    }
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.pNext = reflex_present_id(nullptr);   // (NVIDIA Reflex: the frame's present id, and its present's markers)
     pi.waitSemaphoreCount = 1;
@@ -4263,6 +4275,7 @@ static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4]
         res = vkQueuePresentKHR(dev.queue, &pi);
     }
     reflex_presented();
+    if (check && res == VK_ERROR_DEVICE_LOST) checkpoints_report();   // (on the presents' own queue this is where a lost device first shows)
     if (res < 0 && res != VK_ERROR_OUT_OF_DATE_KHR) {   // (a present that failed: said, a few times)
         static int logged;
         if (logged++ < 8) logf("vk: present failed (VkResult %d%s)", (int)res, dev.present_queue ? ", on the presents' own queue" : "");
