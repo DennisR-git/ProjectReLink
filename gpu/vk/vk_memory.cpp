@@ -720,10 +720,22 @@ void memory_drop_shadow(uint64_t guest, uint64_t size);
 // (a GPU write: RX_VK_GPU_PAGES=1 notes the pages, and the mirror syncs that copy the CPU's version of one over the
 // mirror are counted (the GPU's bytes in that page replaced by what guest memory or a capture held: a page the CPU
 // and the GPU both write). ~1M a race, no effect seen; off by default: its lock on every dirty page cost the replay)
+// (relink) A hash for maps keyed by 64 KB-aligned addresses (pool starts). std::hash<uint64_t> is the identity, and a map
+// reserved to a power of two (libc++, the Windows build) picks its bucket with a mask: every aligned key lands in bucket 0 and
+// each find walks the whole chain (17 to 23 ms in a busy area's capture list). A multiplicative hash, top bits taken.
+// RX_VK_POOL_HASH_OFF=1: the identity, as before.
+struct AlignedKeyHash {
+    size_t operator()(uint64_t k) const noexcept {
+        static const bool off = getenv("RX_VK_POOL_HASH_OFF") != nullptr;
+        if (off) return (size_t)k;
+        k *= 0x9E3779B97F4A7C15ull;
+        return (size_t)(k ^ (k >> 32));
+    }
+};
 std::mutex gpu_pages_mu;
 std::unordered_map<uint32_t, uint32_t> gpu_pages;   // page -> the generation of the GPU's last write
 int64_t st_sync_gpu_pages, st_sync_gpu_live;
-std::unordered_map<uint64_t, int64_t> gpu_over_by_pool;   // (relink: those syncs by pool, since the last report)
+std::unordered_map<uint64_t, int64_t, AlignedKeyHash> gpu_over_by_pool;   // (relink: those syncs by pool, since the last report)
 bool gpu_pages_on() {
     // (relink: RX_VK_PAGES_GPU=1 is the same switch under a name that is not one of the program cache's stamp prefixes
     // (vk_shader.cpp disk_stamp: "RX_VK_GP..."): RX_VK_GPU_PAGES=1 emptied the 7.5 GB program cache of the folder it ran in)
@@ -955,7 +967,7 @@ uint64_t cap_ranges_ver = 1;   // (any of the captures' range lists changed: cap
 std::vector<std::pair<uint64_t, uint64_t>> pool_cap_ranges;   // (merged; cap_ranges_mu)
 uint32_t pool_cap_gen = 0;
 uint64_t captures_made = 0, pool_cap_built = 0;              // (cap_ranges_mu)
-std::unordered_map<uint64_t, uint64_t> pool_first_seen;     // (a pool's start -> the capture it was first seen at)
+std::unordered_map<uint64_t, uint64_t, AlignedKeyHash> pool_first_seen;     // (a pool's start -> the capture it was first seen at)
 int capture_mode();   // (below)
 uint64_t capture_pool_max() {
     static const uint64_t v = (getenv("RX_VK_CAPTURE_POOL_MB") ? (uint64_t)atoll(getenv("RX_VK_CAPTURE_POOL_MB")) : 64) << 20;
@@ -973,7 +985,7 @@ void refresh_pool_ranges_locked() {   // (cap_ranges_mu held)
     static std::vector<std::array<uint64_t, 2>> list(8192);
     const int n = host->gpu_pools(reinterpret_cast<uint64_t(*)[2]>(list.data()), (int)list.size());
     std::vector<std::pair<uint64_t, uint64_t>> v;
-    std::unordered_map<uint64_t, uint64_t> seen;
+    std::unordered_map<uint64_t, uint64_t, AlignedKeyHash> seen;
     seen.reserve((size_t)std::max(n, 0));
     for (int i = 0; i < n; i++) {
         if (!list[i][1] || list[i][1] > capture_pool_max() || list[i][0] >= (1ull << 40)) continue;
@@ -1145,27 +1157,42 @@ bool submitted_page_reuse(uint64_t page, uint32_t page_gen, uint64_t view, uint6
                           uint64_t cached_view) {
     return cached_view != 0 && page == cached_page && page_gen == cached_gen && view == cached_view;
 }
+// (relink) A page no capture holds, as of its write stamp and the capture table's generation: guest memory stands for its next
+// words too, so the read skips pools_mu. 32 of them a thread, by page: a draw's handle program reads a uniform word on one page
+// and a storage word on another, and with one page kept nearly every read missed and took the lock. A page a capture does hold
+// keeps its copy as before, one page a thread (captured_page): repeated words of it are read without the lock too.
+// RX_VK_SUBMITTED_PAGES=1: one slot for every page.
 struct SubmittedPage {
     uint64_t page = ~0ull;
     uint32_t pgen = 0;
     uint64_t view = 0;
-    bool overlay = false;   // (bytes is the capture's copy of the page; otherwise guest memory stands)
+};
+constexpr int kSubmittedPages = 32;
+thread_local SubmittedPage submitted_pages[kSubmittedPages];
+inline SubmittedPage& submitted_page_for(uint64_t page) {   // (a page and its neighbours, and pages 32 apart, in other slots)
+    static const bool one = getenv("RX_VK_SUBMITTED_PAGES") && atoi(getenv("RX_VK_SUBMITTED_PAGES")) == 1;
+    return submitted_pages[one ? 0 : (page + (page >> 5) * 13) & (kSubmittedPages - 1)];
+}
+struct CapturedPage {
+    uint64_t page = ~0ull;
+    uint32_t pgen = 0;
+    uint64_t view = 0;
     uint8_t bytes[4096]{};
 };
-thread_local SubmittedPage submitted_page;
+thread_local CapturedPage captured_page;   // (the last page read that a capture held: its copy)
+inline bool submitted_known(uint64_t page, uint32_t pgen, uint64_t view) {
+    const SubmittedPage& sp = submitted_page_for(page);
+    return submitted_page_reuse(page, pgen, view, sp.page, sp.pgen, sp.view);
+}
 
 bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
-    // (once a capture exists, every uniform word took pools_mu to ask whether its page was in one. The next words are
-    // the same page: the answer is kept until a stamp or a new capture)
-    if (n && capture_on() && captures_seen.load(std::memory_order_relaxed)) {
+    if (n && capture_on() && captures_seen.load(std::memory_order_relaxed)) {   // (a captured page read before: its copy)
         const uint64_t guest = gpu < (1ull << 40) ? gpu : host->gpu_guest(gpu);
-        if (guest) {
-            const uint64_t page0 = guest >> kPageShift, page1 = (guest + n - 1) >> kPageShift;
-            const uint64_t view = cap_view_gen.load(std::memory_order_acquire);
-            if (page0 == page1 && submitted_page_reuse(page0, page_gen(page0), view, submitted_page.page,
-                                                       submitted_page.pgen, submitted_page.view) &&
-                submitted_page.overlay) {
-                std::memcpy(dst, submitted_page.bytes + (guest & 4095), (size_t)n);
+        if (guest && (guest >> kPageShift) == ((guest + n - 1) >> kPageShift)) {
+            const uint64_t page = guest >> kPageShift;
+            if (submitted_page_reuse(page, page_gen(page), cap_view_gen.load(std::memory_order_acquire), captured_page.page,
+                                     captured_page.pgen, captured_page.view)) {
+                std::memcpy(dst, captured_page.bytes + (guest & 4095), (size_t)n);
                 return true;
             }
         }
@@ -1176,9 +1203,7 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
     if (!guest) return true;
     const uint64_t page0 = guest >> kPageShift, page1 = (guest + n - 1) >> kPageShift;
     const uint64_t view = cap_view_gen.load(std::memory_order_acquire);
-    if (page0 == page1 && submitted_page_reuse(page0, page_gen(page0), view, submitted_page.page, submitted_page.pgen,
-                                               submitted_page.view))
-        return true;
+    if (page0 == page1 && submitted_known(page0, page_gen(page0), view)) return true;
     static std::atomic<int64_t> reads{0}, pages_from{0};
     int64_t from = 0;
     {
@@ -1193,19 +1218,17 @@ bool memory_read_as_submitted(uint64_t gpu, void* dst, uint64_t n) {
             std::memcpy((uint8_t*)dst + (a - guest), (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096 + (a - (page << kPageShift)), z - a);
             from++;
         }
-        if (page0 == page1) {
-            submitted_page.page = page0;
-            submitted_page.pgen = page_gen(page0);
-            submitted_page.view = cap_view_gen.load(std::memory_order_relaxed);
-            submitted_page.overlay = false;
+        if (page0 == page1 && from == 0) {   // (in no capture: guest memory stands for its next words too)
+            SubmittedPage& sp = submitted_page_for(page0);
+            sp.page = page0;
+            sp.pgen = page_gen(page0);
+            sp.view = view;   // (the generation this read started from: a newer capture makes it stale, not trusted)
+        } else if (page0 == page1) {   // (in a capture: the whole page copied once for the next words of it)
             const CapEntry e = cap_entry(page0);
-            if (e.gen && e.gen == submitted_page.pgen) {
-                auto b = cap_bufs.find(e.gen);
-                if (b != cap_bufs.end() && b->second.map) {
-                    capture_late_fix(b->second);
-                    std::memcpy(submitted_page.bytes, (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096, 4096);
-                    submitted_page.overlay = true;
-                }
+            auto b = e.gen && e.gen == page_gen(page0) ? cap_bufs.find(e.gen) : cap_bufs.end();
+            if (b != cap_bufs.end() && b->second.map) {
+                std::memcpy(captured_page.bytes, (const uint8_t*)b->second.map + (uint64_t)e.slot * 4096, 4096);
+                captured_page.page = page0, captured_page.pgen = e.gen, captured_page.view = view;
             }
         }
     }
@@ -2560,6 +2583,7 @@ bool mirror_on() {
     return on != 0;
 }
 } // namespace
+bool pools_mirrored() { return mirror_on(); }
 uint64_t device_vram_bytes() {
     uint64_t vram = 0;
     for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
@@ -3036,9 +3060,9 @@ void retire_pool(std::map<uint64_t, Pool>::iterator it) {
 }
 int64_t st_sync_bytes, st_sync_copies, st_wb_bytes, st_mirrors;
 int64_t st_sync_live_pages, st_sync_cap_pages, st_sync_old_pages;   // (mirror syncs' dirty pages: live / this submit's capture / an earlier one's)
-std::unordered_map<uint64_t, int64_t> live_by_pool;
-std::unordered_map<uint64_t, std::pair<int64_t, int>> direct_by_pool;   // (bindings the GPU reads in guest memory: count, state)
-std::unordered_map<uint64_t, uint64_t> direct_bytes_by_pool;           // (and the bytes of those bindings: what the GPU may read over PCIe, a binding's whole range)
+std::unordered_map<uint64_t, int64_t, AlignedKeyHash> live_by_pool;
+std::unordered_map<uint64_t, std::pair<int64_t, int>, AlignedKeyHash> direct_by_pool;   // (bindings the GPU reads in guest memory: count, state)
+std::unordered_map<uint64_t, uint64_t, AlignedKeyHash> direct_bytes_by_pool;           // (and the bytes of those bindings: what the GPU may read over PCIe, a binding's whole range)
 int64_t live_seen = 0;   // (pool -> pages its syncs read live, since the last report)
 
 void transfer_barrier(VkCommandBuffer cmd) {
@@ -4897,7 +4921,7 @@ void memory_end_submission(VkCommandBuffer cmd) {
             {   // (relink) RX_VK_LOG_WRITEBACK=1: the pools written back the most, every 600 write-back submissions
                 static const bool log_wb = getenv("RX_VK_LOG_WRITEBACK") != nullptr;
                 if (log_wb) {
-                    static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> by_pool;   // lo -> bytes, runs
+                    static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>, AlignedKeyHash> by_pool;   // lo -> bytes, runs
                     static int64_t subs;
                     auto& e = by_pool[p->lo];
                     for (const VkBufferCopy& r : runs) e.first += r.size;

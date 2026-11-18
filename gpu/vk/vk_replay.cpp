@@ -644,6 +644,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     if (uploads) checkpoint_note(r.upload, r.value, 'F', "its uploads");
     checkpoint_note(r.cmd, r.value, 'F', "its draws and dispatches");
     vkEndCommandBuffer(r.upload);
+    host_read_barrier(r.cmd);
     vkEndCommandBuffer(r.cmd);
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     signal.semaphore = timeline;
@@ -771,6 +772,17 @@ uint64_t ts_anchor_ns = 0;   // (the last present's time: counter timestamps are
 /// A GPU-timeline write of guest memory (the stream's own writes: they reach memory in command order)
 void gpu_write(VkCommandBuffer cmd, uint64_t gpu, const void* data, uint64_t n) {
     const uint8_t* d = (const uint8_t*)data;
+    {   // (relink) two inline updates of the same bytes with nothing between them may land in either order. One that overlaps
+        // the thread's last write on this command buffer gets a barrier first (full_barrier leaves it out when one already
+        // stands after that write). RX_VK_UB_ORDER_OFF=1: none, as before
+        static const bool off = getenv("RX_VK_UB_ORDER_OFF") != nullptr;
+        static thread_local VkCommandBuffer last_cmd = VK_NULL_HANDLE;
+        static thread_local uint64_t last_lo = 0, last_hi = 0;
+        if (!off && n) {
+            if (cmd == last_cmd && gpu < last_hi && gpu + n > last_lo) full_barrier(cmd, "barrier (overlapping inline writes)");
+            last_cmd = cmd, last_lo = gpu, last_hi = gpu + n;
+        }
+    }
     while (n) {   // (vkCmdUpdateBuffer: up to 64 KB, 4-byte aligned)
         const uint64_t k = std::min<uint64_t>(n, 65536);
         BufferRef b = gpu_buffer_bind(gpu, k, true);
@@ -781,6 +793,21 @@ void gpu_write(VkCommandBuffer cmd, uint64_t gpu, const void* data, uint64_t n) 
         }
         gpu += k, d += k, n -= k;
     }
+}
+
+/// (relink) The game reads what the GPU wrote into its memory (copies to buffers, queries, write-backs) once the timeline reaches a
+/// submission. A host wait only makes device writes visible to the device, so each recording ends with a memory dependency into
+/// the host's reads, or a GPU whose caches are not flushed by chance could hand the game stale bytes.
+/// RX_VK_NO_HOST_READ_BARRIER=1: none, as before
+void host_read_barrier(VkCommandBuffer cmd) {
+    static const bool off = getenv("RX_VK_NO_HOST_READ_BARRIER") != nullptr;
+    if (off) return;
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, b.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1, d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
 }
 
 // ---- uniform updates (UPDATE_UB): written at the end of their recording; ub_overlay applies them to copies ----
@@ -1017,8 +1044,56 @@ void flush_ub_updates(VkCommandBuffer cmd) {
     GprofSpan gp(cmd, "ubupd (the stream's uniform updates -> guest memory, with its barriers)");
     gp.items = (int)(ub_updates.size() - ub_first_of_recording);
     full_barrier(cmd);
-    for (size_t i = ub_first_of_recording; i < ub_updates.size(); i++)
-        gpu_write(cmd, ub_updates[i].dst, ub_updates[i].bytes.data(), ub_updates[i].bytes.size()), gp.bytes += ub_updates[i].bytes.size();
+    // (relink) The game updates one uniform block many times a recording, and two updates of the same bytes with no barrier
+    // between may land in either order (a driver that runs vkCmdUpdateBuffer as a copy): the older bytes could stay for the next
+    // frames. Updates that overlap, one by one or through a chain of them, are composed on the CPU in stream order into one write
+    // over their union; the others are written as they are. RX_VK_UB_ORDER_OFF=1: each written as it comes, as before.
+    static const bool order_off = getenv("RX_VK_UB_ORDER_OFF") != nullptr;
+    const size_t first = ub_first_of_recording, last = ub_updates.size();
+    std::vector<size_t> by_dst;
+    if (!order_off) {
+        for (size_t i = first; i < last; i++)
+            if (!ub_updates[i].bytes.empty()) by_dst.push_back(i);
+        std::stable_sort(by_dst.begin(), by_dst.end(), [](size_t a, size_t b) { return ub_updates[a].dst < ub_updates[b].dst; });
+    }
+    if (order_off || by_dst.size() < 2) {
+        for (size_t i = first; i < last; i++)
+            gpu_write(cmd, ub_updates[i].dst, ub_updates[i].bytes.data(), ub_updates[i].bytes.size()), gp.bytes += ub_updates[i].bytes.size();
+        full_barrier(cmd);
+        return;
+    }
+    static int64_t composed_groups = 0, composed_updates = 0;
+    std::vector<size_t> group;
+    std::vector<uint8_t> merged;
+    for (size_t k = 0; k < by_dst.size();) {
+        group.assign(1, by_dst[k]);
+        uint64_t lo = ub_updates[by_dst[k]].dst, hi = lo + ub_updates[by_dst[k]].bytes.size();
+        size_t j = k + 1;
+        for (; j < by_dst.size() && ub_updates[by_dst[j]].dst < hi; j++) {
+            group.push_back(by_dst[j]);
+            hi = std::max<uint64_t>(hi, ub_updates[by_dst[j]].dst + ub_updates[by_dst[j]].bytes.size());
+        }
+        k = j;
+        if (group.size() == 1) {
+            const UbUpdate& u = ub_updates[group[0]];
+            gpu_write(cmd, u.dst, u.bytes.data(), u.bytes.size()), gp.bytes += u.bytes.size();
+            continue;
+        }
+        std::sort(group.begin(), group.end());   // (stream order: the later update's bytes win)
+        if (hi - lo > (1ull << 20)) {   // (a union that long: written one by one, gpu_write puts a barrier between overlapping ones)
+            for (size_t i : group)
+                gpu_write(cmd, ub_updates[i].dst, ub_updates[i].bytes.data(), ub_updates[i].bytes.size()), gp.bytes += ub_updates[i].bytes.size();
+            continue;
+        }
+        merged.assign((size_t)(hi - lo), 0);
+        for (size_t i : group)
+            std::memcpy(merged.data() + (ub_updates[i].dst - lo), ub_updates[i].bytes.data(), ub_updates[i].bytes.size());
+        gpu_write(cmd, lo, merged.data(), merged.size()), gp.bytes += merged.size();
+        composed_groups++, composed_updates += (int64_t)group.size();
+        if (composed_groups % 20000 == 1)
+            logf("vk: uniform updates composed in stream order: %lld groups from %lld updates", (long long)composed_groups,
+                 (long long)composed_updates);
+    }
     full_barrier(cmd);
 }
 
@@ -1029,6 +1104,8 @@ void log_stage_bind(uint32_t op, int stage) {
 }
 
 void maybe_split(VkCommandBuffer& cmd);
+void split_part(VkCommandBuffer& cmd);   // (a part's end: maybe_split says when, replay() on Intel, right before a plain draw)
+bool part_end_wanted = false;
 
 /// The handles already stored, so a rebind of the same ones does not rebuild descriptors
 bool handles_unchanged(const uint64_t* have, const uint64_t* next, int n) {
@@ -1052,6 +1129,11 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         std::memcpy(&h, p, sizeof h);
         const uint8_t* a = p + 8;
         const uint32_t avail = h.size - 8;
+        // (relink) the part's end maybe_split asked for: here, right before a draw with a vertex stage that will be recorded, so
+        // the next part does not begin with a mesh draw or a dispatch (see part_ends_before_draw)
+        if (!dry && !worker && part_end_wanted && (h.op == NOP_DRAW || h.op == NOP_DRAW_IDX || h.op == NOP_DRAW_INDIRECT) &&
+            s.render_enabled && !s.raster_discard)
+            split_part(cmd);
         switch (h.op) {
         case NOP_END: return;
         case NOP_BEGIN: case NOP_JUMP: case NOP_CALL: break;
@@ -1253,7 +1335,12 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         }
         case NOP_COPY_B2T: if (!dry) { ParLock lk; copy_b2t(cmd, s, payload<nvn_p_copy_bt>(a, avail), true); } break;
         case NOP_COPY_T2B: if (!dry) { ParLock lk; copy_b2t(cmd, s, payload<nvn_p_copy_bt>(a, avail), false); } break;
-        case NOP_COPY_T2T: if (!dry) { ParLock lk; copy_t2t(cmd, s, payload<nvn_p_copy_tt>(a, avail)); } break;
+        case NOP_COPY_T2T: {
+            ParLock lk;
+            if (dry) dry_mark_copy_target(payload<nvn_p_copy_tt>(a, avail));
+            else copy_t2t(cmd, s, payload<nvn_p_copy_tt>(a, avail));
+            break;
+        }
         case NOP_CLEAR_TEX: if (!dry) { ParLock lk; clear_tex(cmd, s, payload<nvn_p_clear_tex>(a, avail)); } break;
         case NOP_UPDATE_UB: {
             if (worker) {   // (appended by the dry pass: the draws after it read it from here on)
@@ -1643,15 +1730,50 @@ int par_max_batch() {
     return n;
 }
 
+/// (relink) Whether a part ends only right before a plain draw (one with a vertex stage), so no cut leaves a part beginning with a
+/// mesh draw or a dispatch. On an Intel Arc B580 a command buffer whose first commands were mesh draws drew every plain draw after
+/// them as exploded triangles (white shards over the scene in Kokiri Forest while moving, a few frames in a hundred), whenever the
+/// 120th draw or dispatch fell among the depth pre-pass's mesh draws or on the culling dispatch before them. Intel only by default:
+/// RX_VK_SPLIT_BEFORE_DRAW=1 turns it on elsewhere, =0 off (a part ends after its 120th draw or dispatch, as before)
+bool part_ends_before_draw() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_SPLIT_BEFORE_DRAW");
+        return e ? atoi(e) != 0 : dev.props.vendorID == 0x8086;
+    }();
+    return on;
+}
+
 void maybe_split(VkCommandBuffer& cmd) {
     static const int64_t every = getenv("RX_VK_CHUNK") ? atoll(getenv("RX_VK_CHUNK")) : 120;
     if (!rec_cur || every <= 0 || ++part_work < every || rec_parts + 1 >= kMaxParts || dump_on()) return;
+    if (part_ends_before_draw()) {   // (at the next plain draw: replay(); the submission's end comes first when none follows)
+        part_end_wanted = true;
+        return;
+    }
+    split_part(cmd);
+}
+
+/// The recording's part ends here and the submission goes on in a new one (maybe_split says when)
+void split_part(VkCommandBuffer& cmd) {
+    part_end_wanted = false;
+    // (asked for in another command buffer of the submission: what maybe_split refuses is refused here too)
+    if (!rec_cur || rec_parts + 1 >= kMaxParts || dump_on()) return;
     end_pass(cmd);
-    flush_ub_updates(cmd);
+    // (relink) On a GPU whose buffer pools have no VRAM mirror (the Intel iGPUs) a part's end does not write the stream's uniform
+    // updates so far into guest memory, nor start a new window of them: the last part writes them all, as an unsplit submission
+    // does (finish_recording). Written at each part's end there, Kokiri Forest showed white blocks and a white flash every 8 frames:
+    // later parts' storage, vertex or texture reads of an updated range, and the game's own CPU reads, saw a state an unsplit
+    // submission never shows. Seen on Intel without mirrors only, so the default stays as before elsewhere.
+    // RX_VK_SPLIT_UBFLUSH=1: written at each part's end as before, =0: by the last part on any GPU
+    static const bool part_flush = [] {
+        const char* e = getenv("RX_VK_SPLIT_UBFLUSH");
+        return e ? atoi(e) != 0 : dev.props.vendorID != 0x8086 || pools_mirrored();
+    }();
+    if (part_flush) flush_ub_updates(cmd);
     memory_end_submission(cmd);
     full_barrier(cmd, "barrier (recording end)");
     submit_recording(*rec_cur, false);
-    ub_first_of_recording = ub_updates.size();
+    if (part_flush) ub_first_of_recording = ub_updates.size();
     Recording& r = begin_recording(rec_cur_value);
     memory_begin_submission();
     full_barrier(r.cmd, "barrier (recording start)");
@@ -1981,6 +2103,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
                 texture_segment_worker(-1);
                 vkEndCommandBuffer(j->r->upload);
                 gpu_time_end(*j->r);   // (relink: see begin_segment_recording)
+                host_read_barrier(c);
                 vkEndCommandBuffer(j->r->cmd);
                 j->t1 = std::chrono::steady_clock::now();
                 {
@@ -2083,7 +2206,7 @@ void bench_replay(const std::vector<uint64_t>& handles) {
     Recording& first = begin_recording(value);
     memory_begin_submission();
     full_barrier(first.cmd);
-    rec_cur = &first, rec_cur_value = value, rec_parts = 0, part_work = 0;
+    rec_cur = &first, rec_cur_value = value, rec_parts = 0, part_work = 0, part_end_wanted = false;
     VkCommandBuffer cmd = first.cmd;
     for (uint64_t h : handles)
         if (h) replay(cmd, *cur_state, reinterpret_cast<const uint8_t*>(h));
@@ -2369,7 +2492,7 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
         texture_defrag_step();   // (relink, RX_VK_DEFRAG: nothing recorded yet)
         memory_begin_submission();
         full_barrier(first.cmd, "barrier (recording start)");
-        rec_cur = &first, rec_cur_value = tag, rec_parts = 0, part_work = 0;
+        rec_cur = &first, rec_cur_value = tag, rec_parts = 0, part_work = 0, part_end_wanted = false;
     }
     VkCommandBuffer cmd = rec_cur->cmd;
     const uint8_t* stop = nullptr;
