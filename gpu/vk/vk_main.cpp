@@ -99,6 +99,23 @@ namespace {
 // takes a null module for a failed program), logged with the SPIR-V kept beside the game for us (the first two), and said once in
 // a box, with what it likely means on a GPU below the minimum. RX_VK_NO_MODULE_GUARD=1: the driver's pointer as before
 bool amd_gcn = false;   // (an AMD GPU with only 64-lane subgroups and no mesh shaders: GCN, RX 400 / 500 / Vega; create_device)
+// (relink) AMD's Windows driver loses the device or times out on task + mesh draws on RDNA 2 (RX 6000 cards: players report device lost
+// within minutes of play on an RX 6800 XT class card; the compute fallback did not). So those
+// chips draw them through the fallback by default. It costs some frame rate (not measured here).
+// FLIP THIS to false to give the native mesh shaders back by default. RX_VK_FORCE_MESH_FALLBACK=1 / =0 decide over it either way
+constexpr bool kMeshFallbackOnAmdNavi2x = true;
+/// Navi 21 (RX 6800 / 6900 / 6950 and Pro), Navi 22 (RX 6700) and Navi 23 (RX 6600) device ids; Navi 24 (RX 6400 / 6500 XT) is left out
+#ifdef _WIN32
+static bool amd_navi2x_mesh_fallback(uint32_t vendor, uint32_t device) {
+    if (vendor != 0x1002) return false;
+    switch (device) {
+    case 0x73bf: case 0x73af: case 0x73a5: case 0x73a1: case 0x73a2: case 0x73a3: case 0x73ab: case 0x73ae:   // Navi 21
+    case 0x73df:                                                                                               // Navi 22
+    case 0x73e0: case 0x73e1: case 0x73e3: case 0x73ef: case 0x73ff: return true;                               // Navi 23
+    default: return false;
+    }
+}
+#endif
 #ifdef _WIN32
 PFN_vkCreateShaderModule driver_create_shader_module = nullptr;
 std::atomic<int> module_faults{0};
@@ -352,7 +369,16 @@ bool create_device() {
     };
     // (RX_VK_FORCE_MESH_FALLBACK=1, a test: mesh shaders not used where they are, so the no-mesh fallback the GTX 10xx and RX 5000
     // cards run (issue 640) can be tried on any GPU)
-    if (getenv("RX_VK_FORCE_MESH_FALLBACK") && atoi(getenv("RX_VK_FORCE_MESH_FALLBACK")) != 0) dev.mesh_shader = false;
+    bool force_fallback = false;
+#ifdef _WIN32
+    force_fallback = kMeshFallbackOnAmdNavi2x && amd_navi2x_mesh_fallback(dev.props.vendorID, dev.props.deviceID);
+    const char* force_env = getenv("RX_VK_FORCE_MESH_FALLBACK");
+    if (force_fallback && !force_env)
+        logf("vk: AMD RDNA 2 (device %#x) on Windows: task and mesh programs run as compute shaders, as the driver's mesh path lost the "
+             "device there (RX_VK_FORCE_MESH_FALLBACK=0: the driver's mesh shaders)", (unsigned)dev.props.deviceID);
+#endif
+    if (const char* e = getenv("RX_VK_FORCE_MESH_FALLBACK")) force_fallback = atoi(e) != 0;   // (the switch decides both ways)
+    if (force_fallback) dev.mesh_shader = false;
     else optional(VK_EXT_MESH_SHADER_EXTENSION_NAME, dev.mesh_shader);
     optional(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME, dev.external_memory_host);
     optional(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, dev.external_memory_fd);   // (guest memory as udmabufs: vk_memory.cpp import_dma_buf)
