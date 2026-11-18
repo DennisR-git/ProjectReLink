@@ -218,7 +218,8 @@ void to_general(VkCommandBuffer cmd, VkImage image) {
 }
 
 bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
-    if (fg.w == w && fg.h == h && fg.mult == multiplier()) return true;
+    const int want = multiplier();   // (read once: the menu runs on another thread)
+    if (fg.w == w && fg.h == h && fg.mult == want) return true;
     {   // (the display thread is done with the old sets first)
         std::unique_lock lk(fg.mu);
         fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy && !fg.sets[2].busy; });
@@ -241,7 +242,7 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
         ok = ok && make_img(fg.lumas[i], qw, qh, VK_FORMAT_R16_SFLOAT, rw);
         ok = ok && make_img(fg.flows[i], cw, ch, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
     }
-    fg.mult = multiplier();
+    fg.mult = want;
     for (OutSet& set : fg.sets)
         for (int k = 0; k < fg.mult; k++)
             ok = ok && make_img(set.frame[k], w, h, VK_FORMAT_R8G8B8A8_UNORM,
@@ -661,7 +662,11 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         set->busy = true;
         fg.next_set = (fg.next_set + 1) % 3;
     }
-    const int cur = fg.cur, prev = cur ^ 1, m = multiplier();
+    // (relink) the multiplier the sets were made for (ensure_size above), not the menu's row read again: the menu runs on another
+    // thread and a step up in the wait for a free set made m one more than the images made, and the last copy went to an image
+    // that was never made (a crash in the driver)
+    static const bool live_mult = getenv("RX_VK_FG_LIVE_MULT") != nullptr;   // (as before)
+    const int cur = fg.cur, prev = cur ^ 1, m = live_mult ? multiplier() : fg.mult;
     const bool blend = fg.have_prev && !gap;
     const uint32_t uw = (uint32_t)w, uh = (uint32_t)h;
     const uint32_t qw = (uw + 3) / 4, qh = (uh + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
