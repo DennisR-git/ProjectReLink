@@ -419,6 +419,28 @@ void EmitMeshFallbackVertexBody(EmitContext& ctx) {
             }
         }
     }
+    // (relink) every generic output starts at (0,0,0,1) and the point size at 1, as a vertex stage's unwritten components are: the
+    // record's lines are stored over them below. The ones no line writes were whatever the registers held on AMD's Windows driver
+    // (specks of colour in bushes on an RX 5500M). RX_VK_MESH_NO_VTX_INIT=1: as before
+    if (!std::getenv("RX_VK_MESH_NO_VTX_INIT")) {
+        for (u32 index = 0; index < IR::NUM_GENERICS; ++index) {
+            for (u32 element = 0; element < 4; ++element) {
+                const GenericElementInfo& info{ctx.output_generics[index][element]};
+                if (!Sirit::ValidId(info.id)) {
+                    continue;
+                }
+                const Id init{element == 3 ? ctx.Const(1.0f) : ctx.f32_zero_value};
+                if (info.num_components == 1) {
+                    ctx.OpStore(info.id, init);
+                } else {
+                    ctx.OpStore(ctx.OpAccessChain(ctx.output_f32, info.id, ctx.Const(element - info.first_element)), init);
+                }
+            }
+        }
+        if (Sirit::ValidId(ctx.output_point_size)) {
+            ctx.OpStore(ctx.output_point_size, ctx.Const(1.0f));
+        }
+    }
     const MeshInfo& mesh{ctx.mesh_info};
     const u32 corners{mesh.Corners()};
     const u32 vertex_lines{static_cast<u32>(mesh.vertex_lines.size())};
