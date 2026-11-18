@@ -531,7 +531,7 @@ Shader::Profile make_profile() {
     p.lower_left_origin_mode = false;
     p.need_declared_frag_colors = false;
     p.max_subgroup_size = 32;
-    p.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
+    p.min_ssbo_alignment = storage_binding_align();
     p.support_maximal_reconvergence = dev.max_reconvergence;
     p.support_float32_atomic_add = dev.float_atomic_add && !getenv("EDEN_NX2_NO_FADD");   // (relink: native float adds)
     // (relink) gathers nudged by 1/512 of a texel on AMD's and Intel's drivers, so the four texels a gather picks match Maxwell's at
@@ -572,7 +572,7 @@ Shader::HostTranslateInfo host_info() {
     h.needs_demote_reorder = false;
     h.support_snorm_render_buffer = true;
     h.support_viewport_index_layer = true;
-    h.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
+    h.min_ssbo_alignment = storage_binding_align();
     h.support_geometry_shader_passthrough = false;
     h.support_conditional_barrier = true;   // (barriers in loops kept: see the WebGPU renderer's 4f5e3e6)
     h.support_lookup_tables = lookup_tables_on();
@@ -1092,6 +1092,8 @@ uint64_t disk_stamp() {
                                (dev.big_warp ? 8u : 0u) | (fetch_bounds ? 16u : 0u) | (nan_bits ? 32u : 0u) |
                                (dev.gather_offset ? 64u : 0u) | (fetch_bounds_buffers ? 128u : 0u);   // (and the vendor fixes: coopmat_init)
         add(&flags, sizeof flags);
+        const uint64_t ssbo_align = storage_binding_align();   // (relink: the translator reads storage vectors at this alignment)
+        add(&ssbo_align, sizeof ssbo_align);
         add(mma_order_a.data(), sizeof(uint32_t) * mma_order_a.size());
         add(mma_order_b.data(), sizeof(uint32_t) * mma_order_b.size());
         add(mma_order_c.data(), sizeof(uint32_t) * mma_order_c.size());
