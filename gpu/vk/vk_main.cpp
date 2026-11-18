@@ -99,9 +99,9 @@ namespace {
 // takes a null module for a failed program), logged with the SPIR-V kept beside the game for us (the first two), and said once in
 // a box, with what it likely means on a GPU below the minimum. RX_VK_NO_MODULE_GUARD=1: the driver's pointer as before
 bool amd_gcn = false;   // (an AMD GPU with only 64-lane subgroups and no mesh shaders: GCN, RX 400 / 500 / Vega; create_device)
-// (relink) AMD's Windows driver loses the device or times out on task + mesh draws on RDNA 2 (RX 6000 cards: players report device lost
-// within minutes of play on an RX 6800 XT class card; the compute fallback did not). So those
-// chips draw them through the fallback by default. It costs some frame rate (not measured here).
+// (relink, issues 45 66 79 80 107) AMD's Windows driver loses the device or times out on RX 6000 cards (RDNA 2), and every hang
+// report names task + mesh draws as the work in flight. Those chips draw them through the compute fallback by default (the GTX 10
+// and RX 5000 path). It costs frame rate (not measured here: no AMD card on the bench), and whether it ends the hangs waits on testers.
 // FLIP THIS to false to give the native mesh shaders back by default. RX_VK_FORCE_MESH_FALLBACK=1 / =0 decide over it either way
 constexpr bool kMeshFallbackOnAmdNavi2x = true;
 /// Navi 21 (RX 6800 / 6900 / 6950 and Pro), Navi 22 (RX 6700) and Navi 23 (RX 6600) device ids; Navi 24 (RX 6400 / 6500 XT) is left out
