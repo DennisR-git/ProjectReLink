@@ -421,6 +421,14 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
     if (pass_trace_on())   // (relink, diagnostic)
         trace_line("clear tex #%u %#llx %ux%u f%#x%s", s.tex->id, (unsigned long long)s.tex->gpu, s.tex->width, s.tex->height,
                    s.tex->nvn_format, s.tex->released ? " (finalized)" : "");
+    {   // (relink) An image kept in ASTC blocks cannot be cleared: vkCmdClearColorImage takes no compressed format, and the region
+        // path below knows BC blocks only. Left as it is. RX_VK_CLEAR_ASTC=1: cleared as before
+        static const bool as_before = getenv("RX_VK_CLEAR_ASTC") != nullptr;
+        if (!as_before && s.tex->format >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && s.tex->format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) {
+            warn(14, "clear of a texture kept in ASTC blocks: skipped");
+            return;
+        }
+    }
     end_pass(cmd);
     GprofSpan gp(cmd, "xfer clear texture (with its barriers)");
     full_barrier(cmd);
