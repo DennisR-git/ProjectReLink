@@ -644,6 +644,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     if (uploads) checkpoint_note(r.upload, r.value, 'F', "its uploads");
     checkpoint_note(r.cmd, r.value, 'F', "its draws and dispatches");
     vkEndCommandBuffer(r.upload);
+    host_read_barrier(r.cmd);
     vkEndCommandBuffer(r.cmd);
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     signal.semaphore = timeline;
@@ -792,6 +793,21 @@ void gpu_write(VkCommandBuffer cmd, uint64_t gpu, const void* data, uint64_t n) 
         }
         gpu += k, d += k, n -= k;
     }
+}
+
+/// (relink) The game reads what the GPU wrote into its memory (copies to buffers, queries, write-backs) once the timeline reaches a
+/// submission. A host wait only makes device writes visible to the device, so each recording ends with a memory dependency into
+/// the host's reads, or a GPU whose caches are not flushed by chance could hand the game stale bytes.
+/// RX_VK_NO_HOST_READ_BARRIER=1: none, as before
+void host_read_barrier(VkCommandBuffer cmd) {
+    static const bool off = getenv("RX_VK_NO_HOST_READ_BARRIER") != nullptr;
+    if (off) return;
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, b.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT, b.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
+    VkDependencyInfo d{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    d.memoryBarrierCount = 1, d.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &d);
 }
 
 // ---- uniform updates (UPDATE_UB): written at the end of their recording; ub_overlay applies them to copies ----
@@ -2040,6 +2056,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
                 texture_segment_worker(-1);
                 vkEndCommandBuffer(j->r->upload);
                 gpu_time_end(*j->r);   // (relink: see begin_segment_recording)
+                host_read_barrier(c);
                 vkEndCommandBuffer(j->r->cmd);
                 j->t1 = std::chrono::steady_clock::now();
                 {
