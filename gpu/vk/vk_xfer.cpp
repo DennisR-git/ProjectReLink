@@ -348,6 +348,21 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
     texture_written(d.tex);
 }
 
+// (relink) The parallel replay's dry pass, in stream order: the destination of a texture-to-texture copy marked as the GPU's
+// (texture_written), as dry_mark_written does for a draw's targets. Segments record out of order, and a later segment that
+// samples this texture before the copy's own segment has recorded it found it never written and uploaded stale guest memory
+// over it, an upload that runs after the earlier segment's copy: a scene target black for a frame. RX_VK_NO_DRY_XFER_MARKS=1: as before
+void dry_mark_copy_target(const nvn_p_copy_tt& p) {
+    static const bool off = getenv("RX_VK_NO_DRY_XFER_MARKS") != nullptr;
+    if (off || !p.dst || !p.dst->gpu) return;
+    Texture* tex = texture_get(p.dst, false);
+    if (!tex) return;
+    const unsigned level = view_level(p.has_dv ? &p.dv : nullptr);
+    // (what copy_t2t's resolve refuses: a level the image left out that is not scaled into its first one, or one past its end)
+    if (level < tex->skip ? (tex->bc || tex->type != VK_IMAGE_TYPE_2D) : level >= tex->skip + tex->levels) return;
+    texture_written(tex);
+}
+
 void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
     Sub s;
     if (!resolve(p.tex, &p.view, p.has_view != 0, p.r, s, false, true)) return;
