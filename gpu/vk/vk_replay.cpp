@@ -637,6 +637,7 @@ Recording& begin_recording(uint64_t value) {
     draw_begin_recording(r.slot, r.cmd, value);
     return r;
 }
+void host_read_barrier(VkCommandBuffer cmd);   // (below: the recording's writes made visible to the game's reads)
 void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at = 0) {
     const bool uploads = texture_uploads_recorded();
     gprof_submitted(r.slot, uploads);
