@@ -153,6 +153,10 @@ struct State {
     // (DLSS failed, FSR failed: that one's upscale is left to the network from then on, the other can still be chosen. Atomic:
     // dlss_jitter_size reads them on the game's thread, without the lock)
     std::atomic<bool> failed{false}, fsr_failed{false};
+    // (relink) The preset and output a feature creation failed for (a key; 0: none): not tried again each frame (a try is tens of ms),
+    // but once the preset or output changes, so a failure, out of video memory after quick menu switches say, does not turn DLSS off
+    // until a restart. RX_VK_DLSS_RETRY=0: as before, a failed creation fails DLSS for the run
+    uint64_t refused = 0;
 #ifdef RELINK_NGX
     NVSDK_NGX_Parameter* caps = nullptr;
     NVSDK_NGX_Parameter* params = nullptr;
@@ -763,6 +767,8 @@ bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, ui
     if (s.feature && s.feature_ow == ow && s.feature_oh == oh && rw <= s.feature_rw && rh <= s.feature_rh &&
         rw >= s.min_rw && rh >= s.min_rh && s.feature_preset == preset)
         return true;
+    const uint64_t refused_key = (uint64_t)ow << 40 ^ (uint64_t)oh << 16 ^ (uint64_t)preset ^ 1ull << 63;
+    if (s.refused == refused_key) return fail("its feature was not made");
     // (why it is made: in the log with its time, so a stall in play can be matched with one)
     char why[160];
     if (!s.feature && !s.features_made) snprintf(why, sizeof why, "the first");
@@ -831,9 +837,15 @@ bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, ui
     if (NVSDK_NGX_FAILED(r) || !s.feature) {
         logf("vk: NVIDIA DLSS: its feature was not made (%#x) for %ux%u -> %ux%u", (unsigned)r, max_w, max_h, ow, oh);
         s.feature = nullptr;
-        s.failed = true;
-        return false;
+        static const bool retry = !(getenv("RX_VK_DLSS_RETRY") && atoi(getenv("RX_VK_DLSS_RETRY")) == 0);
+        if (!retry) {
+            s.failed = true;
+            return false;
+        }
+        s.refused = refused_key;
+        return fail("its feature was not made");   // (the game's upscale until the preset or output changes)
     }
+    s.refused = 0;
     s.feature_rw = max_w, s.feature_rh = max_h, s.feature_ow = ow, s.feature_oh = oh, s.min_rw = min_w, s.min_rh = min_h;
     s.feature_preset = preset;
     s.features_made++;

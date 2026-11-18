@@ -170,7 +170,11 @@ bool buffer_side(const NvnState& st, const Sub& s, uint64_t addr, uint64_t& size
         warn(3, "copy row stride does not fit the level's blocks: skipped");
         return false;
     }
-    size = row * hb * s.layers * s.d;
+    // (relink) What the copy touches ends with its last row's real bytes: the stride padding after that row is never read or
+    // written, and counted in the span it could cross the pool's end and skip a copy that fits. RX_VK_COPY_FULL_SPAN=1: as before
+    static const bool full_span = getenv("RX_VK_COPY_FULL_SPAN") != nullptr;
+    const uint64_t rows = (uint64_t)hb * s.layers * s.d;
+    size = full_span ? row * rows : row * (rows - 1) + (uint64_t)wb * s.bpb;
     span = gpu_buffer_bind(addr, size, written);
     if (!addr || !span) {
         warn(3, "copy buffer is not one mapped pool span: skipped");

@@ -1972,6 +1972,9 @@ uint32_t aniso_override() {
 }
 /// compare: the shader reads depth with a reference (a sampler without one cannot compare)
 VkSampler sampler_make(int id, bool compare);
+// (relink) set by sampler_make when its sampler could not be made and a stand-in is returned: not kept anywhere, asked for again
+// at the next use (RX_VK_SAMPLER_RETRY=0: a failure is kept as it was)
+thread_local bool sampler_stand_in = false;
 // (each texture of each draw found its sampler through reg_mu, a copy of the registration, a hash of it and a map lookup:
 // ~48000 times a frame at 3000 draws. Now a thread's table by id and compare, good while no sampler registration's contents
 // changed (sampler_registrations_generation). RX_VK_SAMPLER_CACHE=0: off)
@@ -1985,10 +1988,11 @@ VkSampler sampler_for(int id, bool compare) {
     Entry& e = table[compare ? 1 : 0][id];
     if (e.gen == gen && e.bias == bias) return e.s;
     const VkSampler made = sampler_make(id, compare);
-    e = {gen, bias, made};
+    if (!sampler_stand_in) e = {gen, bias, made};
     return made;
 }
 VkSampler sampler_make(int id, bool compare) {
+    sampler_stand_in = false;
     nvn_samp_par p{};
     if (!sampler_of(id, &p)) p.minf = NVN_MIN_FILTER_LINEAR, p.magf = NVN_MAG_FILTER_LINEAR, p.lod_max = 1000.0f;
     // (relink) DLSS / FSR drawing: the mipmapped textures' bias lowered by upscaler_lod_bias (vk_dlss.cpp), so the upscaled
@@ -2074,7 +2078,30 @@ VkSampler sampler_make(int id, bool compare) {
         ci.pNext = &rm;
     }
     VkSampler sm = VK_NULL_HANDLE;
-    vkCreateSampler(dev.device, &ci, nullptr, &sm);
+    const VkResult made = vkCreateSampler(dev.device, &ci, nullptr, &sm);
+    static const bool retry = !(getenv("RX_VK_SAMPLER_RETRY") && atoi(getenv("RX_VK_SAMPLER_RETRY")) == 0);
+    if (retry && (made != VK_SUCCESS || !sm)) {
+        // (relink) A failed creation (the driver's limit on samplers, memory) kept as a null sampler dropped every draw with this
+        // state for the rest of the run. Not kept: tried again at the next use, and a plain sampler of a kind a draw can use (nearest
+        // or linear, clamped, comparing or not) stands in meanwhile
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 8)
+            logf("vk: a sampler was not made (%d): a plain one stands in, and it is tried again at its next use", (int)made);
+        static VkSampler plain[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+        VkSampler& pl = plain[compare ? 1 : 0];
+        if (!pl) {
+            VkSamplerCreateInfo pi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            pi.magFilter = pi.minFilter = VK_FILTER_LINEAR;
+            pi.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            pi.addressModeU = pi.addressModeV = pi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            pi.compareEnable = compare ? VK_TRUE : VK_FALSE;
+            pi.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+            pi.maxLod = VK_LOD_CLAMP_NONE;
+            if (vkCreateSampler(dev.device, &pi, nullptr, &pl) != VK_SUCCESS) pl = VK_NULL_HANDLE;
+        }
+        sampler_stand_in = true;
+        return pl;
+    }
     samplers.emplace(key, sm);
     return sm;
 }
@@ -4329,6 +4356,12 @@ std::vector<uint32_t> spirv_location(const uint32_t* w, size_t n, uint32_t locat
 
 std::unordered_map<uint64_t, VkPipeline> clear_pipes;
 VkPipelineLayout clear_layout = VK_NULL_HANDLE;
+// (relink) A masked clear's pipeline that the driver did not make is not kept as null (its clear was then left out for the rest of the
+// run after one transient failure): the key is tried again at its next clears, kClearTries times in a row, then backs off to one try
+// in kClearRetryEvery of its clears, which keeps a driver that never makes it off the per-frame path. RX_VK_CLEAR_RETRY=0: as before
+struct ClearFailure { int tries = 0, waited = 0; };
+std::unordered_map<uint64_t, ClearFailure> clear_failures;
+constexpr int kClearTries = 3, kClearRetryEvery = 600;
 
 VkPipeline clear_pipeline(const Targets& at, int index, uint32_t mask, int kind) {
     uint64_t key = mix((uint64_t)index << 8 | mask << 4 | (uint64_t)kind, (uint64_t)at.samples);
@@ -4336,12 +4369,26 @@ VkPipeline clear_pipeline(const Targets& at, int index, uint32_t mask, int kind)
     key = mix(key, (uint64_t)at.depth_format);
     auto it = clear_pipes.find(key);
     if (it != clear_pipes.end()) return it->second;
+    static const bool retry = !(getenv("RX_VK_CLEAR_RETRY") && atoi(getenv("RX_VK_CLEAR_RETRY")) == 0);
+    ClearFailure& failed = clear_failures[key];
+    if (retry && failed.tries >= kClearTries && ++failed.waited < kClearRetryEvery) return VK_NULL_HANDLE;
+    failed.waited = 0;
+    const auto fail = [&](const char* what, VkResult r) -> VkPipeline {
+        if (++failed.tries == kClearTries)
+            logf("vk: masked clear: no %s (VkResult %d); this clear is left out, tried again every %d of its clears", what, (int)r,
+                 kClearRetryEvery);
+        if (!retry) clear_pipes[key] = VK_NULL_HANDLE;
+        return VK_NULL_HANDLE;
+    };
     if (!clear_layout) {
         const VkPushConstantRange r{VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
         VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         li.pushConstantRangeCount = 1;
         li.pPushConstantRanges = &r;
-        vkCreatePipelineLayout(dev.device, &li, nullptr, &clear_layout);
+        VkPipelineLayout made = VK_NULL_HANDLE;
+        const VkResult lr = vkCreatePipelineLayout(dev.device, &li, nullptr, &made);
+        if (lr != VK_SUCCESS || !made) return fail("pipeline layout", lr);
+        clear_layout = made;
     }
     const uint32_t* fw = kind == 1 ? CLEAR_U_FRAG_SPV : kind == 2 ? CLEAR_I_FRAG_SPV : CLEAR_F_FRAG_SPV;
     const size_t fn = (kind == 1 ? sizeof CLEAR_U_FRAG_SPV : kind == 2 ? sizeof CLEAR_I_FRAG_SPV : sizeof CLEAR_F_FRAG_SPV) / 4;
@@ -4349,9 +4396,14 @@ VkPipeline clear_pipeline(const Targets& at, int index, uint32_t mask, int kind)
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     VkShaderModule vm = VK_NULL_HANDLE, fm = VK_NULL_HANDLE;
     mi.codeSize = sizeof CLEAR_VERT_SPV, mi.pCode = CLEAR_VERT_SPV;
-    vkCreateShaderModule(dev.device, &mi, nullptr, &vm);
+    const VkResult vr = vkCreateShaderModule(dev.device, &mi, nullptr, &vm);
+    if (retry && (vr != VK_SUCCESS || !vm)) return fail("vertex module", vr);
     mi.codeSize = frag.size() * 4, mi.pCode = frag.data();
-    vkCreateShaderModule(dev.device, &mi, nullptr, &fm);
+    const VkResult fr = vkCreateShaderModule(dev.device, &mi, nullptr, &fm);
+    if (retry && (fr != VK_SUCCESS || !fm)) {
+        if (vm) vkDestroyShaderModule(dev.device, vm, nullptr);
+        return fail("fragment module", fr);
+    }
     VkPipelineShaderStageCreateInfo st[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
                                           {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
     st[0].stage = VK_SHADER_STAGE_VERTEX_BIT, st[0].module = vm, st[0].pName = "main";
@@ -4387,9 +4439,14 @@ VkPipeline clear_pipeline(const Targets& at, int index, uint32_t mask, int kind)
     ci.pMultisampleState = &ms, ci.pDepthStencilState = &ds, ci.pColorBlendState = &bs, ci.pDynamicState = &dy;
     ci.layout = clear_layout;
     VkPipeline pl = VK_NULL_HANDLE;
-    vkCreateGraphicsPipelines(dev.device, pcache, 1, &ci, nullptr, &pl);
+    const VkResult pr = vkCreateGraphicsPipelines(dev.device, pcache, 1, &ci, nullptr, &pl);
     vkDestroyShaderModule(dev.device, vm, nullptr);
     vkDestroyShaderModule(dev.device, fm, nullptr);
+    if (retry && (pr != VK_SUCCESS || !pl)) {
+        if (pl) vkDestroyPipeline(dev.device, pl, nullptr);
+        return fail("pipeline", pr);
+    }
+    clear_failures.erase(key);
     clear_pipes[key] = pl;
     return pl;
 }
@@ -8327,7 +8384,20 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
     if (notes.empty() || getenv("RX_VK_NO_PREDICT")) return;
     size_t programs = 0;
-    const std::vector<std::unique_ptr<PipeNote>> predicted = predict_pipelines(notes, &programs);
+    size_t too_big = 0;
+    const std::vector<std::unique_ptr<PipeNote>> predicted = predict_pipelines(notes, &programs, &too_big);
+    // (relink) The driver's compiles take their memory from the system's commit, and a refused allocation hurts the game and every
+    // other program: stop predicting (the rest is built in play) when less than RX_VK_PREDICT_RESERVE_MB (3072; 0: no check) is left
+    static const unsigned long long reserve_mb =
+        getenv("RX_VK_PREDICT_RESERVE_MB") ? strtoull(getenv("RX_VK_PREDICT_RESERVE_MB"), nullptr, 10) : 3072;
+    std::atomic<bool> low_commit{false};
+    const auto commit_short = [&] {
+        if (!reserve_mb) return false;
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof ms;
+        if (!GlobalMemoryStatusEx(&ms)) return false;
+        return (unsigned long long)(ms.ullAvailPageFile >> 20) < reserve_mb;
+    };
     std::unordered_map<uint64_t, std::vector<const PipeNote*>> by_program;
     for (const auto& n : predicted) by_program[n->prog].push_back(n.get());
     std::vector<uint64_t> keys;
@@ -8348,6 +8418,10 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
                 out_of_time = true;
                 return;
             }
+            if (low_commit.load() || commit_short()) {
+                low_commit = true;
+                return;
+            }
             const size_t i = next++;
             if (i >= keys.size()) return;
             const auto& list = by_program[keys[i]];
@@ -8364,14 +8438,16 @@ void predict_run(void (*progress)(size_t done, size_t total)) {
     std::vector<std::thread> threads;
     const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
     for (unsigned i = 0; i < std::clamp(cpus / 2, 1u, 32u); i++) threads.emplace_back(worker);
-    while (next.load() < keys.size() + threads.size() && !prepare_stopped() && !out_of_time.load()) {
+    while (next.load() < keys.size() + threads.size() && !prepare_stopped() && !out_of_time.load() && !low_commit.load()) {
         if (progress) progress(done.load(), predicted.size());
         Sleep(100);
     }
     for (std::thread& t : threads) t.join();
-    logf("vk: predicted %zu pipelines from %zu notes for %zu program variants no note names: %zu made in %.1f s%s", predicted.size(),
+    logf("vk: predicted %zu pipelines from %zu notes for %zu program variants no note names: %zu made in %.1f s%s%s; %zu giant "
+         "programs left to play (RX_VK_PREDICT_MAX_KWORDS)", predicted.size(),
          notes.size(), programs, made.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-         out_of_time.load() ? " (the time budget, RX_VK_PREDICT_S, ran out: the rest are built in play)" : "");
+         out_of_time.load() ? " (the time budget, RX_VK_PREDICT_S, ran out: the rest are built in play)" : "",
+         low_commit.load() ? " (little commit left, RX_VK_PREDICT_RESERVE_MB: the rest are built in play)" : "", too_big);
 }
 
 // (relink) Compute pipelines made ahead. A dispatch's compute pipeline was made where the dispatch was, the first time: 0.5-6 s each
