@@ -1857,7 +1857,11 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     if (!p.mesh) {
         dyn.push_back(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY);
         dyn.push_back(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE);
-        dyn.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
+        // (relink) Not for the mesh fallback: its draws bind no vertex buffers, so nothing ever set a stride for a dynamic one to
+        // use (a validation error on every such draw). The ordinary draw after one binds its strides again (see the pipeline bind).
+        // RX_VK_FALLBACK_STRIDE=1: dynamic there too, as before
+        static const bool fb_stride = getenv("RX_VK_FALLBACK_STRIDE") != nullptr;
+        if (!p.fallback || fb_stride) dyn.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
     }
     if (dev.eds3_blend) {
         dyn.push_back(VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT);
@@ -6997,6 +7001,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_SCOPE(FT_BINDPL);
         FINE_N(FC_BIND_PIPE, 1);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl), last_pipeline = pl;
+        // (relink) A pipeline whose vertex strides are static leaves the dynamic ones undefined: the next ordinary draw binds its
+        // vertex streams again, though its buffers are the same as before the fallback's draw
+        if (p.fallback) last_vb_valid = false, vertex_set.on = false;
     }
     if (!same_desc) {
         FINE_SCOPE(FT_BINDDESC);
