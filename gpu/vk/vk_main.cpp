@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <vector>
@@ -82,6 +83,36 @@ void logf(const char* fmt, ...) {
     va_end(a);
     if (host) host->log(b);
 }
+
+#ifdef _WIN32
+// (relink) The renderer's C++ allocations at Windows' commit limit (RAM plus page file). An operator new that malloc refused
+// calls this each time and tries again when it returns; before, the refusal was a std::bad_alloc that nothing caught (exception
+// 0x20474343 in the renderer's DLL, the game closing at once). With the commit nearly all used it now waits 50 ms and lets the
+// allocation try again, for up to 5 s on a thread (a refusal more than 250 ms after the last one starts a new 5 s), then says
+// "out of memory" in the log and throws as before. A refusal with plenty of commit left is not the limit (a size gone wrong, as
+// a bad shader's): the std::bad_alloc at once, for the catch that holds it. The textures give back their memory on the replay
+// thread through the budget (vk_texture.cpp's commit headroom), not from here: this may run on any thread. RX_VK_NEW_WAIT=0: off
+static void new_refused() {
+    using clock = std::chrono::steady_clock;
+    static thread_local clock::time_point first, last;
+    static std::atomic<int> told{0};
+    const clock::time_point now = clock::now();
+    if (last == clock::time_point() || now - last > std::chrono::milliseconds(250)) first = now;
+    last = now;
+    MEMORYSTATUSEX m = {};
+    m.dwLength = sizeof m;
+    const long long left = GlobalMemoryStatusEx(&m) ? (long long)(m.ullAvailPageFile >> 20) : -1;
+    if (left < 0 || left > 4096) throw std::bad_alloc();
+    if (now - first >= std::chrono::seconds(5)) {
+        logf("mem: out of memory: the renderer's C++ allocations are still refused after 5 s at the commit limit (%lld MB of commit left): "
+             "close other programs, or let Windows manage the page file size", left);
+        throw std::bad_alloc();
+    }
+    if (told.fetch_add(1) < 8)
+        logf("vk: a C++ allocation refused at the commit limit (%lld MB of commit left): tried again for up to 5 s", left);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
+#endif
 
 // (relink) HDR output: VK_EXT_swapchain_colorspace enabled on the instance (the player asked for HDR and the loader has it), and
 // whether the swapchain now is HDR10 (A2B10G10R10, ST 2084) with the display's peak in nits (hdr_output, hdr_peak_nits)
@@ -1335,6 +1366,9 @@ const MkwVkRenderer* mkwvk_init(const MkwVkHost* h) {
     using namespace mkwvk;
     if (!h || h->version != MKWVK_API_VERSION) return nullptr;
     host = h;
+#ifdef _WIN32
+    if (!getenv("RX_VK_NEW_WAIT") || atoi(getenv("RX_VK_NEW_WAIT")) != 0) std::set_new_handler(new_refused);   // (new_refused, above)
+#endif
     if (!load_global()) {
         logf("vk: vulkan-1.dll not found");
         return nullptr;
