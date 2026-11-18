@@ -790,7 +790,7 @@ bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, ui
     const NVSDK_NGX_PerfQuality_Value* modes = aa ? same : scaled;
     const size_t nmodes = aa ? 2 : 5;
     NVSDK_NGX_PerfQuality_Value mode = modes[0];
-    unsigned max_w = 0, max_h = 0, min_w = 0, min_h = 0;
+    unsigned max_w = 0, max_h = 0, min_w = 0, min_h = 0, rec_w = 0, rec_h = 0;
     bool found = aa;
     if (aa) max_w = min_w = ow, max_h = min_h = oh;   // (DLAA: the render size is the output's, one size)
     for (size_t i = 0; i < nmodes && !found; i++) {
@@ -799,7 +799,7 @@ bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, ui
         float sharp = 0;
         if (NVSDK_NGX_FAILED(NGX_DLSS_GET_OPTIMAL_SETTINGS(s.caps, ow, oh, m, &w, &h, &xw, &xh, &nw, &nh, &sharp)) || !w) continue;
         if (rw >= nw && rh >= nh && rw <= xw && rh <= xh) {
-            mode = m, max_w = xw, max_h = xh, min_w = nw, min_h = nh, found = true;
+            mode = m, max_w = xw, max_h = xh, min_w = nw, min_h = nh, rec_w = w, rec_h = h, found = true;
             break;
         }
     }
@@ -813,7 +813,14 @@ bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, ui
                           NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality})
         NVSDK_NGX_Parameter_SetUI(s.params, k, preset);
     NVSDK_NGX_DLSS_Create_Params cp{};
-    cp.Feature.InWidth = max_w, cp.Feature.InHeight = max_h, cp.Feature.InTargetWidth = ow, cp.Feature.InTargetHeight = oh;
+    // (relink) A scaled mode's feature made at NGX's recommended render size for that mode, not the top of its range: models L
+    // and M cost less GPU time made so (K about the same; not measured here yet). The input images still cover the whole range
+    // (feature_rw/rh) and each upscale names its own render size, as
+    // NGX's dynamic resolution allows. DLAA keeps its one size. RX_VK_DLSS_CREATE_MAX=1: made at the range's top, as before
+    static const bool create_max = getenv("RX_VK_DLSS_CREATE_MAX") != nullptr;
+    const bool at_rec = !aa && !create_max && rec_w && rec_h && rec_w <= max_w && rec_h <= max_h;
+    cp.Feature.InWidth = at_rec ? rec_w : max_w, cp.Feature.InHeight = at_rec ? rec_h : max_h;
+    cp.Feature.InTargetWidth = ow, cp.Feature.InTargetHeight = oh;
     cp.Feature.InPerfQualityValue = mode;
     // (LDR colour, already tonemapped: no exposure; motion at the render size, not jittered; depth not reversed)
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
@@ -830,10 +837,10 @@ bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, ui
     s.feature_rw = max_w, s.feature_rh = max_h, s.feature_ow = ow, s.feature_oh = oh, s.min_rw = min_w, s.min_rh = min_h;
     s.feature_preset = preset;
     s.features_made++;
-    logf("vk: NVIDIA DLSS: feature %llu made (%s; frame %llu, %.1f ms of CPU): %ux%u (%ux%u to %ux%u) -> %ux%u, mode %d, "
-         "preset %c%s", (unsigned long long)s.features_made, why, (unsigned long long)texture_frame_no(), made_ms, rw, rh,
-         min_w, min_h, max_w, max_h, ow, oh, (int)mode, upscaler_rows::preset_letter(preset),
-         preset ? "" : " (NVIDIA's default)");
+    logf("vk: NVIDIA DLSS: feature %llu made (%s; frame %llu, %.1f ms of CPU): %ux%u (%ux%u to %ux%u, made at %ux%u) -> %ux%u, "
+         "mode %d, preset %c%s", (unsigned long long)s.features_made, why, (unsigned long long)texture_frame_no(), made_ms, rw, rh,
+         min_w, min_h, max_w, max_h, cp.Feature.InWidth, cp.Feature.InHeight, ow, oh, (int)mode,
+         upscaler_rows::preset_letter(preset), preset ? "" : " (NVIDIA's default)");
     s.last_frame = 0;   // (a new history)
     return true;
 }
@@ -1068,6 +1075,13 @@ void dlss_idle() {
     std::lock_guard lk(s.mu);
     const uint64_t now = texture_frame_no();
     if (now - s.asked <= 120) return;   // (DLSS in use, or off for under 120 frames (2 s): kept, a row stepped through comes back at once)
+    // (relink) Nor while the Upscaler row still names the backend it holds: a loading screen or a cutscene skips the upscale for
+    // a few seconds, and letting go there made the feature again at every area entry, 26 ms of the render thread each time
+    // (players' logs: "not used for 120 frames" then "feature N made (again after it was let go)" at each load). Let go when
+    // the row changes, as before. RX_VK_UPSCALER_IDLE_FREE=1: let go after 120 frames whatever the row says, as before
+    static const bool idle_free = getenv("RX_VK_UPSCALER_IDLE_FREE") != nullptr;
+    const int mode = dlss_mode();
+    if (!idle_free && mode != 0 && (s.fsr ? is_fsr(mode) : s.feature_ow && !is_fsr(mode))) return;
     if (s.fsr || s.feature_ow) {
         const char* name = s.fsr ? "AMD FSR" : "NVIDIA DLSS";
         drop_fsr();

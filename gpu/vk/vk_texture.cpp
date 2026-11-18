@@ -3360,6 +3360,26 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         }
     }
     watch_tex(tex, owned ? "sampled, over rendered storage" : "sampled, uploaded");
+    // (relink, issue 47, diagnosis) The terrain's normal tiles (260 x 260 RG8, NVN 0xd, a mip chain) are drawn by the GPU. One
+    // made from memory instead, its first level all zero there, is a tile the game copied with the CPU from a drawn one, whose
+    // texels were only in the image: the striped ground. Counted, the first 40 named
+    if (!tex->uploaded && !tex->gpu_written && !owned && tex->nvn_format == 0xd && tex->width == 260 && tex->height == 260 &&
+        tex->levels > 1) {
+        static thread_local std::vector<uint8_t> probe;
+        const uint64_t n = std::min<uint64_t>(tex->guest_size, 260ull * 260 * 2);
+        const uint8_t* b = guest_bytes(tex->gpu, n, probe);
+        bool zero = b != nullptr;
+        for (uint64_t i = 0; zero && i < n; i += 8) {
+            uint64_t w = 0;
+            std::memcpy(&w, b + i, std::min<uint64_t>(8, n - i));
+            zero = w == 0;
+        }
+        static std::atomic<int64_t> tiles{0}, zeros{0};
+        const int64_t t = ++tiles, z = zero ? ++zeros : zeros.load();
+        if (zero && z <= 40)
+            logf("vk: terrain tile #%u %#llx made from memory that is all zero (frame %llu; %lld such of %lld tiles made from "
+                 "memory)", tex->id, (unsigned long long)tex->gpu, (unsigned long long)frame_no, (long long)z, (long long)t);
+    }
     if (owned && !texture_dirty(*tex, owned, dirty)) {
         tex->uploaded = true;
         tex->upload_gen = gen;
@@ -4017,6 +4037,18 @@ void texture_written(Texture* tex) {
         trace_line("written #%u %#llx %ux%u f%#x%s%s", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height,
                    tex->nvn_format, tex->released ? " (was finalized)" : "", tex->gpu_written ? "" : " (first write)");
     if (!tex->gpu_written || tex->released) tex->first_written = frame_no;
+    // (relink, issue 69) A texture of a virtual pool the GPU draws before anything uploads it is marked uploaded below without
+    // the first upload, which is where its pages' mapping is noted. Its first check after the game finalized it then took all of
+    // its storage for remapped (texture_dirty: no map yet) and uploaded the whole image from guest memory, which never held what
+    // the GPU drew: the HUD's button labels and the dialog frames turned to noise or went blank after an area change, all at one
+    // present (players' logs: 140x140, 76x76, 113x105, 49x41 uploaded whole). Its mapping as it is now, noted at that first
+    // drawing; the parallel replay's lock is recursive. RX_VK_NO_DRAWN_MAP=1: as before
+    static const bool note_map = getenv("RX_VK_NO_DRAWN_MAP") == nullptr;
+    if (note_map && tex->gpu >= (1ull << 40) && tex->page_map.empty() && tex->guest_size) {
+        ParLock lk;
+        static thread_local Ranges seen;
+        texture_dirty(*tex, 0, seen);
+    }
     tex->last_written = frame_no;
     tex->gpu_written = true;
     tex->gpu_gen = memory_generation();
@@ -5007,6 +5039,35 @@ void texture_frame(uint64_t completed) {
             if (o->second != tex && o->second->last_written > tex->last_frame) return true;
         return false;
     };
+    // (relink, issue 69) Whether another image was drawn into part of tex's storage after tex's own last drawing: that memory
+    // holds the newer image's texels on the console, and writing tex back over it before eviction marks those pages written by
+    // the CPU, so a finalized image drawn there since (the HUD's small labels and dialog frames, drawn inside an old full-screen
+    // target's memory) is uploaded from bytes that never held it: noise over the d-pad icons, counts and dialog boxes until the
+    // pause menu redraws them (players' logs: "upload over a drawn image" for 46x46 to 140x140 textures). Same-frame drawings
+    // keep the write-back (which came last is not known). The drawn images by start, made the first time a write-back asks
+    std::vector<std::tuple<uint64_t, uint64_t, uint64_t, const Texture*>> drawn_spans;   // (start, end, last drawn, image)
+    uint64_t drawn_longest = 0;
+    bool drawn_spans_made = false;
+    const auto newer_drawing_inside = [&](const Texture* tex) {
+        if (!drawn_spans_made) {
+            drawn_spans_made = true;
+            for (auto& [last, t] : order)
+                if (t->gpu_written && t->last_written && t->guest_size) {
+                    drawn_spans.emplace_back(t->gpu, t->gpu + t->guest_size, t->last_written, t);
+                    drawn_longest = std::max(drawn_longest, t->guest_size);
+                }
+            std::sort(drawn_spans.begin(), drawn_spans.end());
+        }
+        const uint64_t lo = tex->gpu, hi = tex->gpu + tex->guest_size;
+        auto it = std::lower_bound(drawn_spans.begin(), drawn_spans.end(),
+                                   std::make_tuple(lo > drawn_longest ? lo - drawn_longest : 0, uint64_t{0}, uint64_t{0},
+                                                   (const Texture*)nullptr));
+        for (; it != drawn_spans.end() && std::get<0>(*it) < hi; ++it) {
+            const auto& [s, e, when, other] = *it;
+            if (other != tex && e > lo && when > tex->last_written) return true;
+        }
+        return false;
+    };
     // (relink-amd) a render target of one level and layer whose storage another render target drew over from another start
     // after its last use (target_overlap.h): the transient targets above. Its texels are gone from that memory on the console too
     const auto drawn_over_shifted = [&](const Texture* tex) {
@@ -5222,7 +5283,14 @@ void texture_frame(uint64_t completed) {
         // (issue 386). RX_VK_EVICT_NO_FLUSH=1: not written back, as before)
         static const bool no_flush = getenv("RX_VK_EVICT_NO_FLUSH") != nullptr;
         bool written_back = false;
-        if (!no_flush && !overwritten && tex->gpu_written && !tex->released && flushable(*tex) &&
+        static std::atomic<int64_t> stale_skipped{0};
+        const bool stale = !no_flush && !overwritten && tex->gpu_written && !tex->released && flushable(*tex) &&
+                           newer_drawing_inside(tex);
+        if (stale && ++stale_skipped % 50 == 1)
+            logf("vk: write-back before eviction left out, another image drawn into its storage since: #%u %#llx %ux%u NVN %#x "
+                 "(%lld so far)", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->nvn_format,
+                 (long long)stale_skipped.load());
+        if (!no_flush && !overwritten && !stale && tex->gpu_written && !tex->released && flushable(*tex) &&
             flush_texture(*tex, tex->gpu, tex->gpu + tex->guest_size)) {
             written_back = true;
             static std::atomic<int64_t> flushed{0};

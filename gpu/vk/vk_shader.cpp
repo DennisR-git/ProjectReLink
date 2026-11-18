@@ -531,6 +531,27 @@ Shader::Profile make_profile() {
     return p;
 }
 
+/// (relink) Lookup tables: a texture handle a shader reads from a table at an index it reads per pixel (OoT's clustered lights:
+/// the light's number from the pixel's light list, then that light's shadow map from the light table) is translated as an
+/// array of the table's first entries, filled per draw, which the shader indexes per pixel. Without it those shadow tests had no
+/// texture: dark squares around Link on water and ice, broken shadows on shards (issues 84, 78, 48, 31). Needs nonuniform
+/// indexing of sampled image arrays and room for 64 of them per stage. RX_VK_LOOKUP_TABLES=0: off (A/B; in the cache's stamp)
+bool lookup_tables_on() {
+    static const bool on = [] {
+        const VkPhysicalDeviceLimits& l = dev.props.limits;
+        const char* why = nullptr;
+        if (!dev.vk12.shaderSampledImageArrayNonUniformIndexing) why = "no nonuniform sampled image array indexing";
+        else if (l.maxPerStageDescriptorSampledImages < 128 || l.maxPerStageDescriptorSamplers < 128 ||
+                 l.maxPerStageResources < 128)
+            why = "too few sampled images per stage";
+        const char* e = getenv("RX_VK_LOOKUP_TABLES");
+        const bool wanted = !e || atoi(e) != 0;
+        logf("vk: shadow lookup tables: %s", !wanted ? "off (RX_VK_LOOKUP_TABLES=0)" : why ? why : "on");
+        return wanted && !why;
+    }();
+    return on;
+}
+
 Shader::HostTranslateInfo host_info() {
     Shader::HostTranslateInfo h{};
     h.support_float64 = true;
@@ -544,15 +565,51 @@ Shader::HostTranslateInfo host_info() {
     h.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
     h.support_geometry_shader_passthrough = false;
     h.support_conditional_barrier = true;   // (barriers in loops kept: see the WebGPU renderer's 4f5e3e6)
+    h.support_lookup_tables = lookup_tables_on();
     return h;
 }
 
 /// A translated stage: its IR program (kept for the next stage's inputs) and the pools its IR lives in
-struct Translation {
+/// (relink) The three pools a translation's IR lives in. Each stage made three and freed them (their first chunks, 8192
+/// objects each, allocated and freed per stage: the start-up preparation's tens of thousands of stages, on every worker at
+/// once, spent time in the allocator and raised the peak memory). Emptied and kept for the thread's next translation instead,
+/// a few per thread. RX_VK_NO_POOL_REUSE=1: made and freed per stage, as before
+struct TranslationPools {
     Shader::ObjectPool<Shader::IR::Inst> insts;
     Shader::ObjectPool<Shader::IR::Block> blocks;
     Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_blocks;
+};
+thread_local std::vector<std::unique_ptr<TranslationPools>> spare_pools;
+
+struct Translation {
+    std::unique_ptr<TranslationPools> pools;
+    Shader::ObjectPool<Shader::IR::Inst>& insts;
+    Shader::ObjectPool<Shader::IR::Block>& blocks;
+    Shader::ObjectPool<Shader::Maxwell::Flow::Block>& flow_blocks;
     Shader::IR::Program program;
+
+    static std::unique_ptr<TranslationPools> take() {
+        static const bool off = getenv("RX_VK_NO_POOL_REUSE") != nullptr;
+        if (!off && !spare_pools.empty()) {
+            auto p = std::move(spare_pools.back());
+            spare_pools.pop_back();
+            return p;
+        }
+        return std::make_unique<TranslationPools>();
+    }
+    Translation() : pools{take()}, insts{pools->insts}, blocks{pools->blocks}, flow_blocks{pools->flow_blocks} {}
+    Translation(const Translation&) = delete;
+    Translation& operator=(const Translation&) = delete;
+    ~Translation() {
+        program = {};   // (its blocks and instructions point into the pools: gone first, as the members' order had it)
+        static const bool off = getenv("RX_VK_NO_POOL_REUSE") != nullptr;
+        if (off || spare_pools.size() >= 3) return;   // (the pools freed with this Translation)
+        // (emptied in the order the members were destroyed in: the flow blocks, the blocks, then the instructions)
+        pools->flow_blocks.ReleaseContents();
+        pools->blocks.ReleaseContents();
+        pools->insts.ReleaseContents();
+        spare_pools.push_back(std::move(pools));
+    }
 };
 
 std::unique_ptr<Translation> translate(Env& env, bool graphics, bool one_exit = false) {
@@ -613,12 +670,12 @@ struct HandleMemo {
     uint32_t program, value;
 };
 thread_local HandleMemo handle_memo[32];
-uint32_t stage_handle_eval(const NvnState& s, const Stage& st, uint32_t program);
+uint32_t stage_handle_eval(const NvnState& s, const Stage& st, uint32_t program, uint32_t slot = 0);
 } // namespace
 void handle_memo_next() { handle_epoch++; }
-uint32_t stage_handle(const NvnState& s, const Stage& st, uint32_t program) {
+uint32_t stage_handle(const NvnState& s, const Stage& st, uint32_t program, uint32_t slot) {
     if (program >= st.info.handle_programs.size()) return 0;
-    if (!handle_epoch) return stage_handle_eval(s, st, program);
+    if (!handle_epoch || slot) return stage_handle_eval(s, st, program, slot);   // (a lookup table's other slots: not kept)
     HandleMemo& m = handle_memo[(((uintptr_t)&st >> 4) * 31 + program) & 31];
     if (m.epoch == handle_epoch && m.st == &st && m.s == &s && m.program == program) return m.value;
     const uint32_t v = stage_handle_eval(s, st, program);
@@ -626,7 +683,7 @@ uint32_t stage_handle(const NvnState& s, const Stage& st, uint32_t program) {
     return v;
 }
 namespace {
-uint32_t stage_handle_eval(const NvnState& s, const Stage& st, uint32_t program) {
+uint32_t stage_handle_eval(const NvnState& s, const Stage& st, uint32_t program, uint32_t slot) {
     return Shader::EvaluateHandleProgram(
                st.info.handle_programs[program],
                [&](u32 index, u32 offset) -> u32 { return stage_cbuf_word(s, st, index, offset); },
@@ -642,10 +699,48 @@ uint32_t stage_handle_eval(const NvnState& s, const Stage& st, uint32_t program)
                        else ub_read(base + offset, &v, 4);
                    }
                    return v;
-               })
+               },
+               slot)
         .value_or(0U);
 }
 } // namespace
+
+void stage_handles(const NvnState& s, const Stage& st, uint32_t program, uint32_t count, uint32_t* out) {
+    if (program >= st.info.handle_programs.size()) {
+        std::fill(out, out + count, 0u);
+        return;
+    }
+    // (the constant words and the storage buffers' addresses are the same for every slot: read for the first, kept for the rest)
+    std::pair<uint64_t, uint32_t> words[8];
+    uint32_t nwords = 0;
+    const auto cbuf = [&](u32 index, u32 offset) -> u32 {
+        const uint64_t key = (uint64_t)index << 32 | offset;
+        for (uint32_t w = 0; w < nwords; w++)
+            if (words[w].first == key) return words[w].second;
+        const uint32_t v = stage_cbuf_word(s, st, index, offset);
+        if (nwords < 8) words[nwords++] = {key, v};
+        return v;
+    };
+    uint64_t bases[Shader::Info::MAX_SSBOS];
+    uint64_t have_base = 0;
+    static const bool live = getenv("RX_VK_HANDLES_LIVE") != nullptr;
+    const auto storage = [&](u32 binding, u32 offset) -> u32 {
+        if (binding >= st.info.storage_buffers_descriptors.size() || binding >= 64) return 0U;
+        if (!(have_base >> binding & 1)) {
+            const auto& d = st.info.storage_buffers_descriptors[binding];
+            bases[binding] = cbuf(d.cbuf_index, d.cbuf_offset) | (uint64_t)cbuf(d.cbuf_index, d.cbuf_offset + 4) << 32;
+            have_base |= 1ull << binding;
+        }
+        uint32_t v = 0;
+        if (bases[binding]) {
+            if (live) host->gpu_read(bases[binding] + offset, &v, 4);
+            else ub_read(bases[binding] + offset, &v, 4);
+        }
+        return v;
+    };
+    const auto& code = st.info.handle_programs[program];
+    for (uint32_t k = 0; k < count; k++) out[k] = Shader::EvaluateHandleProgram(code, cbuf, storage, k).value_or(0U);
+}
 
 namespace {
 
@@ -994,7 +1089,7 @@ uint64_t disk_stamp() {
     // RX_VK_GPU_PROFILE and RX_VK_GPL, none of which the translation reads, and a line of them added to relink_env.txt or taken out
     // prepared every shader again
     for (char** e = _environ; e && *e; e++)
-        for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "EDEN_"})
+        for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "RX_VK_LOOKUP", "EDEN_"})
             if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
     return h;
 }
