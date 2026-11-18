@@ -5933,15 +5933,38 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
 }
 
 bool fallback_compute_pipelines(Program& p) {
+    // (relink) The lock covers the lookup and the publishing only, not the compiles: one 12 s AMD compile held every recording
+    // thread. A program being built by another thread is waited for (never two builds of one program); other programs go on.
+    // RX_VK_FALLBACK_COMPILE_LOCK=1: one lock around the whole compile, as before
     static std::mutex mu;
-    std::lock_guard lk(mu);
-    if (!p.fallback_compute.empty()) return true;
+    static std::condition_variable built_cv;
+    static std::unordered_set<const Program*> building;
+    static const bool whole = getenv("RX_VK_FALLBACK_COMPILE_LOCK") && atoi(getenv("RX_VK_FALLBACK_COMPILE_LOCK")) != 0;
+    std::unique_lock lk(mu);
     // (relink, issue 60) A program whose compile failed was compiled again at each of its draws, on the recording thread, the
     // driver's state after a fault caught in it unknown (-77): the GTX 1070's log stopped for good right after the first
     // failure. Its draws are now left out without another try. RX_VK_FALLBACK_RETRY=1: tried again at each draw, as before
     static std::unordered_set<const Program*> failed;
     static const bool retry = getenv("RX_VK_FALLBACK_RETRY") && atoi(getenv("RX_VK_FALLBACK_RETRY")) != 0;
-    if (!retry && failed.count(&p)) return false;
+    for (;;) {
+        if (!p.fallback_compute.empty()) return true;
+        if (!retry && failed.count(&p)) return false;
+        if (!building.count(&p)) break;
+        built_cv.wait(lk);
+    }
+    building.insert(&p);
+    if (!whole) lk.unlock();
+    struct Done {   // (publishes or not, the program is no longer being built: whatever way out)
+        std::unique_lock<std::mutex>& lk;
+        const Program* p;
+        bool whole;
+        ~Done() {
+            if (!lk.owns_lock()) lk.lock();
+            building.erase(p);
+            lk.unlock();
+            built_cv.notify_all();
+        }
+    } done{lk, &p, whole};
     std::vector<VkPipeline> made(p.stages.size(), VK_NULL_HANDLE);
     bool any = false;
     for (size_t i = 0; i < p.stages.size(); i++) {
@@ -5975,7 +5998,11 @@ bool fallback_compute_pipelines(Program& p) {
                      (unsigned long long)p.key, (int)r, ms, r == (VkResult)-77 ? ", a fault in the driver" : "");
             for (VkPipeline& m : made)
                 if (m) vkDestroyPipeline(dev.device, m, nullptr), m = VK_NULL_HANDLE;
-            failed.insert(&p);
+            {   // (failed is read under mu)
+                std::unique_lock<std::mutex> fl(mu, std::defer_lock);
+                if (!lk.owns_lock()) fl.lock();
+                failed.insert(&p);
+            }
             return false;
         }
         static std::atomic<int> told_slow{0};
@@ -5984,6 +6011,7 @@ bool fallback_compute_pipelines(Program& p) {
         pcache_built_since_save++;
     }
     if (!any) return false;
+    if (!lk.owns_lock()) lk.lock();   // (publishing; Done lets go of it and wakes the waiters)
     p.fallback_compute = std::move(made);
     return true;
 }
