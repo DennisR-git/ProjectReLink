@@ -4199,6 +4199,12 @@ VkDeviceSize sparse_added = 0;
 bool sparse_take(Texture* tex, VkDeviceSize n, VkDeviceMemory& mem, VkDeviceSize& off) {
     constexpr VkDeviceSize kChunk = 64ull << 20;
     n = (n + tex->sparse_align - 1) / tex->sparse_align * tex->sparse_align;
+    for (size_t i = 0; i < tex->sparse_spare.size(); i++) {   // (relink: what a failed bind left first, so a bind that keeps failing takes no more)
+        if (tex->sparse_spare[i].size < n) continue;
+        mem = tex->sparse_spare[i].memory, off = tex->sparse_spare[i].offset;
+        tex->sparse_spare.erase(tex->sparse_spare.begin() + (std::ptrdiff_t)i);
+        return true;
+    }
     if (tex->sparse_chunks.empty() || tex->chunk_used + n > kChunk) {
         VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
         ai.allocationSize = std::max(kChunk, n);
@@ -4220,8 +4226,37 @@ bool sparse_take(Texture* tex, VkDeviceSize n, VkDeviceMemory& mem, VkDeviceSize
     return true;
 }
 
+/// (relink) The queued binds that did not happen: their tiles and mip tails are marked unbound again, so the next write to them
+/// queues them anew instead of writing into unbacked memory, and their memory goes to the texture's spare list for that retry
+/// (sparse_mu held). RX_VK_SPARSE_RETRY=0: as before, the blocks stay marked bound
+void sparse_unqueue(Texture* tex) {
+    const VkSparseImageMemoryRequirements& r = tex->sparse_req;
+    const VkExtent3D g = r.formatProperties.imageGranularity;
+    for (const VkSparseImageMemoryBind& b : sparse_binds) {
+        const uint32_t level = b.subresource.mipLevel, layer = b.subresource.arrayLayer;
+        if (level >= tex->levels || layer >= tex->layers || !g.width || !g.height) continue;
+        std::vector<uint8_t>& map = tex->tiles[(size_t)layer * tex->levels + level];
+        const uint32_t lw = std::max(1u, tex->width >> level);
+        const size_t i = (size_t)(b.offset.y / g.height) * ((lw + g.width - 1) / g.width) + (size_t)(b.offset.x / g.width);
+        if (i < map.size()) map[i] = 0;
+        tex->sparse_spare.push_back({b.memory, b.memoryOffset, tex->sparse_align});
+    }
+    const bool single = r.formatProperties.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT;
+    const VkDeviceSize align = tex->sparse_align ? tex->sparse_align : 1;
+    for (const VkSparseMemoryBind& b : sparse_opaque) {
+        const VkDeviceSize layer = single || !r.imageMipTailStride ? 0 : (b.resourceOffset - r.imageMipTailOffset) / r.imageMipTailStride;
+        if (layer < tex->tail_bound.size()) tex->tail_bound[(size_t)layer] = 0;
+        tex->sparse_spare.push_back({b.memory, b.memoryOffset, (b.size + align - 1) / align * align});
+    }
+    total_bytes += sparse_added;   // (the chunks made for them stay allocated)
+    sparse_added = 0;
+    sparse_binds.clear();
+    sparse_opaque.clear();
+}
+
 bool sparse_flush(Texture* tex) {
     if (sparse_binds.empty() && sparse_opaque.empty()) return true;
+    static const bool retry = !(getenv("RX_VK_SPARSE_RETRY") && atoi(getenv("RX_VK_SPARSE_RETRY")) == 0);
     VkSparseImageMemoryBindInfo ib{tex->image, (uint32_t)sparse_binds.size(), sparse_binds.data()};
     VkSparseImageOpaqueMemoryBindInfo ob{tex->image, (uint32_t)sparse_opaque.size(), sparse_opaque.data()};
     VkBindSparseInfo bi{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
@@ -4232,7 +4267,15 @@ bool sparse_flush(Texture* tex) {
     static VkFence fence = VK_NULL_HANDLE;
     if (!fence) {
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-        vkCreateFence(dev.device, &fi, nullptr, &fence);
+        if (vkCreateFence(dev.device, &fi, nullptr, &fence) != VK_SUCCESS) {   // (relink: never a bind waited on through a null fence)
+            fence = VK_NULL_HANDLE;
+            static int fence_logged;
+            if (fence_logged++ < 8) logf("vk: sparse texture %#llx: no fence for its binds, retried at the next write", (unsigned long long)tex->gpu);
+            if (retry) {
+                sparse_unqueue(tex);
+                return false;
+            }
+        }
     }
     VkResult res;
     {   // (bound before any work that writes the blocks is submitted: waited for here, on the recording thread. And
@@ -4252,7 +4295,12 @@ bool sparse_flush(Texture* tex) {
         vkWaitForFences(dev.device, 1, &fence, VK_TRUE, UINT64_MAX);
         vkResetFences(dev.device, 1, &fence);
     } else {
-        logf("vk: sparse texture %#llx: binding failed (%d)", (unsigned long long)tex->gpu, (int)res);
+        static int failed;   // (relink: capped, the write retries)
+        if (failed++ < 8) logf("vk: sparse texture %#llx: binding failed (%d)", (unsigned long long)tex->gpu, (int)res);
+        if (retry) {
+            sparse_unqueue(tex);
+            return false;
+        }
     }
     static int logged;
     static uint64_t next_mb = 0;
