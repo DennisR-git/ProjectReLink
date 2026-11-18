@@ -3088,6 +3088,36 @@ void build_descriptors(const NvnState& s, const Program& p) {
             static thread_local std::vector<uint32_t> table;
             const bool is_table = d.handle_program != ~0U && d.count > 1;
             if (is_table) table.resize(d.count), stage_handles(s, st, d.handle_program, d.count, table.data());
+            // (diagnosis) RX_VK_TABLE_NOBIND=1: a lookup table's slots bound as nothing, as before the tables (the translation unchanged:
+            // no new preparation). RX_VK_TABLE_LOG=1: the first 24 tables met, each slot's handle and the texture it names
+            static const bool table_nobind = getenv("RX_VK_TABLE_NOBIND") != nullptr;
+            if (is_table && table_nobind) std::fill(table.begin(), table.end(), 0u);
+            // (diagnosis) RX_VK_TABLE_MASK=<hex>: only the slots whose bit is set are bound (slot k: bit k, up to 63)
+            static const uint64_t table_mask = getenv("RX_VK_TABLE_MASK") ? strtoull(getenv("RX_VK_TABLE_MASK"), nullptr, 16) : ~0ull;
+            if (is_table && table_mask != ~0ull)
+                for (uint32_t k = 0; k < d.count && k < 64; k++)
+                    if (!(table_mask >> k & 1)) table[k] = 0;
+            static const bool table_log = getenv("RX_VK_TABLE_LOG") != nullptr;
+            if (is_table && table_log) {
+                static std::mutex tl_mu;
+                static std::unordered_set<uint64_t> tl_seen;
+                std::lock_guard tl(tl_mu);
+                if (tl_seen.size() < 24 && tl_seen.insert(p.key ^ ((uint64_t)st.vk_stage << 56)).second) {
+                    std::string line;
+                    for (uint32_t k = 0; k < d.count; k++) {
+                        if (!table[k] || (k && table[k] == table[k - 1])) continue;
+                        Texture* tt = nullptr;
+                        const VkImageView tv = texture_view_of(table[k], vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tt);
+                        char b[160];
+                        snprintf(b, sizeof b, " [%u] %#x -> %s%ux%u x%u fmt %d%s;", k, table[k], tv ? "" : "NO VIEW ", tt ? tt->width : 0,
+                                 tt ? tt->height : 0, tt ? tt->layers : 0, tt ? (int)tt->format : -1,
+                                 tt && is_depth_format(tt->format) ? " depth" : "");
+                        if (line.size() < 1500) line += b;
+                    }
+                    logf("vk: table prog %016llx stage %#x depth %d type %d count %u:%s", (unsigned long long)p.key, (unsigned)st.vk_stage,
+                         (int)d.is_depth, (int)d.type, d.count, line.empty() ? " all 0" : line.c_str());
+                }
+            }
             uint32_t last_handle = 0;
             VkImageView last_view = VK_NULL_HANDLE;
             Texture* last_tex = nullptr;
