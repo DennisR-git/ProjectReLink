@@ -3913,6 +3913,51 @@ std::atomic<uint32_t> present_kind{0};   // (vk_framegen.cpp: 1 while a made fra
 // the swapchain had no image free, twice a frame with frame interpolation.
 std::mutex present_image_mu;
 
+// (relink) The swapchain image waited for on the CPU, not on the replay's queue. AMD's Windows driver returns from
+// vkAcquireNextImageKHR at once and leaves the whole wait to the acquire's semaphore; the present's copy waited for it on the
+// queue every submission of the game's work goes to, so a window the system stopped presenting (Alt+Tab, OBS in front) held the
+// whole replay until the hang watch ended the game. Now the acquire signals a fence, the CPU waits for it (up to 250 ms) before
+// the copy is recorded, and the copy's submit waits for nothing. An image not back in time is kept (held): the frame is not shown,
+// the game goes on, and each later present looks at the same image again, without waiting and without a second acquire, and
+// copies into it once it is free. On by default for AMD on Windows only; RX_VK_PRESENT_FENCE=1: on every driver, =0: off
+static bool present_fence_on() {
+    static const bool on = [] {
+        const char* e = getenv("RX_VK_PRESENT_FENCE");
+        bool v;
+#ifdef _WIN32
+        v = dev.props.vendorID == 0x1002;
+#else
+        v = false;
+#endif
+        if (e) v = atoi(e) != 0;
+        logf("vk: the swapchain image is waited for %s (RX_VK_PRESENT_FENCE=%d: %s)", v ? "on the CPU, with a fence" : "on the GPU, with a semaphore",
+             v ? 0 : 1, v ? "the semaphore" : "the fence");
+        return v;
+    }();
+    return on;
+}
+static VkFence acquire_fence = VK_NULL_HANDLE;
+static struct { bool held = false; uint32_t index = 0; VkSwapchainKHR swapchain = VK_NULL_HANDLE; } held_image;
+/// Whether the acquire's fence is signaled (waiting up to ns); reset for the next acquire when it is
+static bool acquire_fence_free(uint64_t ns) {
+    if (!acquire_fence) return false;
+    if (vkWaitForFences(dev.device, 1, &acquire_fence, VK_TRUE, ns) != VK_SUCCESS) return false;
+    vkResetFences(dev.device, 1, &acquire_fence);
+    return true;
+}
+/// A fence that is unsignaled and free for an acquire (made here the first time, and again after a held image's was let go)
+static bool acquire_fence_ready() {
+    if (acquire_fence) return true;
+    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    return vkCreateFence(dev.device, &fi, nullptr, &acquire_fence) == VK_SUCCESS;
+}
+/// The held image's swapchain is gone: let it go. Its fence may never be signaled now, so it is left alone (not destroyed: the
+/// presentation engine may still signal it) and a new one is made at the next acquire
+static void held_image_drop() {
+    held_image.held = false;
+    if (!acquire_fence_free(0)) acquire_fence = VK_NULL_HANDLE;
+}
+
 static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool first_of_frame);
 void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view) {
     std::lock_guard lk(present_image_mu);
@@ -3955,7 +4000,14 @@ static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4]
     static bool unseen = false;
     const uint64_t acquire_timeout = unseen ? 0 : 100000000ull;
 #endif
-    VkResult res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, f.acquired, VK_NULL_HANDLE, &index);
+    const bool fence_mode = present_fence_on();
+    if (fence_mode && held_image.held && held_image.swapchain != dev.swapchain) held_image_drop();   // (its swapchain is gone)
+    const bool was_held = fence_mode && held_image.held;
+    if (fence_mode && !was_held && !acquire_fence_ready()) return false;   // (no fence to acquire with: the frame is not shown)
+    VkResult res = VK_SUCCESS;
+    if (was_held) index = held_image.index;   // (acquired at an earlier present and not free then: no other acquire meanwhile)
+    else if (fence_mode) res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, VK_NULL_HANDLE, acquire_fence, &index);
+    else res = vkAcquireNextImageKHR(dev.device, dev.swapchain, acquire_timeout, f.acquired, VK_NULL_HANDLE, &index);
 #ifndef _WIN32
     if (res == VK_TIMEOUT || res == VK_NOT_READY) {
         if (!unseen) logf("vk: the window is not shown (no image back in 100 ms): frames are not shown until it is");
@@ -3973,6 +4025,18 @@ static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4]
         return false;
     }
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) return false;
+    if (fence_mode) {   // (the image free before any work for it goes to the queue; a held one is only looked at)
+        if (!acquire_fence_free(was_held ? 0 : 250000000ull)) {
+            static int said;
+            if (!was_held && said++ < 16)
+                logf("vk: the window's image was not given back in 250 ms (window hidden?): frames are not shown until it is (RX_VK_PRESENT_FENCE=0: wait on the GPU)");
+            held_image = {true, index, dev.swapchain};
+            return false;
+        }
+        static int said_back;
+        if (was_held && said_back++ < 16) logf("vk: the window's image was given back: frames are shown again");
+        held_image.held = false;
+    }
     vkResetFences(dev.device, 1, &f.done);
     vkResetCommandPool(dev.device, f.pool, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -4032,7 +4096,7 @@ static bool present_one(VkImage src, uint32_t sw, uint32_t sh, const int crop[4]
     VkCommandBufferSubmitInfo cb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
     cb.commandBuffer = f.cmd;
     VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
-    si.waitSemaphoreInfoCount = 1;
+    si.waitSemaphoreInfoCount = fence_mode ? 0 : 1;   // (fence mode: the image was free before the copy was recorded, no GPU wait)
     si.pWaitSemaphoreInfos = waits;
     si.commandBufferInfoCount = 1;
     si.pCommandBufferInfos = &cb;

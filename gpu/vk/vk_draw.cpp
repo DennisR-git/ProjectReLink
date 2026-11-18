@@ -962,7 +962,9 @@ __declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGr
     __try {
         return vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
     } __except (1) {
-        return VK_ERROR_UNKNOWN;
+        *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
+        logf("vk: the driver faulted compiling a graphics pipeline (exception %#lx): that one is left out", (unsigned long)GetExceptionCode());
+        return (VkResult)-77;   // (a fault, told apart from the driver's own VK_ERROR_UNKNOWN: fault_gate_end keeps the program out)
     }
 }
 __declspec(noinline) VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
@@ -1013,8 +1015,9 @@ static void install_driver_fault_guard() {
 VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
     install_driver_fault_guard();
     if (sigsetjmp(fault_jmp, 1) != 0) {
+        *pl = VK_NULL_HANDLE;
         logf("vk: the driver faulted compiling a graphics pipeline: that one is left out");
-        return VK_ERROR_UNKNOWN;
+        return (VkResult)-77;
     }
     fault_armed = 1;
     const VkResult r = vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
@@ -1033,6 +1036,95 @@ VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInf
     return r;
 }
 #endif
+
+// (relink) Programs the driver's compiler faulted on stay out of the driver. On AMD's Windows driver the caught fault leaves
+// that program's compile unfinished inside it, and every later build of the same program waits there for good (a pause-menu
+// freeze with the music still playing, no device lost). So: a faulted program is not built again in this run; on AMD one build
+// of a program is in the driver at a time (a second one waits here, outside it, and learns how the first ended); and the faulted
+// keys are written to relink_driver_faults.txt beside the exe, per vendor and driver version, so later runs skip them from the
+// start. RX_VK_DRIVER_FAULTS=0: off; 1 (default): as above, the gate on AMD only; 2: the gate on every driver
+constexpr VkResult kDriverFault = (VkResult)-77;
+struct FaultGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::unordered_set<uint64_t> bad, building;
+    bool serial = false;
+};
+int driver_faults_mode() {
+    static const int mode = getenv("RX_VK_DRIVER_FAULTS") ? std::clamp(atoi(getenv("RX_VK_DRIVER_FAULTS")), 0, 2) : 1;
+    return mode;
+}
+std::string driver_faults_path() { return computes_list_path("relink_driver_faults.txt"); }
+FaultGate& fault_gate() {
+    static FaultGate g;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::string text;
+        if (FILE* f = fopen(driver_faults_path().c_str(), "rb")) {
+            char b[4096];
+            size_t n;
+            while ((n = fread(b, 1, sizeof b, f)) > 0) text.append(b, n);
+            fclose(f);
+        }
+        size_t kept = 0, at = 0;
+        while (at < text.size()) {   // ("<vendor> <driver> <key>" in hex; other drivers' lines, comments and junk are skipped)
+            size_t end = text.find('\n', at);
+            if (end == std::string::npos) end = text.size();
+            const std::string l = text.substr(at, end - at);
+            at = end + 1;
+            unsigned v = 0, d = 0;
+            unsigned long long k = 0;
+            char extra = 0;
+            if (l.empty() || l[0] == '#') continue;
+            if (sscanf(l.c_str(), "%x %x %llx %c", &v, &d, &k, &extra) != 3) continue;
+            if (v == dev.props.vendorID && d == dev.props.driverVersion && k) kept += g.bad.insert(k).second;
+        }
+        g.serial = driver_faults_mode() == 2 || dev.props.vendorID == 0x1002;
+        if (kept) logf("vk: %zu programs the driver faulted on in earlier runs are not built (%s; RX_VK_DRIVER_FAULTS=0: they are)", kept, driver_faults_path().c_str());
+        if (g.serial) logf("vk: one build of a program goes to the driver at a time (%s; RX_VK_DRIVER_FAULTS=0: as many as ask)", driver_faults_mode() == 2 ? "RX_VK_DRIVER_FAULTS=2" : "AMD");
+    });
+    return g;
+}
+enum { kGateGo, kGateBusy, kGateFaulted };
+/// Before a build of a program goes to the driver. kGateGo: build, then fault_gate_end. kGateFaulted: do not build. With wait
+/// false (a build that must not block) a program being built right now answers kGateBusy
+int fault_gate_begin(uint64_t key, bool wait) {
+    if (!driver_faults_mode() || !key) return kGateGo;
+    FaultGate& g = fault_gate();
+    std::unique_lock lk(g.mu);
+    if (!g.serial) return g.bad.count(key) ? kGateFaulted : kGateGo;
+    if (wait) g.cv.wait(lk, [&] { return g.bad.count(key) || !g.building.count(key); });
+    if (g.bad.count(key)) return kGateFaulted;
+    if (g.building.count(key)) return kGateBusy;
+    g.building.insert(key);
+    return kGateGo;
+}
+void fault_gate_end(uint64_t key, bool faulted) {
+    if (!driver_faults_mode() || !key) return;
+    FaultGate& g = fault_gate();
+    bool fresh = false;
+    {
+        std::lock_guard lk(g.mu);
+        g.building.erase(key);
+        if (faulted) fresh = g.bad.insert(key).second;
+    }
+    g.cv.notify_all();
+    if (!fresh) return;
+    logf("vk: program %016llx is kept out of the driver for the rest of the run", (unsigned long long)key);
+    FILE* f = fopen(driver_faults_path().c_str(), "ab");
+    if (!f) {   // (a folder the game cannot write to)
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) logf("vk: %s could not be written: faulted programs are kept out for this run only", driver_faults_path().c_str());
+        return;
+    }
+    static std::mutex file_mu;
+    std::lock_guard lk(file_mu);
+    fseek(f, 0, SEEK_END);
+    if (ftell(f) == 0) fputs("# programs the graphics driver's compiler faulted on: <vendor> <driver version> <program key>. Delete this file to try them again.\n", f);
+    fprintf(f, "%04x %08x %016llx\n", (unsigned)dev.props.vendorID, (unsigned)dev.props.driverVersion, (unsigned long long)key);
+    fclose(f);
+}
+
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1);
 thread_local bool driver_cache_only = false;   // (predict_run's: pipelines for the driver's own cache, not into ours)
 
@@ -1834,7 +1926,13 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
             }
         }
     }
-    const VkResult r = guarded_graphics(part >= 0 || driver_cache_only ? VK_NULL_HANDLE : pcache, &ci, &pl);
+    VkResult r = kDriverFault;
+    const int gate = fault_gate_begin(p.key, !driver_cache_only);   // (a warm-up build never waits behind another build)
+    if (gate == kGateBusy) return VK_NULL_HANDLE;
+    if (gate == kGateGo) {
+        r = guarded_graphics(part >= 0 || driver_cache_only ? VK_NULL_HANDLE : pcache, &ci, &pl);
+        fault_gate_end(p.key, r == kDriverFault);
+    }
     if (part >= 0) {
         if (r != VK_SUCCESS) {
             static std::atomic<int> logged;
@@ -3329,7 +3427,7 @@ void checkpoint(VkCommandBuffer cmd, const Program& p, char kind, const Targets*
 const char* checkpoint_kind(char c) {
     return c == 'd' ? "draw of program" : c == 'c' ? "dispatch of program" : c == 'i' ? "INDIRECT dispatch of program"
          : c == 'm' ? "mirror sync of pool"
-         : c == 'b' ? "write-back of pool" : c == 'u' ? "upload of texture" : c == 'g' ? "GPU unswizzle of texture"
+         : c == 'b' ? "write-back of pool" : c == 'w' ? "write-back diff pass, chunk count" : c == 'u' ? "upload of texture" : c == 'g' ? "GPU unswizzle of texture"
          : c == 'A' ? "ASTC decode of texture" : c == 'E' ? "BC3 encode into texture" : c == 'R' ? "resize blit for texture"
          : c == 'Z' ? "end of the uploads of texture"
          : c == 'P' ? "PRESENT to the window, present number" : c == 'B' ? "UPLOADS: readback refresh, pools"
@@ -3618,10 +3716,18 @@ void checkpoints_report() {
     // RX_VK_CHECKPOINTS=1 is the NV checkpoints where the driver has them, not the buffer markers)
     logf("vk: device lost: reading %s", dev.checkpoints ? "the checkpoints"
                                         : marker_words ? "the buffer markers"
-                                        : getenv("RX_VK_FAULT_INFO") ? "the fault info"
+                                        : !getenv("RX_VK_FAULT_INFO") || *getenv("RX_VK_FAULT_INFO") != '0' ? "the fault info"
                                         : "nothing: no markers on (RX_VK_CHECKPOINTS=marker, RX_VK_PARALLEL=0 and RX_VK_FAULT_INFO=1 "
                                           "in relink_env.txt name the work that stopped)");
-    struct FaultLast { ~FaultLast() { if (std::getenv("RX_VK_FAULT_INFO")) device_fault_report(); } } fault_last;
+    // (relink) With neither NV checkpoints nor buffer markers (AMD, Intel) the fault info is read without being asked for: it is
+    // all the report has. Not where the checkpoints are, where it has not come back after a fault. RX_VK_FAULT_INFO=0: never
+    struct FaultLast {
+        ~FaultLast() {
+            const char* e = std::getenv("RX_VK_FAULT_INFO");
+            const bool bare = !dev.checkpoints && !marker_words;
+            if (e ? *e != '0' : bare) device_fault_report();
+        }
+    } fault_last;
     const auto watched = [] {
         std::lock_guard lk(watch_mu);
         for (int i = 0; i < 40; i++)
