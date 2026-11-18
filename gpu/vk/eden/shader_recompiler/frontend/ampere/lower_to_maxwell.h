@@ -1733,8 +1733,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             u32 address = insn.Bits(24, 8);
             const u64 offset = insn.Bits(40, 24);
             if (address != 255 && address >= dest && address < dest + count) {
-                emit(0x5c10000000000000ULL | predicate | 253 | (u64{address} << 8) | (u64{255} << 20));
-                address = 253;
+                // (relink) The copy goes to R254: R253 is where each matrix's row address is shuffled to below, so matrices 1 to 3
+                // of an .x2/.x4 shuffled matrix 0's address and read the wrong rows. R246-R253 are used by the paths
+                emit(0x5c10000000000000ULL | predicate | 254 | (u64{address} << 8) | (u64{255} << 20));
+                address = 254;
             }
             if (transpose) {
                 // .MT88: lane t receives stored rows 2(t%4) and 2(t%4)+1 at column t/4 (16 bits each).
