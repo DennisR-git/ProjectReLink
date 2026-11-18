@@ -1923,6 +1923,14 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         // (-13 here) or takes minutes on some Ocarina shaders it builds in seconds unoptimized (Lichii #200, #210).
         static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
         if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+        // (relink) the cloth's colour program (key 5fa56485a6b07619) on AMD's proprietary Windows driver: the optimized pipeline was still pending
+        // after its depth pass had drawn, and parts of the cloth came out white or black. RX_VK_CLOTH_OPT=1: optimized
+        static const bool cloth_opt = getenv("RX_VK_CLOTH_OPT") && atoi(getenv("RX_VK_CLOTH_OPT")) != 0;
+        if (p.key == 0x5fa56485a6b07619ull && !cloth_opt && driver_id_once() == VK_DRIVER_ID_AMD_PROPRIETARY) {
+            ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+            static std::atomic<int> told_cloth{0};
+            if (told_cloth++ < 1) logf("vk: the cloth colour program is built without the driver's optimizer (AMD)");
+        }
         // (from PR 430, YunaraDebugs: on AMD the task and mesh programs (OoT's foliage culling, following pointers through its
         // tables) hung the GPU when the driver's optimizer built them: a device lost one to four minutes into Kokiri, each time with
         // another of them first (RX 6600, issues 461 and 484); never in runs where they were built without it. They are built
