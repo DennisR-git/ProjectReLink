@@ -528,6 +528,10 @@ Shader::Profile make_profile() {
     p.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
     p.support_maximal_reconvergence = dev.max_reconvergence;
     p.support_float32_atomic_add = dev.float_atomic_add && !getenv("EDEN_NX2_NO_FADD");   // (relink: native float adds)
+    // (relink) gathers nudged by 1/512 of a texel on AMD's and Intel's drivers, so the four texels a gather picks match Maxwell's at
+    // texel edges (2D, rect and 2D array only: Eden's translator has it, never turned on; coopmat_init decides, RX_VK_GATHER_OFFSET=0/1
+    // forces it; the flag is in disk_stamp)
+    p.need_gather_subpixel_offset = dev.gather_offset;
     return p;
 }
 
@@ -1079,7 +1083,8 @@ uint64_t disk_stamp() {
         // integrated and dedicated GPUs), and RX_VK_NO_INVARIANT / RX_VK_NO_NAN_GUARD did nothing for programs already cached)
         using namespace Shader::Backend::SPIRV;
         const uint32_t flags = (position_invariant ? 1u : 0u) | (frag_nan_guard ? 2u : 0u) | (mma_software ? 4u : 0u) |
-                               (dev.big_warp ? 8u : 0u);
+                               (dev.big_warp ? 8u : 0u) | (fetch_bounds ? 16u : 0u) | (nan_bits ? 32u : 0u) |
+                               (dev.gather_offset ? 64u : 0u) | (fetch_bounds_buffers ? 128u : 0u);   // (and the vendor fixes: coopmat_init)
         add(&flags, sizeof flags);
         add(mma_order_a.data(), sizeof(uint32_t) * mma_order_a.size());
         add(mma_order_b.data(), sizeof(uint32_t) * mma_order_b.size());
