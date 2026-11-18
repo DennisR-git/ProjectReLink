@@ -771,6 +771,17 @@ uint64_t ts_anchor_ns = 0;   // (the last present's time: counter timestamps are
 /// A GPU-timeline write of guest memory (the stream's own writes: they reach memory in command order)
 void gpu_write(VkCommandBuffer cmd, uint64_t gpu, const void* data, uint64_t n) {
     const uint8_t* d = (const uint8_t*)data;
+    {   // (relink) two inline updates of the same bytes with nothing between them may land in either order. One that overlaps
+        // the thread's last write on this command buffer gets a barrier first (full_barrier leaves it out when one already
+        // stands after that write). RX_VK_UB_ORDER_OFF=1: none, as before
+        static const bool off = getenv("RX_VK_UB_ORDER_OFF") != nullptr;
+        static thread_local VkCommandBuffer last_cmd = VK_NULL_HANDLE;
+        static thread_local uint64_t last_lo = 0, last_hi = 0;
+        if (!off && n) {
+            if (cmd == last_cmd && gpu < last_hi && gpu + n > last_lo) full_barrier(cmd, "barrier (overlapping inline writes)");
+            last_cmd = cmd, last_lo = gpu, last_hi = gpu + n;
+        }
+    }
     while (n) {   // (vkCmdUpdateBuffer: up to 64 KB, 4-byte aligned)
         const uint64_t k = std::min<uint64_t>(n, 65536);
         BufferRef b = gpu_buffer_bind(gpu, k, true);
@@ -1017,8 +1028,56 @@ void flush_ub_updates(VkCommandBuffer cmd) {
     GprofSpan gp(cmd, "ubupd (the stream's uniform updates -> guest memory, with its barriers)");
     gp.items = (int)(ub_updates.size() - ub_first_of_recording);
     full_barrier(cmd);
-    for (size_t i = ub_first_of_recording; i < ub_updates.size(); i++)
-        gpu_write(cmd, ub_updates[i].dst, ub_updates[i].bytes.data(), ub_updates[i].bytes.size()), gp.bytes += ub_updates[i].bytes.size();
+    // (relink) The game updates one uniform block many times a recording, and two updates of the same bytes with no barrier
+    // between may land in either order (a driver that runs vkCmdUpdateBuffer as a copy): the older bytes could stay for the next
+    // frames. Updates that overlap, one by one or through a chain of them, are composed on the CPU in stream order into one write
+    // over their union; the others are written as they are. RX_VK_UB_ORDER_OFF=1: each written as it comes, as before.
+    static const bool order_off = getenv("RX_VK_UB_ORDER_OFF") != nullptr;
+    const size_t first = ub_first_of_recording, last = ub_updates.size();
+    std::vector<size_t> by_dst;
+    if (!order_off) {
+        for (size_t i = first; i < last; i++)
+            if (!ub_updates[i].bytes.empty()) by_dst.push_back(i);
+        std::stable_sort(by_dst.begin(), by_dst.end(), [](size_t a, size_t b) { return ub_updates[a].dst < ub_updates[b].dst; });
+    }
+    if (order_off || by_dst.size() < 2) {
+        for (size_t i = first; i < last; i++)
+            gpu_write(cmd, ub_updates[i].dst, ub_updates[i].bytes.data(), ub_updates[i].bytes.size()), gp.bytes += ub_updates[i].bytes.size();
+        full_barrier(cmd);
+        return;
+    }
+    static int64_t composed_groups = 0, composed_updates = 0;
+    std::vector<size_t> group;
+    std::vector<uint8_t> merged;
+    for (size_t k = 0; k < by_dst.size();) {
+        group.assign(1, by_dst[k]);
+        uint64_t lo = ub_updates[by_dst[k]].dst, hi = lo + ub_updates[by_dst[k]].bytes.size();
+        size_t j = k + 1;
+        for (; j < by_dst.size() && ub_updates[by_dst[j]].dst < hi; j++) {
+            group.push_back(by_dst[j]);
+            hi = std::max<uint64_t>(hi, ub_updates[by_dst[j]].dst + ub_updates[by_dst[j]].bytes.size());
+        }
+        k = j;
+        if (group.size() == 1) {
+            const UbUpdate& u = ub_updates[group[0]];
+            gpu_write(cmd, u.dst, u.bytes.data(), u.bytes.size()), gp.bytes += u.bytes.size();
+            continue;
+        }
+        std::sort(group.begin(), group.end());   // (stream order: the later update's bytes win)
+        if (hi - lo > (1ull << 20)) {   // (a union that long: written one by one, gpu_write puts a barrier between overlapping ones)
+            for (size_t i : group)
+                gpu_write(cmd, ub_updates[i].dst, ub_updates[i].bytes.data(), ub_updates[i].bytes.size()), gp.bytes += ub_updates[i].bytes.size();
+            continue;
+        }
+        merged.assign((size_t)(hi - lo), 0);
+        for (size_t i : group)
+            std::memcpy(merged.data() + (ub_updates[i].dst - lo), ub_updates[i].bytes.data(), ub_updates[i].bytes.size());
+        gpu_write(cmd, lo, merged.data(), merged.size()), gp.bytes += merged.size();
+        composed_groups++, composed_updates += (int64_t)group.size();
+        if (composed_groups % 20000 == 1)
+            logf("vk: uniform updates composed in stream order: %lld groups from %lld updates", (long long)composed_groups,
+                 (long long)composed_updates);
+    }
     full_barrier(cmd);
 }
 
