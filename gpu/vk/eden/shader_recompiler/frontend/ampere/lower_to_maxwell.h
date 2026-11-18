@@ -170,6 +170,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         return result;
     };
     if (code.empty() || code.size() > 65536) return fail(0, "invalid native program size");
+    // (relink) A shared memory store (STS) not yet followed by a barrier: an LDS after it may read another lane's word
+    bool shared_store_pending = false;
     for (u32 index = 0; index < code.size(); ++index) {
         auto insn = code[index];
         result.source_instruction_offsets.push_back(static_cast<u32>(result.instructions.size()));
@@ -1584,6 +1586,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
         case 0xb1d: // BAR.SYNC 0 (bit 80: .DEFER_BLOCKING), full workgroup.
             if (insn.words[1] || (insn.words[2] & ~0x10000U) || native_predicate != 7)
                 return fail(index, "native workgroup barrier mode");
+            shared_store_pending = false;
             emit(0xf0a8000000000000ULL | predicate | (u64{1} << 43) |
                 (u64{1} << 44) | (u64{1} << 39) | (u64{7} << 39));
             break;
@@ -1606,6 +1609,17 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 address = 250;
             }
             const u32 data = opcode == 0x388 ? insn.Bits(32, 8) : static_cast<u32>(dest);
+            // (relink) The Switch runs a warp's shared memory accesses in order; Vulkan orders another lane's store and this lane's
+            // load only through a barrier, and the driver may move them past each other (bright 16x2 bars with the game's upscaler
+            // below 100% on NVIDIA). A subgroup barrier before the first LDS after an STS, only where the LDS is not predicated
+            // (every lane reaches it). RX_VK_SHARED_NO_LDS_BARRIER=1: none (the RX_VK_SHARED prefix is in disk_stamp)
+            static const bool lds_barrier = std::getenv("RX_VK_SHARED_NO_LDS_BARRIER") == nullptr;
+            if (opcode == 0x388) {
+                shared_store_pending = true;
+            } else if (shared_store_pending && lds_barrier && native_predicate == 7) {
+                emit(0xef98000000000000ULL | predicate | (u64{1} << 20)); // MEMBAR, bit 20: subgroup barrier
+                shared_store_pending = false;
+            }
             emit((opcode == 0x388 ? 0xef58000000000000ULL : 0xef48000000000000ULL) |
                 predicate | data | (u64{address} << 8) | (u64{insn.Bits(40, 24)} << 20) |
                 (u64{width} << 48));

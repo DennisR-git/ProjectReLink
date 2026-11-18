@@ -161,6 +161,7 @@ public:
                                const Value& false_value);
 
     void Barrier();
+    void SubgroupBarrier();
     void WorkgroupMemoryBarrier();
     void DeviceMemoryBarrier();
 

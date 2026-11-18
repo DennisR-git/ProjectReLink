@@ -22,6 +22,7 @@ OPCODE(EndPrimitive,                                        Void,           U32,
 
 // Barriers
 OPCODE(Barrier,                                             Void,                                                                                           )
+OPCODE(SubgroupBarrier,                                      Void,                                                                                           )
 OPCODE(WorkgroupMemoryBarrier,                              Void,                                                                                           )
 OPCODE(DeviceMemoryBarrier,                                 Void,                                                                                           )
 
