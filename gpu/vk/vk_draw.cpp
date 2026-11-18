@@ -1165,6 +1165,20 @@ uint64_t program_wm_sig(const Program& p) {
 // makes that quick), so that nothing is built during play. RX_VK_PRECOMPILE=1: in any build; =0: off. A build with
 // RX_RELEASE=1 (nx2/build.py) has it on. The notes are written in every build ----
 std::mutex note_mu;
+// (relink) A list a crash or a full disk left ending in part of a record: cut back to its last whole record before it is added
+// to, the whole ones kept. Records added after a part one were never read back (their pipelines made again in play at every
+// start). RX_VK_KEEP_PART_RECORD=1: left as it was
+void cut_part_record(const std::string& path, uint64_t head, uint64_t rec) {
+    static const bool off = getenv("RX_VK_KEEP_PART_RECORD") != nullptr;
+    if (off || !rec) return;
+    std::error_code ec;
+    const uint64_t size = std::filesystem::file_size(path, ec);
+    if (ec || size < head) return;
+    const uint64_t whole = head + (size - head) / rec * rec;
+    if (whole == size) return;
+    std::filesystem::resize_file(path, whole, ec);
+    logf("vk: %s ended in part of a record: %s", path.c_str(), ec ? "it could not be cut back" : "cut back to its last whole one");
+}
 FILE* note_file = nullptr;
 std::unordered_set<uint64_t> noted;   // (a pipeline once in the file, however many runs meet it)
 std::string pipe_notes_path() {
@@ -1222,6 +1236,7 @@ void pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targ
             fclose(f);
         }
         const bool same = head[0] == stamp && head[1] == sizeof(PipeNote);
+        if (same) cut_part_record(path, sizeof head, sizeof(PipeNote));
         if (same) {
             if (FILE* f = fopen(path.c_str(), "rb")) {
                 for (int64_t at = 16;; at += sizeof(PipeNote)) {
@@ -1331,6 +1346,7 @@ void state_record(const Program& p, const NvnState& s, const Targets& at, VkPrim
         FILE* probe = fopen(path.c_str(), "rb");
         const bool keep = probe && !had.empty();
         if (probe) fclose(probe);
+        if (keep) cut_part_record(path, 12, sizeof(StateRec));   // (the magic and the record size)
         state_file = fopen(path.c_str(), keep ? "ab" : "wb");
         if (state_file && !keep) {
             const uint32_t size = sizeof(StateRec);
