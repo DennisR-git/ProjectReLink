@@ -4,6 +4,8 @@
 #include <atomic>
 #include <algorithm>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "vk_xfer.h"
@@ -49,6 +51,36 @@ struct Sub {
     int nvn_format = 0;
     uint32_t down = 0;   // (a level the image left out, copied into its first at 1 / 2^down the size)
 };
+
+/// (relink) What the device does with a format in optimal tiling, asked of the driver once each: a scaled copy looks at both sides
+VkFormatFeatureFlags tiling_features(VkFormat f) {
+    static std::mutex mu;
+    static std::unordered_map<int, VkFormatFeatureFlags> known;
+    std::lock_guard lk(mu);
+    if (const auto it = known.find((int)f); it != known.end()) return it->second;
+    VkFormatProperties fp{};
+    vkGetPhysicalDeviceFormatProperties(dev.physical, f, &fp);
+    return known[(int)f] = fp.optimalTilingFeatures;
+}
+/// (relink) 0: float or normalized, 1: unsigned integer, 2: signed integer. A blit may not mix them (VUID 00229, 00230)
+int format_class(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8_UINT: case VK_FORMAT_B8G8R8_UINT:
+    case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_B8G8R8A8_UINT: case VK_FORMAT_A8B8G8R8_UINT_PACK32:
+    case VK_FORMAT_A2R10G10B10_UINT_PACK32: case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_R16_UINT:
+    case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16B16_UINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32_UINT:
+    case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_S8_UINT:
+        return 1;
+    case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8_SINT: case VK_FORMAT_B8G8R8_SINT:
+    case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_B8G8R8A8_SINT: case VK_FORMAT_A8B8G8R8_SINT_PACK32:
+    case VK_FORMAT_A2R10G10B10_SINT_PACK32: case VK_FORMAT_A2B10G10R10_SINT_PACK32: case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16_SINT: case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_SINT:
+    case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32B32_SINT: case VK_FORMAT_R32G32B32A32_SINT:
+        return 2;
+    default:
+        return 0;
+    }
+}
 
 int warn_budget[16];
 void warn(int key, const char* what) {
@@ -344,7 +376,20 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         bl.srcOffsets[1] = {s.x + (int32_t)s.w, s.y + (int32_t)s.h, s.z + (int32_t)s.d};
         bl.dstOffsets[0] = offset(d);
         bl.dstOffsets[1] = {d.x + (int32_t)d.w, d.y + (int32_t)d.h, d.z + (int32_t)d.d};
-        const bool linear = ((p.flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) || d.down > s.down) && color;
+        // (relink) What Vulkan allows a blit: BLIT_SRC and BLIT_DST, one format class on both sides, the same format for depth or
+        // stencil, single-sampled images, and linear filtering only where the source format has it. Outside that the result is
+        // undefined (garbage, or a lost device on some drivers): skipped, the destination keeps what it had. RX_VK_BLIT_CHECK=0: as before
+        static const bool check = !(getenv("RX_VK_BLIT_CHECK") && atoi(getenv("RX_VK_BLIT_CHECK")) == 0);
+        const VkFormat sf = s.tex->format, df = d.tex->format;
+        if (check && (!(tiling_features(sf) & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || !(tiling_features(df) & VK_FORMAT_FEATURE_BLIT_DST_BIT) ||
+                      format_class(sf) != format_class(df) || s.tex->samples != VK_SAMPLE_COUNT_1_BIT ||
+                      d.tex->samples != VK_SAMPLE_COUNT_1_BIT)) {
+            warn(13, "texture blit the device cannot make: skipped");
+            full_barrier(cmd);
+            return;
+        }
+        const bool linear = ((p.flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) || d.down > s.down) && color &&
+                            (!check || ((tiling_features(sf) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) && format_class(sf) == 0));
         vkCmdBlitImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, d.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
@@ -376,6 +421,14 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
     if (pass_trace_on())   // (relink, diagnostic)
         trace_line("clear tex #%u %#llx %ux%u f%#x%s", s.tex->id, (unsigned long long)s.tex->gpu, s.tex->width, s.tex->height,
                    s.tex->nvn_format, s.tex->released ? " (finalized)" : "");
+    {   // (relink) An image kept in ASTC blocks cannot be cleared: vkCmdClearColorImage takes no compressed format, and the region
+        // path below knows BC blocks only. Left as it is. RX_VK_CLEAR_ASTC=1: cleared as before
+        static const bool as_before = getenv("RX_VK_CLEAR_ASTC") != nullptr;
+        if (!as_before && s.tex->format >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && s.tex->format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK) {
+            warn(14, "clear of a texture kept in ASTC blocks: skipped");
+            return;
+        }
+    }
     end_pass(cmd);
     GprofSpan gp(cmd, "xfer clear texture (with its barriers)");
     full_barrier(cmd);

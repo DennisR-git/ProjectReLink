@@ -1165,6 +1165,20 @@ uint64_t program_wm_sig(const Program& p) {
 // makes that quick), so that nothing is built during play. RX_VK_PRECOMPILE=1: in any build; =0: off. A build with
 // RX_RELEASE=1 (nx2/build.py) has it on. The notes are written in every build ----
 std::mutex note_mu;
+// (relink) A list a crash or a full disk left ending in part of a record: cut back to its last whole record before it is added
+// to, the whole ones kept. Records added after a part one were never read back (their pipelines made again in play at every
+// start). RX_VK_KEEP_PART_RECORD=1: left as it was
+void cut_part_record(const std::string& path, uint64_t head, uint64_t rec) {
+    static const bool off = getenv("RX_VK_KEEP_PART_RECORD") != nullptr;
+    if (off || !rec) return;
+    std::error_code ec;
+    const uint64_t size = std::filesystem::file_size(path, ec);
+    if (ec || size < head) return;
+    const uint64_t whole = head + (size - head) / rec * rec;
+    if (whole == size) return;
+    std::filesystem::resize_file(path, whole, ec);
+    logf("vk: %s ended in part of a record: %s", path.c_str(), ec ? "it could not be cut back" : "cut back to its last whole one");
+}
 FILE* note_file = nullptr;
 std::unordered_set<uint64_t> noted;   // (a pipeline once in the file, however many runs meet it)
 std::string pipe_notes_path() {
@@ -1222,6 +1236,7 @@ void pipeline_note(uint64_t key, const Program& p, const NvnState& s, const Targ
             fclose(f);
         }
         const bool same = head[0] == stamp && head[1] == sizeof(PipeNote);
+        if (same) cut_part_record(path, sizeof head, sizeof(PipeNote));
         if (same) {
             if (FILE* f = fopen(path.c_str(), "rb")) {
                 for (int64_t at = 16;; at += sizeof(PipeNote)) {
@@ -1331,6 +1346,7 @@ void state_record(const Program& p, const NvnState& s, const Targets& at, VkPrim
         FILE* probe = fopen(path.c_str(), "rb");
         const bool keep = probe && !had.empty();
         if (probe) fclose(probe);
+        if (keep) cut_part_record(path, 12, sizeof(StateRec));   // (the magic and the record size)
         state_file = fopen(path.c_str(), keep ? "ab" : "wb");
         if (state_file && !keep) {
             const uint32_t size = sizeof(StateRec);
@@ -1858,7 +1874,11 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     if (!p.mesh) {
         dyn.push_back(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY);
         dyn.push_back(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE);
-        dyn.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
+        // (relink) Not for the mesh fallback: its draws bind no vertex buffers, so nothing ever set a stride for a dynamic one to
+        // use (a validation error on every such draw). The ordinary draw after one binds its strides again (see the pipeline bind).
+        // RX_VK_FALLBACK_STRIDE=1: dynamic there too, as before
+        static const bool fb_stride = getenv("RX_VK_FALLBACK_STRIDE") != nullptr;
+        if (!p.fallback || fb_stride) dyn.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
     }
     if (dev.eds3_blend) {
         dyn.push_back(VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT);
@@ -3276,7 +3296,7 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 }
                 if (view && tex && d.is_written && (dump_on() || probe_on())) dump_written().push_back({tex, level});
                 if (dump_on()) dump_input(d.is_written ? 'W' : 'R', (uint32_t)dw().imgs.size(), handle, view ? tex : nullptr);
-                if (!view && !dev.null_descriptor) view = VK_NULL_HANDLE;
+                if (!view && !dev.null_descriptor) view = dummies.view[(int)vt];   // (relink: make_dummies; null where it could not be made)
                 dw().imgs.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &dw().imgs[first];
@@ -4381,8 +4401,68 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
 }
 #undef DYN_CHANGED
 
+// (relink) Without robustness2's nullDescriptor an image descriptor's view must not be null, and this was an empty stub: a texture or
+// storage image that resolved to nothing was written with a null view. Three 1x1 black images (1D, 2D with 6 layers for the cube
+// views, 3D), cleared in the recording that makes them, and a view of each type that the device can make. Made once; if an image
+// cannot be made all are given back and the views stay null, as before. RX_VK_NO_DUMMY_VIEWS=1: not made
 void make_dummies() {
-    if (dummies.view[0] || dev.null_descriptor) return;
+    static VkImage img[3]{};
+    static VmaAllocation mem[3]{};
+    static const bool off = getenv("RX_VK_NO_DUMMY_VIEWS") != nullptr;
+    static bool tried = false;
+    if (off || tried || dev.null_descriptor || !rec_cmd) return;
+    tried = true;
+    const VkImageType types[3] = {VK_IMAGE_TYPE_1D, VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_3D};
+    const uint32_t layers[3] = {1, 6, 1};
+    for (int i = 0; i < 3; i++) {
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.flags = i == 1 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+        ci.imageType = types[i], ci.format = VK_FORMAT_R8G8B8A8_UNORM, ci.extent = {1, 1, 1};
+        ci.mipLevels = 1, ci.arrayLayers = layers[i], ci.samples = VK_SAMPLE_COUNT_1_BIT, ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (!create_image(ci, img[i], mem[i])) {
+            for (int j = 0; j < i; j++) destroy_image(img[j], mem[j]), img[j] = VK_NULL_HANDLE, mem[j] = nullptr;
+            logf("vk: the dummy images (the device has no nullDescriptor) were not made: image views stay null");
+            return;
+        }
+    }
+    VkImageMemoryBarrier2 b[3]{};
+    for (int i = 0; i < 3; i++) {
+        b[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        b[i].srcStageMask = VK_PIPELINE_STAGE_2_NONE, b[i].dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+        b[i].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, b[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b[i].srcQueueFamilyIndex = b[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b[i].image = img[i];
+        b[i].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers[i]};
+    }
+    VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dep.imageMemoryBarrierCount = 3, dep.pImageMemoryBarriers = b;
+    vkCmdPipelineBarrier2(rec_cmd, &dep);
+    const VkClearColorValue black{};
+    for (int i = 0; i < 3; i++) {
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers[i]};
+        vkCmdClearColorImage(rec_cmd, img[i], VK_IMAGE_LAYOUT_GENERAL, &black, 1, &range);
+    }
+    for (int i = 0; i < 3; i++) {
+        b[i].srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT, b[i].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        b[i].dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b[i].dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT;
+        b[i].oldLayout = b[i].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    vkCmdPipelineBarrier2(rec_cmd, &dep);
+    // (VkImageViewType's order: 1D, 2D, 3D, cube, 1D array, 2D array, cube array; the cube views and the 2D array one are of the
+    // 6-layer image)
+    const int from[7] = {0, 1, 2, 1, 0, 1, 1};
+    const uint32_t count[7] = {1, 1, 1, 6, 1, 6, 6};
+    for (int t = 0; t < 7; t++) {
+        if (t == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY && !dev.features.imageCubeArray) continue;
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = img[from[t]], vi.viewType = (VkImageViewType)t, vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, count[t]};
+        if (vkCreateImageView(dev.device, &vi, nullptr, &dummies.view[t]) != VK_SUCCESS) dummies.view[t] = VK_NULL_HANDLE;
+    }
 }
 
 
@@ -7048,6 +7128,9 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         FINE_SCOPE(FT_BINDPL);
         FINE_N(FC_BIND_PIPE, 1);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl), last_pipeline = pl;
+        // (relink) A pipeline whose vertex strides are static leaves the dynamic ones undefined: the next ordinary draw binds its
+        // vertex streams again, though its buffers are the same as before the fallback's draw
+        if (p.fallback) last_vb_valid = false, vertex_set.on = false;
     }
     if (!same_desc) {
         FINE_SCOPE(FT_BINDDESC);
@@ -8756,8 +8839,7 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
             // (issue 496: one at a time on Intel. RX_VK_COMPUTE_SERIAL=1 or 0 says so on any GPU)
             static const bool serial = getenv("RX_VK_COMPUTE_SERIAL") ? getenv("RX_VK_COMPUTE_SERIAL")[0] == '1'
                                                                      : dev.props.vendorID == 0x8086;
-            auto build = [job] {
-                Program& q = const_cast<Program&>(*job);
+            const auto info = [](const Program& q) {
                 VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
                 ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
                 ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -8767,6 +8849,21 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                 ci.layout = q.layout;
                 static const bool noopt = getenv("RX_VK_NOOPT") != nullptr;
                 if (noopt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+                return ci;
+            };
+            // (relink) A pipeline the caches already hold is only asked for here, without a compile: it comes back at once. Queued,
+            // it waited for a worker behind the graphics builds, and the dispatch was left out meanwhile (its work is not done
+            // again later). Needs pipelineCreationCacheControl. RX_VK_COMPUTE_ASK=0: always queued
+            static const bool ask = !(getenv("RX_VK_COMPUTE_ASK") && atoi(getenv("RX_VK_COMPUTE_ASK")) == 0);
+            VkPipeline cached = VK_NULL_HANDLE;
+            if (ask && dev.vk13.pipelineCreationCacheControl) {
+                VkComputePipelineCreateInfo asked = info(p);
+                asked.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+                if (guarded_compute(pcache, &asked, &cached) != VK_SUCCESS) cached = VK_NULL_HANDLE;
+            }
+            auto build = [job, info] {
+                Program& q = const_cast<Program&>(*job);
+                VkComputePipelineCreateInfo ci = info(q);
                 const auto t0 = std::chrono::steady_clock::now();
                 VkPipeline made = VK_NULL_HANDLE;
                 if (const VkResult r = guarded_compute(pcache, &ci, &made); r != VK_SUCCESS || !made) {
@@ -8784,7 +8881,12 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
                 pcache_built_since_save++;
                 q.compute_state.store(2, std::memory_order_release);
             };
-            if (serial) jobs_push_serial(std::move(build));
+            if (cached) {
+                p.compute_pipeline = cached;
+                compute_used_note(p.key);
+                st_pipelines++;
+                p.compute_state.store(2, std::memory_order_release);
+            } else if (serial) jobs_push_serial(std::move(build));
             else jobs_push(std::move(build), true);
         }
         // (only the dispatch that started the build waits: later ones while it still compiles are left out at once, not 50 ms
