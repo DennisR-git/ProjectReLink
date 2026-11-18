@@ -933,8 +933,16 @@ struct UbWord {
     bool on = false;
 };
 thread_local UbWord ub_words[128];
+// (relink) The slot of a cached word: uniform buffers often hold the same handle 512 bytes or a page apart, and the low seven
+// word bits alone sent those reads to one slot where they evicted each other; the upper bits are mixed in. The hit test still
+// compares the whole address. RX_VK_UB_WORD_HASH=0: the low bits alone, as before
+uint32_t ub_word_slot(uint64_t addr) {
+    static const bool linear = getenv("RX_VK_UB_WORD_HASH") && atoi(getenv("RX_VK_UB_WORD_HASH")) == 0;
+    const uint64_t word = addr >> 2;
+    return (uint32_t)((linear ? word : word + (word >> 7) + (word >> 14)) & 127);
+}
 bool ub_word_hit(uint64_t addr, size_t lim, uint32_t* out) {
-    UbWord& w = ub_words[(addr >> 2) & 127];
+    UbWord& w = ub_words[ub_word_slot(addr)];
     if (!w.on || w.addr != addr || w.rec != rec_value_now || w.page != memory_page_stamp(addr)) return false;
     if (!ub_gap_holds(addr, 4, 0, lim)) return false;
     *out = w.v;
@@ -1020,7 +1028,7 @@ bool ub_read(uint64_t addr, void* dst, uint64_t n) {
     // in the gap do not walk the list. A word kept from that gap is the capture's own bytes)
     if (ub_gap_holds(addr, n, 0, lim) || ub_try_gap(0, lim, addr, n)) {
         if (n == 4 && page == memory_page_stamp(addr)) {
-            UbWord& w = ub_words[(addr >> 2) & 127];
+            UbWord& w = ub_words[ub_word_slot(addr)];
             uint32_t v = 0;
             std::memcpy(&v, dst, 4);
             w = {};
