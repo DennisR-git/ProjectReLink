@@ -3350,9 +3350,13 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     uint32_t owned = !tex->uploaded && !upload_all ? gpu_owned_since(tex->gpu, tex->guest_size) : 0;
     if (owned && !any_format && !drawable_format(*tex)) {
         static std::atomic<int> logged{0};
-        if (logged.fetch_add(1, std::memory_order_relaxed) < 30)
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 30) {
+            std::string drawn;   // (the textures the GPU wrote that lie in its storage now, if any: issue 47's question)
+            texture_describe_written(tex->gpu, tex->guest_size, drawn);
             logf("vk: texture #%u %#llx %ux%u NVN %#x is block-compressed: uploaded from memory although render targets used its "
-                 "storage", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->nvn_format);
+                 "storage;%s", tex->id, (unsigned long long)tex->gpu, tex->width, tex->height, tex->nvn_format,
+                 drawn.empty() ? " no texture the GPU wrote lies there now" : drawn.c_str());
+        }
         owned = 0;
     }
     if (owned && !remade_skip_old()) {   // (one evicted that came from memory: uploaded from it again. Above)
@@ -3388,6 +3392,9 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         if (zero && z <= 40)
             logf("vk: terrain tile #%u %#llx made from memory that is all zero (frame %llu; %lld such of %lld tiles made from "
                  "memory)", tex->id, (unsigned long long)tex->gpu, (unsigned long long)frame_no, (long long)z, (long long)t);
+        if (t % 50 == 0)   // (the count goes on after the 40 named: what a run is compared by)
+            logf("vk: terrain tiles made from memory so far: %lld, %lld of them all zero (frame %llu)", (long long)t, (long long)z,
+                 (unsigned long long)frame_no);
     }
     if (owned && !texture_dirty(*tex, owned, dirty)) {
         tex->uploaded = true;
@@ -4061,7 +4068,7 @@ int texture_flush_to_guest(uint64_t lo, uint64_t size) {
     flushes += done, all_bytes += (int64_t)bytes, all_ms += ms;
     static int logged;
     if (done && (logged++ < 12 || logged % 200 == 0))
-        logf("vk: virtual pages %#llx..%#llx remapped: %d texture(s) the GPU wrote there written back into their memory "
+        logf("vk: storage %#llx..%#llx about to be remapped or moved: %d texture(s) the GPU wrote there written back into their memory "
              "(%llu KB, %.1f ms; %lld in all, %lld MB, %.0f ms)", (unsigned long long)lo, (unsigned long long)hi, done,
              (unsigned long long)(bytes >> 10), ms, (long long)flushes, (long long)(all_bytes >> 20), all_ms);
     return done;

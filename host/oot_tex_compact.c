@@ -43,3 +43,28 @@ int hos_tex_compact_due(void) {
     if (tc_asked % 3600 == 0) hos_log("tex: heap compaction: %lu rounds let through in %lu asks", tc_let, tc_asked);
     return yes;
 }
+
+/* (relink, issues 47 and 72: the striped ground) nx2/oot_tex_move.py calls this right before each copy of the compaction: the
+   texture stored at [from, from + size) is about to be copied to `to` with the CPU and made again there. What the GPU drew
+   into textures of that range is only in the renderer's images: it is written back into their memory first (the back end's
+   answer to a remapping of virtual pages, which is the same need), so the copy carries the texels. A range with no such
+   texture costs one list lookup. HOS_TEX_MOVE_FLUSH=0: not told (the stripes come back), 2: the first 200 moves are logged. */
+void rx_nvn_vmap_changing(uint64_t gpu, uint64_t size);   /* (host/rx_backend.c; a pool's GPU address is its memory's) */
+
+static int tm_mode = -1;
+static unsigned long tm_moves;
+static uint64_t tm_bytes;
+
+void hos_tex_moving(uint64_t from, uint64_t size, uint64_t to) {
+    if (tm_mode < 0) {
+        const char *e = getenv("HOS_TEX_MOVE_FLUSH");
+        tm_mode = e && *e ? atoi(e) : 1;
+        hos_log("tex: textures the heap's compaction moves are %s", tm_mode ? "written back from the GPU's images first" : "copied as their memory is (HOS_TEX_MOVE_FLUSH=0)");
+    }
+    tm_moves++, tm_bytes += size;
+    if (tm_mode == 2 && tm_moves <= 200)
+        hos_log("tex: move %#llx -> %#llx, %llu KB", (unsigned long long)from, (unsigned long long)to, (unsigned long long)(size >> 10));
+    if (tm_moves % 2000 == 0)
+        hos_log("tex: the heap's compaction has moved %lu textures (%llu MB)", tm_moves, (unsigned long long)(tm_bytes >> 20));
+    if (tm_mode && from && size && size < (1ull << 31)) rx_nvn_vmap_changing(from, size);
+}

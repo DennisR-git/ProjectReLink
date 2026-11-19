@@ -133,6 +133,7 @@ def exefs_sites():
     import oot_ripples
     import oot_step_cuts
     import oot_tex_compact
+    import oot_tex_move
     return {"widescreen": [oot_wide.MAIN + s[0] for s in oot_wide.SITES],
             "camera jitter (DLSS, FSR)": [oot_wide.MAIN + s[0] for s in oot_jitter.SITES],
             "Occlusion Off": [oot_occlusion.MAIN + o for o in oot_occlusion.OFFSETS],
@@ -140,6 +141,7 @@ def exefs_sites():
             "the frame rate above 60 fps": [oot_step_rate.MAIN + oot_step_rate.SITE],
             "water ripples above 60 fps": [oot_ripples.MAIN + oot_ripples.SITE],
             "texture heap compaction": [oot_tex_compact.MAIN + oot_tex_compact.SITE],
+            "texture moves told to the renderer": [oot_tex_move.MAIN + s[0] for s in oot_tex_move.SITES],
             **oot_step_cuts.sites()}
 
 
@@ -213,6 +215,8 @@ def main():
         oot_step_cuts.install(L, img)
         import oot_tex_compact   # (relink) the texture heap's compaction round asked for once a second, not at every frame
         oot_tex_compact.install(L, img)
+        import oot_tex_move   # (relink, issues 47 and 72) the renderer told before the compaction moves a texture: the striped ground
+        oot_tex_move.install(L, img)
     L.discover(max_insns=a.max_func)
     print("discovered %d functions (%.0fs)" % (len(L.funcs), time.time() - t0))
     # (relink) exefs mods (nx2/exefs_mods.py, OOT_EXEFS_PATCHES: what make_game.py applied to this exefs): which functions
