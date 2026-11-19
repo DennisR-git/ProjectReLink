@@ -70,6 +70,10 @@ VkSemaphore timeline = VK_NULL_HANDLE;
 // before ----
 VkSemaphore rec_timeline = VK_NULL_HANDLE;
 uint64_t rec_seq = 0;                       // (the recordings submitted so far; replay_mu)
+// (relink, 0.7.9.3, issue 79) the newest of them handed to the driver, for the stall watch below: set before the call, which
+// a driver that hung may never return from
+std::atomic<uint64_t> rec_sent_pub{0};
+void stall_watch_start();
 std::vector<uint64_t> rec_open_values;      // (the submissions finished in the recording being made; replay_mu)
 std::mutex rec_map_mu;
 std::map<uint64_t, uint64_t> value_rec;     // submission value (or a recording's own) -> the recording that finished it
@@ -233,6 +237,7 @@ void queue_flush_locked() {   // (dev.present_mu held)
     si.signalSemaphoreInfoCount = n;
     si.pSignalSemaphoreInfos = sig;
     PROF(PROF_QSUBMIT);
+    if (pend.rec) rec_sent_pub.store(pend.rec, std::memory_order_relaxed), stall_watch_start();
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: batched submit %llu failed (%d)", (unsigned long long)batch_next, (int)res);
@@ -726,6 +731,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         return;
     }
     PROF(PROF_QSUBMIT);
+    if (seq) rec_sent_pub.store(seq, std::memory_order_relaxed), stall_watch_start();
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
     if (tl_log_on()) {   // (every submit, for vk_tl_recent: one that signals nothing has tid 0, shown with a 'u')
         if (signal_value) {
@@ -2737,6 +2743,59 @@ uint64_t vk_rec_completed() {
     if (rec_timeline) vkGetSemaphoreCounterValue(dev.device, rec_timeline, &v);
     return v;
 }
+// (relink, 0.7.9.3, issue 79) The stall watch. A GPU that stops was noticed by whichever thread waited for it with a time
+// limit: the game's thread, at each frame's first submit. With fast sync that thread no longer waits there, the waits left
+// have no limit (a fence, the swapchain's image), and a hung card gave a frozen picture and a log that says nothing: an RX
+// 6800 XT on RADV under 0.7.9.2, where 0.7.8 and RX_VK_FAST_SYNC=0 name the draws that hung. A thread of its own now looks
+// twice a second: recordings handed to the driver, none finished for RX_VK_STALL_REPORT_MS (2000) or the device lost, and
+// it writes the same report those waits wrote (once a run, as theirs). It asks the driver for a counter and nothing else:
+// no lock of ours, so it runs whatever the other threads are stuck in. RX_VK_STALL_WATCH=0: off.
+// RX_VK_STALL_WATCH_TEST=<n> (a test): the stall report made at its n-th look, as if nothing had finished since
+namespace {
+void stall_watch_start() {
+    static std::atomic<bool> started{false};
+    if (started.load(std::memory_order_relaxed) || started.exchange(true)) return;
+    static const bool on = !getenv("RX_VK_STALL_WATCH") || atoi(getenv("RX_VK_STALL_WATCH")) != 0;
+    static const int64_t stall_ms = getenv("RX_VK_STALL_REPORT_MS") ? atoll(getenv("RX_VK_STALL_REPORT_MS")) : 2000;
+    if (!on || stall_ms <= 0 || !rec_timeline) return;
+    logf("vk: stall watch on: a card that stops is reported after %lld ms with work sent and none finished "
+         "(RX_VK_STALL_WATCH=0: off)", (long long)stall_ms);
+    std::thread([] {
+        SetThreadDescription(GetCurrentThread(), L"mkw_vk stall watch");
+        static const int test_at = getenv("RX_VK_STALL_WATCH_TEST") ? atoi(getenv("RX_VK_STALL_WATCH_TEST")) : 0;
+        uint64_t last_done = UINT64_MAX;
+        int64_t since = 0;
+        for (int looks = 1;; looks++) {
+            Sleep(500);
+            // (lost, and seen by a thread that may not have said so: the report is made once whoever asks)
+            if (device_was_lost()) return checkpoints_report();
+            const uint64_t sent = rec_sent_pub.load(std::memory_order_relaxed);
+            uint64_t done = 0;
+            const VkResult r = vkGetSemaphoreCounterValue(dev.device, rec_timeline, &done);
+            if (test_at > 0 && looks == test_at) {
+                logf("vk: the stall watch's report, asked for by RX_VK_STALL_WATCH_TEST (look %d)", looks);
+                gpu_stall_report(0.0, done, sent);
+                return;
+            }
+            if (r == VK_ERROR_DEVICE_LOST) {
+                logf("vk: the stall watch finds the device lost (recordings sent %llu, finished %llu)", (unsigned long long)sent,
+                     (unsigned long long)done);
+                checkpoints_report();
+                return;
+            }
+            const int64_t now = tl_now_us() / 1000;
+            if (r != VK_SUCCESS || done != last_done || done >= sent) {
+                last_done = done, since = now;
+                continue;
+            }
+            if (now - since >= stall_ms) {
+                gpu_stall_report((now - since) / 1000.0, done, sent);
+                return;   // (once a run)
+            }
+        }
+    }).detach();
+}
+}  // namespace
 bool vk_rec_wait(uint64_t seq, uint32_t ms) {
     if (!rec_timeline || vk_rec_completed() >= seq) return true;
     queue_flush_for(FR_VALUE);
@@ -2744,7 +2803,34 @@ bool vk_rec_wait(uint64_t seq, uint32_t ms) {
     wi.semaphoreCount = 1;
     wi.pSemaphores = &rec_timeline;
     wi.pValues = &seq;
-    return vkWaitSemaphores(dev.device, &wi, (uint64_t)ms * 1000000ull) == VK_SUCCESS;
+    const VkResult r = vkWaitSemaphores(dev.device, &wi, (uint64_t)ms * 1000000ull);
+    if (r == VK_SUCCESS) return true;
+    // (relink, 0.7.9.3, issue 79) With fast sync this is the wait the game's thread makes, and it said nothing of how it
+    // ended: a GPU that hung under 0.7.9.2 (an RX 6800 XT on RADV, two runs) left no "THE GRAPHICS CARD STOPPED" and no report
+    // of the work that stopped, where 0.7.8 and RX_VK_FAST_SYNC=0 gave both (vk_timeline_wait's). A lost device is reported
+    // from here too, and a wait that gives up counts toward the stall report: nothing finished for RX_VK_STALL_REPORT_MS
+    if (r == VK_ERROR_DEVICE_LOST) {
+        checkpoints_report();
+        return false;
+    }
+    {
+        static std::mutex stall_mu;
+        static uint64_t stall_value = UINT64_MAX;
+        static int64_t stall_since = 0;
+        static const int64_t stall_ms = getenv("RX_VK_STALL_REPORT_MS") ? atoll(getenv("RX_VK_STALL_REPORT_MS")) : 2000;
+        const uint64_t done = vk_rec_completed();
+        const int64_t now = tl_now_us() / 1000;
+        bool report = false;
+        int64_t for_ms = 0;
+        {
+            std::lock_guard lk(stall_mu);
+            if (done != stall_value) stall_value = done, stall_since = now - (int64_t)ms;
+            for_ms = now - stall_since;
+            report = stall_ms > 0 && for_ms >= stall_ms;
+        }
+        if (report) gpu_stall_report(for_ms / 1000.0, done, seq);
+    }
+    return false;
 }
 namespace {
 bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {

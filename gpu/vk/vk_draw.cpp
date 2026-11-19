@@ -4072,9 +4072,8 @@ void gpu_stall_report(double seconds, uint64_t done, uint64_t waited) {
 }
 void device_lost_notice();   // (vk_main.cpp)
 void checkpoints_report() {
-    static bool done;
-    if (done) return;
-    done = true;
+    static std::atomic<bool> done{false};   // (relink: any thread may be the one that sees the loss, the stall watch among them)
+    if (done.exchange(true)) return;
     device_lost_notice();
     if (getenv("RX_VK_FAULT_INFO")) device_fault_report();   // (now, while the process is still alive: the faulting address)
     {   // (RX_VK_FLASH_RECORD=<program,...>: those programs' last draws, sizes and all)
