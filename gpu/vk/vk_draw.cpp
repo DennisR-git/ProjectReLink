@@ -1036,9 +1036,79 @@ VkResult guarded_compute_once(VkPipelineCache cache, const VkComputePipelineCrea
     return r;
 }
 #endif
+// (relink, issues 111 and 131: a start of 10 to 30 minutes at every launch on AMD cards) A lean start keeps no pipeline cache of
+// ours and takes every pipeline from the driver's own disk cache. NVIDIA's has them (this PC's 5030 compute pipelines in 2.7 s);
+// AMD's Windows driver compiled the start's compute pipelines again at each start (an RX 9070 XT's second start: 5171 compute
+// pipelines in 557 s, the same as its first). So where the driver is not NVIDIA's, the compute pipelines (the start's, play's and
+// the mesh fallback's) are made through a cache of their own, kept in relink_compute_pipelines.bin beside the executable: read at
+// the first compute pipeline, written after the start's precompile and when play has built more. Only the compute ones: a cache
+// with every graphics pipeline is what a lean start is there to avoid (pipelines_lean). Not checked on an AMD card (none here):
+// whether its driver builds from the cache's data faster than it compiles is what the players' logs will say ("vk: compute
+// pipeline cache" lines). RX_VK_COMPUTE_CACHE=1: on any card, 0: never
+VkPipelineCache ccache = VK_NULL_HANDLE;
+std::atomic<int64_t> ccache_built{0};
+size_t ccache_loaded = 0;
+bool compute_cache_wanted() {
+    static const bool on = [] {
+        if (const char* e = getenv("RX_VK_COMPUTE_CACHE")) return atoi(e) != 0;
+        return dev.props.vendorID != 0x10DE;
+    }();
+    return on;
+}
+std::string compute_cache_path() { return computes_list_path("relink_compute_pipelines.bin"); }
+/// The cache a compute pipeline is made through when the caller has none (a lean start): made at the first call
+VkPipelineCache compute_cache() {
+    if (!compute_cache_wanted()) return VK_NULL_HANDLE;
+    static std::once_flag once;
+    std::call_once(once, [] {
+        const std::vector<uint8_t> data = pcache_read(compute_cache_path());
+        VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        ci.initialDataSize = data.size();
+        ci.pInitialData = data.empty() ? nullptr : data.data();
+        if (vkCreatePipelineCache(dev.device, &ci, nullptr, &ccache) != VK_SUCCESS) {   // (data the driver refuses: an empty one)
+            ci.initialDataSize = 0, ci.pInitialData = nullptr;
+            if (vkCreatePipelineCache(dev.device, &ci, nullptr, &ccache) != VK_SUCCESS) ccache = VK_NULL_HANDLE;
+        }
+        if (ccache && vkGetPipelineCacheData(dev.device, ccache, &ccache_loaded, nullptr) != VK_SUCCESS) ccache_loaded = 0;
+        logf("vk: compute pipeline cache %s: %zu KB read, %zu KB taken by the driver (RX_VK_COMPUTE_CACHE=0: none)",
+             compute_cache_path().c_str(), data.size() >> 10, ccache_loaded >> 10);
+    });
+    return ccache;
+}
+/// The compute cache to its file when pipelines were made through it since the last time (force: any; else 32 and a minute)
+void compute_cache_save(bool force) {
+    if (!ccache) return;
+    static std::mutex mu;
+    static std::chrono::steady_clock::time_point last;
+    std::unique_lock lk(mu, std::defer_lock);
+    if (force) lk.lock();
+    else if (!lk.try_lock()) return;
+    const int64_t built = ccache_built.load();
+    const auto now = std::chrono::steady_clock::now();
+    if (!built || (!force && (built < 32 || now - last < std::chrono::seconds(60)))) return;
+    const auto t0 = now;
+    size_t n = 0;
+    if (vkGetPipelineCacheData(dev.device, ccache, &n, nullptr) != VK_SUCCESS || !n) return;
+    std::vector<uint8_t> data(n);
+    if (vkGetPipelineCacheData(dev.device, ccache, &n, data.data()) != VK_SUCCESS) return;
+    const std::string path = compute_cache_path(), tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    const bool ok = fwrite(data.data(), 1, n, f) == n;
+    fclose(f);
+    if (!ok || !MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        remove(tmp.c_str());
+        return;
+    }
+    ccache_built -= built;
+    last = std::chrono::steady_clock::now();
+    logf("vk: compute pipeline cache written: %zu KB, %lld pipelines made through it since the last time (%.0f ms)", n >> 10,
+         (long long)built, std::chrono::duration<double, std::milli>(last - t0).count());
+}
 /// (relink) A compute pipeline the driver's compiler fails on (AMD's crashes, -13, or faults, -77, on some programs) is built
 /// again without its optimizer, as a graphics one is (build_graphics): run a little slower rather than left out
 VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
+    if (!cache && (cache = compute_cache()) != VK_NULL_HANDLE) ccache_built++;   // (a lean start: the compute pipelines' own cache)
     const VkResult r = guarded_compute_once(cache, ci, pl);
     if (r == VK_SUCCESS || r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
         (ci->flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT))
@@ -8639,6 +8709,7 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
         delete pre;
         pipeline_cache_slim();   // (relink: every pipeline the cache was read for is made)
     }
+    compute_cache_save(true);   // (what the start built through the compute pipelines' own cache, for the next start)
     logf("vk: precompile: %zu programs, %zu graphics and %zu compute pipelines in %.0f ms (%.0f ms of it the caches opened, the notes "
          "and programs read)", programs_n, graphics_n, computes_n,
          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), read_ms);
@@ -9499,6 +9570,15 @@ void pipeline_cache_slim() {
 }
 
 void pipeline_cache_save(bool force) {
+    if (ccache) {   // (the compute pipelines' own cache: on a thread of its own unless forced, as the other below)
+        if (force) compute_cache_save(true);
+        else if (ccache_built.load() >= 32) {
+            try {
+                std::thread([] { compute_cache_save(false); }).detach();
+            } catch (const std::exception&) {
+            }
+        }
+    }
     if (!pcache || (!force && pcache_built_since_save < 32)) return;
     if (pcache_slimmed && !pcache_built_since_save) return;   // (nothing built since the small cache was last written)
     pcache_built_since_save = 0;
