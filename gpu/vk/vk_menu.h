@@ -25,7 +25,9 @@ enum { HOS_OPT_KEY_FULLSCREEN = 73 };
 // (out of the box every feature is off: what the game does on its own. The ini beside the executable keeps a player's choices)
 struct Options {
     int framegen = 0;     // made frames: 0 off, or 2, 3, 4 times the game's frames
-    int pace = 0;         // frames shown on an even line (vk_framegen.cpp)
+    int pace = 1;         // frames shown on an even line (vk_framegen.cpp; (relink, 0.7.9.3) on by default: it paces the
+                          // game's frames alone too, and an options file from before, where it did nothing without frame
+                          // generation, gets it once: vk_menu.cpp pacing_rev)
     int vsync = 0;        // (relink) V-Sync: 0 off (mailbox where the driver has it, else immediate, which can tear), 1 on
                           // (FIFO: every frame waits for the display's refresh; vk_main.cpp make_swapchain)
     // (relink: 1 by default, the 3D at the picture's size. Auto ran at 1536 x 864 and below for a 2048 x 1152 picture)

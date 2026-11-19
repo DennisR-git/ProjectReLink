@@ -1021,7 +1021,7 @@ void save() {
             const char* eq = strchr(line, '=');
             if (!eq || line[0] == '#') continue;
             const std::string key(line, (size_t)(eq - line));
-            bool mine = key == "microphone_device" || key == "hdr_paper_white" || key == "options_version";
+            bool mine = key == "microphone_device" || key == "hdr_paper_white" || key == "options_version" || key == "pacing_rev";
             for (const Row& r : rows) mine |= r.value && key == ini_key(r);
             if (mine) continue;
             std::string text(line);
@@ -1039,6 +1039,9 @@ void save() {
         // (2: game_speed below 2 was only ever the old default, see menu_init; 3: the mouse's buttons are bindings, see
         // host/nn_hid.c binds_load)
         fprintf(f, "options_version=3\n");
+        // (relink, 0.7.9.3: frame_pacing above is a choice made since the row paces the game's frames alone; see menu_init. The
+        // launcher writes it too. Not a step of options_version: host/nn_hid.c reads that one for the bindings)
+        fprintf(f, "pacing_rev=1\n");
         for (const auto& o : others) fputs(o.second.c_str(), f);
         if (!can_bind()) fputs(kept.c_str(), f);
         for (int i = 0; i < HOS_KEY_N && can_bind(); i++) {   // (the keys-only controls, HOS_KEY_*, have no pad_ line)
@@ -3137,7 +3140,7 @@ void menu_init() {
         has_options = true;
         char line[80];
         bool has_resolution = false;
-        bool v2 = false;
+        bool v2 = false, pacing_rev = false;
         int old_dynres = -1;   // (the row before Resolution: 0, the full scale, is its 100%; 1 is Auto)
         while (fgets(line, sizeof line, f)) {
             char* eq = strchr(line, '=');
@@ -3150,6 +3153,7 @@ void menu_init() {
             }
             has_resolution |= !strcmp(line, "resolution");
             v2 |= !strcmp(line, "options_version");
+            pacing_rev |= !strcmp(line, "pacing_rev");
             if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
             if (!strcmp(line, "hdr_paper_white")) opts.hdr_paper_white = std::clamp(atoi(eq + 1), 80, 500);   // (relink: HDR)
             if (!strcmp(line, "microphone_device")) {   // (relink: the microphone, by its name)
@@ -3174,6 +3178,11 @@ void menu_init() {
         // (Game speed is Real time by default now: Per frame played at half speed at 30 fps, the "slow motion" players
         // reported. An options file from before kept the old default whether chosen or not: Real time for it too)
         if (!v2) opts.realtime = 1;
+        // (relink, 0.7.9.3) Frame pacing paces the game's frames alone now (vk_framegen.cpp pace_only) and is on by default. In
+        // an options file from before, with frame generation off, the row did nothing: its saved "off" was no one's choice, and
+        // it is on for that file too, until the file is saved with pacing_rev (here or by the launcher), which says the row's
+        // value was seen as it works now. With frame generation on, the row did what it does: left as saved
+        if (!pacing_rev && opts.framegen == 0) opts.pace = 1;
     }
     // An opt-in profile for 4 GB cards: keep existing options authoritative, but make a first run usable on
     // low-VRAM hardware without requiring the menu to render first.

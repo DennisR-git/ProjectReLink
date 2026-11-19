@@ -90,10 +90,10 @@ static class Game
 sealed class Settings
 {
     // the game's rows (gpu/vk/vk_menu.cpp: ini keys are the row names, lower case, spaces as underscores)
-    public int Fullscreen = 1, FrameGeneration = 0, FramePacing = 0, FrameRate = 0, Resolution = 1, Upscaling = 0, Sharpness = 0,
+    public int Fullscreen = 1, FrameGeneration = 0, FramePacing = 1, FrameRate = 0, Resolution = 1, Upscaling = 0, Sharpness = 0,
                VSync = 0,   // (the game's V-Sync row, saved as v-sync: 0 off, 1 on, FIFO)
                GameSpeed = 0, Handheld = 0, Ultrawide = 0, FpsCounter = 0,
-               Upscaler = 0;   // (the game's Upscaler row, saved as dlss: 0 the game's own, 1 NVIDIA DLSS, 2 NVIDIA DLAA, 3 AMD FSR, 4 AMD FSR native AA)
+               Upscaler = 0;   // (the game's Upscaler row, saved as dlss: 0 the game's own, 1 NVIDIA DLSS, 2 NVIDIA DLAA, 3 AMD FSR, 4 AMD FSR native AA, 5 none: the 3D at full size, as drawn)
     // the launcher's
     public bool Display60 = true, Audio = true, InvertY = false;
     /// The game built with NVIDIA DLSS: NVIDIA's DLSS SDK fetched from NVIDIA at each build, its license accepted by ticking it
@@ -170,7 +170,10 @@ sealed class Settings
         Fullscreen = Int(g, "fullscreen", 1, 0, 1);
         FrameGeneration = Int(g, "frame_generation", 0, 0, 4);
         if (FrameGeneration == 1) FrameGeneration = 2;
-        FramePacing = Int(g, "frame_pacing", 0, 0, 1);
+        FramePacing = Int(g, "frame_pacing", 1, 0, 1);
+        // (relink, 0.7.9.3: the game's rule, vk_menu.cpp menu_init: a file from before the row paced the game's frames alone,
+        // with frame generation off, gets it on once; pacing_rev, written below, says its value was seen as it works now)
+        if (!g.ContainsKey("pacing_rev") && FrameGeneration == 0) FramePacing = 1;
         VSync = Int(g, "v-sync", 0, 0, 1);
         FrameRate = Int(g, "frame_rate", 0, 0, 2);   // (2: 30, smooth: HOS_FPS_CAP=30)
         // (the game's Render resolution row: 0 Auto, 1..6 = 100 %, 75 %, 67 %, 50 %, 58 %, 33 % of the output; 1, native, by default)
@@ -202,7 +205,7 @@ sealed class Settings
     static readonly HashSet<string> Known = new(StringComparer.OrdinalIgnoreCase)
     {
         "fullscreen", "frame_generation", "frame_pacing", "v-sync", "frame_rate", "resolution", "upscaling", "sharpness", "game_speed",
-        "handheld_profile", "ultrawide", "fps_counter", "dlss",
+        "handheld_profile", "ultrawide", "fps_counter", "dlss", "pacing_rev",
     };
 
     public void Save()
@@ -234,6 +237,7 @@ sealed class Settings
         Row("ultrawide", Ultrawide);
         Row("fps_counter", FpsCounter);
         Row("dlss", Upscaler);
+        Row("pacing_rev", 1);
         foreach (var (k, v) in other) g.Append(k).Append('=').Append(v).Append('\n');
         File.WriteAllText(GameIni, g.ToString());
 
