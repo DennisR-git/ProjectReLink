@@ -671,6 +671,11 @@ constexpr uint32_t kPushSize = Shader::Backend::SPIRV::MESH_FALLBACK_PUSH_END;
 
 void ensure_layout(Program& p) {
     if (p.layout) return;
+    // (relink, 0.7.9.3) one maker at a time: a background worker makes a program's layout too now (eager_graphics), beside the
+    // replay threads, which had the recording lock for it only while they ran in parallel
+    static std::mutex layout_mu;
+    std::lock_guard layout_lk(layout_mu);
+    if (p.layout) return;
     std::vector<VkDescriptorSetLayoutBinding> bindings;
     uint32_t total = 0;
     auto add = [&](VkDescriptorType type, VkShaderStageFlags stage, const auto& descriptors) {
@@ -919,6 +924,27 @@ bool pipe_shared_on() {
         return v;
     }();
     return on;
+}
+// (relink, 0.7.9.3) Graphics pipelines made ahead of their first draw (eager_graphics, below): `pipelines` is the replay
+// threads' and a worker cannot put anything in it, so what a worker builds waits here, by the pipeline's key mixed with its
+// program object, until the first draw that asks for it takes it (ahead_take). A slot left empty means a draw has that key now
+// (taken, or the draw came first and builds its own): the worker leaves it alone
+std::mutex ahead_mu;
+std::unordered_map<uint64_t, std::unique_ptr<PipeEntry>> ahead;
+std::deque<uint64_t> ahead_order;   // (ahead_mu: the keys in the order they were made, for the oldest untaken ones to go first)
+int64_t ahead_untaken = 0;          // (ahead_mu: how many of `ahead` hold a pipeline no draw has taken)
+std::atomic<int64_t> st_ahead_made{0}, st_ahead_taken{0}, st_ahead_late{0}, st_ahead_unknown{0}, st_ahead_ms{0};
+bool eager_graphics_on() {
+    static const bool on = !getenv("RX_VK_EAGER_GRAPHICS") || atoi(getenv("RX_VK_EAGER_GRAPHICS")) != 0;
+    return on;
+}
+std::unique_ptr<PipeEntry> ahead_take(uint64_t own) {
+    if (!eager_graphics_on()) return nullptr;
+    std::lock_guard lk(ahead_mu);
+    std::unique_ptr<PipeEntry> e = std::move(ahead[own]);   // (the slot stays, empty: this key is a draw's from here on)
+    (e ? st_ahead_taken : st_ahead_unknown)++;
+    if (e) ahead_untaken--;
+    return e;
 }
 int64_t st_draws, st_skipped, st_dispatches, st_passes, st_mesh, st_pending_skips, st_waits;
 // (relink) skips by the line that made them, reported with the frame statistics (draw_skip_report)
@@ -1487,6 +1513,19 @@ void state_record(const Program& p, const NvnState& s, const Targets& at, VkPrim
     }
     if (state_file && state_seen.insert(h).second) fwrite(&r, sizeof r, 1, state_file), fflush(state_file);
 }
+/// The draw state and the targets a record's pipeline was made for (what pipeline_key and build_graphics read of them)
+void state_of_record(const StateRec& r, NvnState& s, Targets& at) {
+    s = NvnState{};
+    for (int k = 0; k < 16; k++) s.vattr[k] = r.vattr[k], s.vstream[k].stride = r.stride[k], s.vstream[k].divisor = r.divisor[k];
+    s.nvattr = (int)r.nvattr;
+    for (int k = 0; k < 8; k++) std::memcpy(&s.blend[k], &r.blend[k], 8);
+    s.color.blend_en = r.blend_en, s.chmask.mask = r.chmask, s.poly.mode = r.poly_mode;
+    s.depth_clamp = r.depth_clamp != 0, s.ms.a2c = (uint8_t)r.a2c;
+    at = Targets{};
+    at.n = (int)r.n, at.samples = (VkSampleCountFlagBits)r.samples, at.depth_format = (VkFormat)r.depth_format;
+    at.depth = r.has_depth ? (Texture*)1 : nullptr;   // (never read through: whether there is one)
+    for (int k = 0; k < 8; k++) at.color_format[k] = (VkFormat)r.color_format[k];
+}
 /// (relink) The workers of the shader preparation before the game (the first start, and after an update that changed the translator):
 /// RX_VK_PREPARE_THREADS=<n>, else every CPU thread but one, at most 32. They were half of them, for the PC's sake (on all of them
 /// at High the driver's compiles froze it); they run below normal, so the loading screen and the desktop still get the CPU they
@@ -1609,16 +1648,8 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
             no_variant++;
             continue;
         }
-        *s = NvnState{};
-        for (int k = 0; k < 16; k++) s->vattr[k] = r.vattr[k], s->vstream[k].stride = r.stride[k], s->vstream[k].divisor = r.divisor[k];
-        s->nvattr = (int)r.nvattr;
-        for (int k = 0; k < 8; k++) std::memcpy(&s->blend[k], &r.blend[k], 8);
-        s->color.blend_en = r.blend_en, s->chmask.mask = r.chmask, s->poly.mode = r.poly_mode;
-        s->depth_clamp = r.depth_clamp != 0, s->ms.a2c = (uint8_t)r.a2c;
         Targets at{};
-        at.n = (int)r.n, at.samples = (VkSampleCountFlagBits)r.samples, at.depth_format = (VkFormat)r.depth_format;
-        at.depth = r.has_depth ? (Texture*)1 : nullptr;   // (never read through: whether there is one)
-        for (int k = 0; k < 8; k++) at.color_format[k] = (VkFormat)r.color_format[k];
+        state_of_record(r, *s, at);
         if (!p->layout) ensure_layout(const_cast<Program&>(*p));
         pipeline_note(pipeline_key(*p, *s, at, (VkPrimitiveTopology)r.topo), *p, *s, at, (VkPrimitiveTopology)r.topo);
         noted_n++;
@@ -1850,15 +1881,19 @@ PipeEntry* graphics_pipeline(const Program& p, const NvnState& s, const Targets&
     if (it != pipelines.end()) return remember(mine[mkey] = it->second.get());
     pcache_init();
     PipeEntry* e;
+    // (relink, 0.7.9.3: one made ahead from this program object when the game set its shaders, ready: nothing to build or wait for)
+    std::unique_ptr<PipeEntry> made_ahead = ahead_take(own);
+    const bool was_ahead = made_ahead != nullptr;
     {   // (RX_VK_PIPE_SHARED: the map changes under the readers' lock too; the program is set before any reader sees the entry)
         std::unique_lock wl(pipes_rw, std::defer_lock);
         if (pipe_shared_on()) wl.lock();
-        auto made = std::make_unique<PipeEntry>();
+        auto made = was_ahead ? std::move(made_ahead) : std::make_unique<PipeEntry>();
         made->prog.store(&p, std::memory_order_release);
         e = pipelines.emplace(key, std::move(made)).first->second.get();
     }
     e->prog.store(&p, std::memory_order_release);
     if (!own_key) pipeline_note(key, p, s, at, topo, color_types);   // (its own key holds an address: nothing to note)
+    if (was_ahead) return remember(e);
     static const bool sync = getenv("RX_VK_SYNC_PIPELINES") != nullptr;
     if (sync) {
         e->pipeline = build_graphics(p, s, at, topo);
@@ -8936,11 +8971,231 @@ void eager_compute(const nvn_prog& prog) {
         logf("vk: compute pipelines made ahead of their first dispatch: %lld (%lld ms of compiles off the frame)", (long long)n,
              (long long)st_eager_compute_ms.load());
 }
+// (relink, 0.7.9.3) Graphics pipelines made ahead. A lean start (every PC's) makes a graphics pipeline at its first draw: the
+// program's variants read from relink_programs.bin, then the pipeline from the driver's cache, a few milliseconds each with a
+// warm one and up to seconds without. Turning the camera in a busy place draws things for the first time frame after frame:
+// in the Market (hs5400) the slow submissions of a turn each had 2 to 56 ms of "pipelines" and 1 to 13 ms of "programs", and
+// the draws the wait gave up on were left out of the picture. The game sets a program's shaders when the area loads, before
+// the camera looks at what it draws, and the pipeline state lists (this PC's and the shipped one) say which pipelines play
+// has made from those stages: they are made then, on the background workers, and wait in `ahead` for their first draw.
+// Only what the lists name for a program the game has set, each program's stages once a session; never a translation (a
+// variant the program cache lacks is left to its draw), and nothing while the system has little commit left (the driver's
+// compiles take theirs from it). RX_VK_EAGER_GRAPHICS=0: off, RX_VK_EAGER_GRAPHICS_MAX=<n>: at most n a session (20000).
+// MEASURED (19/11, RTX 3060 Ti, a warm driver cache, the camera turned for 20 s right after arriving, 60 fps cap, two rounds
+// a side, the imports by 4 MB): in Hyrule Field, frames over 25 ms 6 and 8 without, 1 and 2 with. In the Market 13 and 5
+// without, 4 and 4 with in one test, 4 and 10 against 4 and 16 in the next: no difference shown there. Draws left out of a
+// frame: 0.8 on average (27 at most) without, none with. With the imports by 16 MB it changed nothing in the Market (41
+// against 42.5): the GPU could not hold 60 fps there whatever the pipelines did.
+// Its cost: ~3000 pipelines made in the run for 1350 a draw took, +0.8 to 1.6 GB of private bytes, +0.5 to 0.8 GB of peak
+// working set. So the ones no draw has taken are kept to RX_VK_EAGER_GRAPHICS_KEEP (1500) at most, the oldest going first
+// (their first draw then makes them, as before).
+// What is made ahead lives as long as the game keeps a program of those stages: when it lets the last one go (an area left)
+// the pipelines no draw took are destroyed (eager_graphics_released), and made again if it sets such a program again. The
+// state lists hold every area's pipelines, and the game sets many programs it never draws with: kept for the session, the
+// ones made ahead would add up to what the full start had, which lean pipelines are there to avoid
+struct AheadProg {
+    int live = 0;                 // (the game's program objects of these stages)
+    bool started = false;         // (their pipelines are made, or being made)
+    std::vector<uint64_t> owns;   // (the keys in `ahead` made for them)
+};
+std::unordered_map<uint64_t, AheadProg> ahead_progs;   // (ahead_mu: by the stages' code keys)
+std::unordered_map<uint64_t, uint64_t> ahead_serial;   // (ahead_mu: a program object's serial -> its stages, 0: not a graphics one)
+std::unordered_set<uint64_t> ahead_dead;               // (ahead_mu: serials let go before their job ran)
+std::atomic<int64_t> st_ahead_programs{0}, st_ahead_no_variant{0}, st_ahead_failed{0}, st_ahead_dropped{0};
+const std::unordered_multimap<uint64_t, StateRec>& ahead_list() {
+    static const std::unordered_multimap<uint64_t, StateRec>* list = [] {
+        auto* out = new std::unordered_multimap<uint64_t, StateRec>();
+        if (getenv("RX_VK_NO_STATE_LIST")) return out;
+        const auto t0 = std::chrono::steady_clock::now();
+        std::unordered_set<uint64_t> seen;
+        size_t other_mode = 0;
+        for (const char* name : {"relink_pipeline_states.bin", "relink_pipeline_states_shipped.bin"})
+            for (const StateRec& r : state_list_read(state_list_path(name))) {
+                if (!r.code[0] || !seen.insert(state_hash(r)).second) continue;
+                if (r.mesh && !dev.mesh_shader && !dev.mesh_fallback) continue;
+                // (a mesh record noted in the other mesh mode: its variant is not this mode's, state_list_prepare)
+                if (r.mesh && (r.pad & 2) && ((r.pad & 1) != 0) != dev.uses_mesh_fallback(r.code[2] != 0)) {
+                    other_mode++;
+                    continue;
+                }
+                uint64_t h = r.mesh ? 0x9E3779B97F4A7C15ull : 0xCBF29CE484222325ull;
+                for (int k = 0; k < 4; k++) h = mix(h, r.code[k]);
+                out->emplace(h, r);
+            }
+        logf("vk: pipelines made ahead: %zu pipelines of the state lists to go by (%zu noted in the other mesh mode left out), read in "
+             "%.0f ms (RX_VK_EAGER_GRAPHICS=0: off)", out->size(), other_mode,
+             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        return out;
+    }();
+    return *list;
+}
+void eager_graphics(const nvn_prog& prog) {
+    static const int64_t most = getenv("RX_VK_EAGER_GRAPHICS_MAX") ? atoll(getenv("RX_VK_EAGER_GRAPHICS_MAX")) : 20000;
+    static std::atomic<bool> low_commit{false};
+    uint64_t code[4];
+    bool mesh = false;
+    uint64_t ch = 0;
+    // (nothing more to make: the serial is still noted, for its release to find)
+    if (!low_commit.load() && st_ahead_made.load() < most && program_set_codes(prog, code, &mesh)) {
+        ch = mesh ? 0x9E3779B97F4A7C15ull : 0xCBF29CE484222325ull;
+        for (int k = 0; k < 4; k++) ch = mix(ch, code[k]);
+        if (!ch) ch = 1;
+    }
+    {
+        std::lock_guard lk(ahead_mu);
+        if (ahead_dead.erase(prog.serial)) return;   // (let go before this ran)
+        ahead_serial[prog.serial] = ch;
+        if (!ch) return;
+        AheadProg& ap = ahead_progs[ch];
+        ap.live++;
+        if (ap.started) return;   // (another object of these stages: their pipelines are made, or being made)
+        ap.started = true;
+    }
+    st_ahead_programs++;
+    const auto& list = ahead_list();
+    const auto range = list.equal_range(ch);
+    struct Item { const StateRec* r; uint64_t key; };
+    std::vector<Item> items;
+    std::unordered_set<uint64_t> keys;
+    for (auto it = range.first; it != range.second; ++it) {
+        const StateRec& r = it->second;
+        if (std::memcmp(r.code, code, sizeof r.code) || (r.mesh != 0) != mesh) continue;
+        if (const uint64_t key = program_set_key(prog, r.vattr, r.color_types)) items.push_back({&r, key}), keys.insert(key);
+    }
+    if (items.empty()) return;
+    // (the variants the program cache has, read as the first draw's pick has them read: through a stand-in, so that a draw of
+    // the program meanwhile waits for this read instead of translating what the cache holds)
+    for (const uint64_t key : keys) program_cache_fetch(key, mesh, mesh && dev.uses_mesh_fallback(code[2] != 0));
+    auto s = std::make_unique<NvnState>();
+    for (const Item& item : items) {
+        const StateRec& r = *item.r;
+        const Program* p = program_find(item.key, r.variant);
+        if (!p || p->compute) {
+            st_ahead_no_variant++;
+            continue;
+        }
+        ensure_layout(const_cast<Program&>(*p));
+        Targets at{};
+        state_of_record(r, *s, at);
+        const VkPrimitiveTopology topo = (VkPrimitiveTopology)r.topo;
+        const uint64_t own = mix(pipeline_key(*p, *s, at, topo), (uint64_t)(uintptr_t)p);
+        {
+            std::lock_guard lk(ahead_mu);
+            if (ahead.count(own)) continue;   // (made, or a draw's already)
+        }
+        if (st_ahead_made.load() >= most) return;
+        {
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof ms;
+            if (GlobalMemoryStatusEx(&ms) && (ms.ullAvailPageFile >> 20) < 3072) {
+                if (!low_commit.exchange(true))
+                    logf("vk: pipelines made ahead: stopped, the system has %llu MB of commit left; the rest are made at their first "
+                         "draw, as before", (unsigned long long)(ms.ullAvailPageFile >> 20));
+                return;
+            }
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        compiles_running++;
+        const VkPipeline made = build_graphics(*p, *s, at, topo);
+        compiles_running--;
+        compile_note("graphics (ahead)", p->key, t0);
+        if (!made) {
+            st_ahead_failed++;
+            continue;
+        }
+        auto e = std::make_unique<PipeEntry>();
+        e->pipeline = made;
+        e->prog.store(p, std::memory_order_release);
+        e->ready.store(true, std::memory_order_release);
+        bool late = false, gone = false;
+        static thread_local std::vector<VkPipeline> aged;
+        {
+            std::lock_guard lk(ahead_mu);
+            const auto ap = ahead_progs.find(ch);
+            if (ap == ahead_progs.end() || ap->second.live <= 0) {
+                gone = true;   // (the game let its programs of these stages go meanwhile)
+            } else {
+                const auto [slot, fresh] = ahead.try_emplace(own);
+                if (fresh) {
+                    slot->second = std::move(e), ap->second.owns.push_back(own);
+                    ahead_order.push_back(own), ahead_untaken++;
+                    // (the oldest that no draw has taken go, past what is kept; taken ones only leave the order)
+                    static const int64_t keep = getenv("RX_VK_EAGER_GRAPHICS_KEEP") ? atoll(getenv("RX_VK_EAGER_GRAPHICS_KEEP")) : 1500;
+                    while (ahead_untaken > keep && !ahead_order.empty()) {
+                        const uint64_t old = ahead_order.front();
+                        ahead_order.pop_front();
+                        const auto a = ahead.find(old);
+                        if (a == ahead.end() || !a->second) continue;
+                        if (const VkPipeline pl = a->second->pipeline.load()) aged.push_back(pl);
+                        ahead.erase(a);
+                        ahead_untaken--;
+                    }
+                } else {
+                    late = true;   // (its first draw came while this was being made, and builds its own)
+                }
+            }
+        }
+        for (const VkPipeline pl : aged) vkDestroyPipeline(dev.device, pl, nullptr);   // (nothing ever drew with them)
+        st_ahead_dropped += (int64_t)aged.size();
+        aged.clear();
+        if (late || gone) {
+            vkDestroyPipeline(dev.device, made, nullptr);
+            if (gone) return;
+            st_ahead_late++;
+            continue;
+        }
+        st_ahead_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        static std::atomic<int> told{0};
+        if (const int64_t n = ++st_ahead_made; n % 250 == 0 && told++ < 80)
+            logf("vk: graphics pipelines made ahead of their first draw: %lld (%lld ms of builds off the frame) for %lld programs "
+                 "the game set; first draws so far: %lld found theirs made, %lld came before it was, %lld had none in the state "
+                 "lists; %lld records' variants not in the program cache, %lld builds failed; %lld no draw took were destroyed "
+                 "(their programs let go by the game, or the oldest past what is kept)",
+                 (long long)n, (long long)st_ahead_ms.load(), (long long)st_ahead_programs.load(), (long long)st_ahead_taken.load(),
+                 (long long)st_ahead_late.load(), (long long)st_ahead_unknown.load(), (long long)st_ahead_no_variant.load(),
+                 (long long)st_ahead_failed.load(), (long long)st_ahead_dropped.load());
+    }
+}
+/// The game lets a program object go (the replay thread, after the draws that used it): the last one of its stages takes the
+/// pipelines made ahead that no draw took with it
+void eager_graphics_released(const nvn_prog* p) {
+    if (!p || !eager_graphics_on()) return;
+    auto gone = std::make_shared<std::vector<VkPipeline>>();
+    {
+        std::lock_guard lk(ahead_mu);
+        const auto it = ahead_serial.find(p->serial);
+        if (it == ahead_serial.end()) {
+            // (its job has not run yet: it will find the serial here and do nothing. Only where jobs are queued at all)
+            if (pipelines_lean()) ahead_dead.insert(p->serial);
+            return;
+        }
+        const uint64_t ch = it->second;
+        ahead_serial.erase(it);
+        const auto ap = ch ? ahead_progs.find(ch) : ahead_progs.end();
+        if (ap == ahead_progs.end() || --ap->second.live > 0) return;
+        for (const uint64_t own : ap->second.owns) {
+            const auto a = ahead.find(own);
+            if (a == ahead.end() || !a->second) continue;   // (a draw took it: it is in `pipelines`, and its slot stays)
+            if (const VkPipeline pl = a->second->pipeline.load()) gone->push_back(pl);
+            ahead.erase(a);
+            ahead_untaken--;
+        }
+        ahead_progs.erase(ap);
+    }
+    if (gone->empty()) return;
+    st_ahead_dropped += (int64_t)gone->size();
+    jobs_push_background([gone] {   // (nothing ever drew with them: no command buffer holds one)
+        for (const VkPipeline pl : *gone) vkDestroyPipeline(dev.device, pl, nullptr);
+    });
+}
 void eager_compute_request(const nvn_prog* p) {
     static const bool on = !getenv("RX_VK_EAGER_COMPUTE") || atoi(getenv("RX_VK_EAGER_COMPUTE")) != 0;
-    if (!on || !p || p->nstage != 1) return;
+    if (!p || !p->nstage) return;
     const nvn_prog copy = *p;
-    jobs_push_background([copy] { eager_compute(copy); });   // (behind the pipelines draws wait on)
+    // (a host of 0.7.9.2 and before names only its compute programs here; from 0.7.9.3 every program the game sets. A program
+    // of one stage may be either: eager_compute leaves one without a compute stage alone, eager_graphics one with)
+    if (on && p->nstage == 1) jobs_push_background([copy] { eager_compute(copy); });   // (behind the pipelines draws wait on)
+    if (eager_graphics_on() && pipelines_lean()) jobs_push_background([copy] { eager_graphics(copy); });
 }
 
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {

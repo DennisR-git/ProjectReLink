@@ -4457,6 +4457,7 @@ void register_texture_locked(int id, const nvn_tex* t, const nvn_view* v) { regi
 void do_program_released(const nvn_prog* p) {
     std::lock_guard lk(replay_mu);   // (the replay may be translating it)
     program_released(p);
+    eager_graphics_released(p);   // (relink, 0.7.9.3: the pipelines made ahead for it that no draw took)
 }
 
 // ---- the replay thread (RX_VK_ASYNC=0: none) ----

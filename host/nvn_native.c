@@ -1016,11 +1016,18 @@ static int set_shaders(nvn_prog *o, int n, const uint8_t *sd, int stride) {
         }
     }
     o->serial = new_serial();
-    /* (relink) a compute program (one stage, its control section's stage 5): its pipeline made ahead, on the back end's workers */
-    if (n == 1 && o->sd[0].control) {
+    /* (relink) every program the game sets is named to the back end, whose workers make ahead what its draws would wait for: a
+       compute program's pipeline (0.7.6), and from 0.7.9.3 the graphics pipelines play has noted for these stages (vk_draw.cpp:
+       eager_graphics). HOS_PROGRAM_SET=compute: only the compute programs, as before 0.7.9.3 */
+    if (n >= 1 && o->sd[0].control) {
+        static int only_compute = -1;
+        if (only_compute < 0) {
+            const char *e = getenv("HOS_PROGRAM_SET");
+            only_compute = e && !strcmp(e, "compute");
+        }
         uint16_t st = 0;
         memcpy(&st, (const uint8_t *)GP(o->sd[0].control) + 0x56, 2);
-        if (st == 5) rx_nvn_program_set(o);
+        if (!only_compute || (n == 1 && st == 5)) rx_nvn_program_set(o);
     }
     return 1;
 }

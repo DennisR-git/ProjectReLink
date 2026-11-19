@@ -900,15 +900,16 @@ const Shader::Profile& profile() {
     return p;
 }
 
-const std::vector<Code>& codes_of(const NvnState& s) {
-    auto& v = codes[s.prog.serial];
+const std::vector<Code>& codes_of_prog(const nvn_prog& prog) {
+    auto& v = codes[prog.serial];
     if (v.empty())
-        for (uint32_t i = 0; i < s.prog.nstage && i < 6; i++) {
-            Code c = read_code(s.prog.sd[i]);
+        for (uint32_t i = 0; i < prog.nstage && i < 6; i++) {
+            Code c = read_code(prog.sd[i]);
             if (c.ok) v.push_back(std::move(c));
         }
     return v;
 }
+const std::vector<Code>& codes_of(const NvnState& s) { return codes_of_prog(s.prog); }
 
 std::atomic<int64_t> st_translated, st_failed, st_translate_ns;
 
@@ -2774,6 +2775,59 @@ const Program* seed_variant_of(const uint64_t code[3], bool mesh, const uint32_t
         }
     variants.push_back(std::move(p));
     return variants.back().get();
+}
+
+// (relink, 0.7.9.3: graphics pipelines made ahead, vk_draw.cpp) A graphics program the game has just set, as the pipeline state
+// list names one: its stages' code keys (code[0] the vertex or mesh stage, [1] the fragment, [2] the task, [3] the header-only
+// stage), and its key for a record's vertex input and colour output types. The stages are read here, once a program object, as
+// its first draw would read them (codes_of). False / 0: a compute program, or stages that cannot be read
+bool program_set_codes(const nvn_prog& prog, uint64_t code[4], bool* mesh) {
+    std::lock_guard lk(shader_mu);
+    const Code* by[8]{};
+    const Code* prim = nullptr;
+    for (const Code& c : codes_of_prog(prog)) {
+        if (c.header_only) prim = &c;
+        else if (c.stage < 8) by[c.stage] = &c;
+    }
+    code[0] = code[1] = code[2] = code[3] = 0;
+    if (by[5]) return false;
+    if (by[7]) {
+        *mesh = true;
+        code[0] = by[7]->key, code[1] = by[1] ? by[1]->key : 0, code[2] = by[6] ? by[6]->key : 0, code[3] = prim ? prim->key : 0;
+        return true;
+    }
+    if (!by[0]) return false;
+    *mesh = false;
+    code[0] = by[0]->key, code[1] = by[1] ? by[1]->key : 0;
+    return true;
+}
+/// (relink) Key's kept variants read now where they are still on disk, as a draw's pick has them read (program_cache_load_async):
+/// a stand-in takes their place meanwhile, and a draw of the program then waits for this read instead of finding nothing and
+/// translating the program again. Returns once they are read (here, if no worker has taken the read yet)
+void program_cache_fetch(uint64_t key, bool mesh, bool fallback) {
+    const Program* stand_in = nullptr;
+    {
+        std::lock_guard lk(shader_mu);
+        auto& variants = programs[key];
+        const bool was = load_async_here;
+        load_async_here = true;
+        if (program_cache_load_async(key, variants, mesh, fallback)) stand_in = variants.back().get();
+        else if (!async_loads_on()) program_cache_load(key, variants);   // (RX_VK_ASYNC_LOAD=0: read here, as its draws read)
+        load_async_here = was;
+    }
+    if (stand_in) jobs_wait(stand_in->ready);
+}
+uint64_t program_set_key(const nvn_prog& prog, const uint32_t vattr[16], const uint8_t color_types[8]) {
+    std::lock_guard lk(shader_mu);
+    const Code* by[8]{};
+    const Code* prim = nullptr;
+    for (const Code& c : codes_of_prog(prog)) {
+        if (c.header_only) prim = &c;
+        else if (c.stage < 8) by[c.stage] = &c;
+    }
+    if (by[7]) return mesh_key(by[6], *by[7], by[1], prim, color_types);
+    if (!by[0]) return 0;
+    return graphics_key(*by[0], by[1], vattr, color_types);
 }
 
 const Program* program_find(uint64_t key, uint64_t variant) {
