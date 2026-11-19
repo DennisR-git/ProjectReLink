@@ -2768,17 +2768,23 @@ void prefetch_chunks(uint64_t lo, uint64_t hi, uint64_t chunk) {
 
 /// (the imports' chunk, for the code outside pool_lookup: the same value as pool_lookup's own. That function is left as it
 /// was written: it is on the replay's path, and a changed one loses its place in the back end's profile, vk_village.profdata)
-// (relink, 0.7.9.3) 4 MB where the mirrors' budget cannot hold every pool the game binds (under 1536 MB: the cards of 6 GB and
-// less, and the small VRAM presets). A chunk the CPU writes one page of needs its mirror whole for fast sync (fast_sync_held):
-// by 16 MB the written chunks were ~750 MB of a 744 MB budget and fast sync was held back all the time; by 4 MB they are
-// 470-560 MB, it is held back a quarter of the time, and what the budget has left goes to chunks the draws read (a 744 MB budget,
-// Market and Kokiri: GPU time 25.6 / 16.0 ms a frame by 16 MB, 12.9 / 8.7 by 4 MB, on an RTX 3060 Ti made to stand for a 6 GB card
-// with RX_VK_MIRROR_MB). Cards whose budget holds everything keep 16 MB: nothing measured there asked for a change
+// (relink, 0.7.9.3) 4 MB where the mirrors' budget cannot hold every pool the game binds. A chunk the CPU writes one page of
+// needs its mirror whole for fast sync (fast_sync_held), and a chunk a draw reads one buffer of takes 16 MB of the budget:
+//  - a 744 MB budget (a 6 GB card, stood for with RX_VK_MIRROR_MB on an RTX 3060 Ti; Market and Kokiri): by 16 MB the
+//    written chunks were ~750 MB and fast sync was held back all the time; by 4 MB they are 470-560 MB, it is held back a
+//    quarter of the time, and the GPU's frame is 12.9 / 8.7 ms against 25.6 / 16.0;
+//  - an 8 GB card's own budget, 2006 MB, is not enough either in the Market: 2000 MB of it used, 149 imports of 4048 MB,
+//    pools of 16 to 80 MB left in system memory for the GPU to read from there, which then cannot hold 60 fps while the
+//    camera turns and the game waits for it: 42 and 43 frames over 25 ms in a 20 s turn, p99 37 to 40 ms, 57.7 fps
+//    (hs5420 / hs5424). By 4 MB: 282 imports of 2796 MB, every pool the game writes mirrored, 12 frames over 25 ms, p99
+//    24 ms, 59.7 fps (hs5422). Neither the fast-sync hold nor the pipelines' wait changed that count (hs5421, hs5423).
+// So 4 MB under a 3072 MB budget: every card under 12 GB, and the VRAM presets under the largest. A budget of 3072 MB
+// (12 GB cards and more) holds what the Market asks by 16 MB, and nothing was measured on such a card: 16 MB as before
 uint64_t mirror_budget();   // (below)
 uint64_t import_chunk() {
     static const uint64_t chunk = [] {
         if (const char* e = getenv("RX_VK_IMPORT_CHUNK_MB")) return (uint64_t)std::max(0, atoi(e)) << 20;
-        const uint64_t mb = mirror_budget() < (1536ull << 20) ? 4 : 16;
+        const uint64_t mb = mirror_budget() < (3072ull << 20) ? 4 : 16;
         if (mb != 16) logf("vk: memory imported by %llu MB chunks: the mirrors' budget is %llu MB (RX_VK_IMPORT_CHUNK_MB=16: as before)",
                            (unsigned long long)mb, (unsigned long long)(mirror_budget() >> 20));
         return mb << 20;

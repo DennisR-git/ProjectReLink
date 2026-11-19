@@ -2322,7 +2322,7 @@ void bench_frame(int64_t presents) {
     logf("%s", line);
 }
 
-/// A slow submit (over 15 ms): what took its time, logged (60 of them). The stalls in it are exact (PROF, PROF_EXACT); the
+/// A slow submit (over 15 ms): what took its time, logged (80 of them, RX_VK_SLOW_LOG=<n>). The stalls in it are exact (PROF, PROF_EXACT); the
 /// per-draw phases' cheap part is sampled, one draw in eight (PROF_HOT): an estimate, exact with RX_VK_PROF_ALL=1
 struct SlowWatch {
     std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
@@ -2332,7 +2332,8 @@ struct SlowWatch {
     ~SlowWatch() {
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         static int logged;
-        if (ms < 15.0 || logged >= 80 || presents_now < 600) return;   // (after the first load)
+        static const int most = getenv("RX_VK_SLOW_LOG") ? atoi(getenv("RX_VK_SLOW_LOG")) : 80;   // (a diagnosis wants them all)
+        if (ms < 15.0 || logged >= most || presents_now < 600) return;   // (after the first load)
         logged++;
         static const char* names[PROF_COUNT] = {"submit", "present", "draw", "descriptors", "texture lookups",
                                                 "uploads", "pipelines", "programs", "commands", "dispatch",
