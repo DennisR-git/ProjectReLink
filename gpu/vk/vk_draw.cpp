@@ -6595,7 +6595,10 @@ static void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs&
     static const int every = getenv("RX_VK_DLSS_TRACE") ? atoi(getenv("RX_VK_DLSS_TRACE")) : 0;
     if (every <= 0 || at.width < 640) return;
     const uint64_t f = texture_frame_no();
-    if (f % (uint64_t)every != (uint64_t)every / 2) return;
+    // (RX_VK_DLSS_TRACE_OBJ=1 traces the frame after too: what changed in an object's buffer from one frame to the next)
+    static const bool obj = getenv("RX_VK_DLSS_TRACE_OBJ") != nullptr;
+    const uint64_t phase = f % (uint64_t)every, at_phase = (uint64_t)every / 2;
+    if (phase != at_phase && !(obj && phase == at_phase + 1)) return;
     char line[3072];
     int n = snprintf(line, sizeof line, "vk: dlss-trace f%llu prog %016llx%s%s %ux%u c[", (unsigned long long)f,
                      (unsigned long long)p.key, d.mesh ? " mesh" : "", p.fallback ? "(fb)" : "", at.width, at.height);
@@ -6621,13 +6624,35 @@ static void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs&
             if (s.ssbo[ns][u].addr) n += snprintf(line + n, sizeof line - n, " s%d=%llx/%llu", u, (unsigned long long)s.ssbo[ns][u].addr,
                                                   (unsigned long long)s.ssbo[ns][u].size);
     }
-    logf("%s", line);
+    if (!obj) logf("%s", line);
+    // (RX_VK_DLSS_TRACE_OBJ=1: instead, the first 0x80 bytes of the vertex stage's uniform buffer 1, the object's, as floats:
+    // where a rigid object's own transform is, for its motion. The scene's draws only, 3000 a traced frame, numbered in the
+    // frame's order)
+    static uint64_t obj_frame = 0;
+    static int obj_n = 0;
+    if (obj && at.color_format[0] == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && at.depth && s.ubo[0][1].addr && s.ubo[0][1].size >= 0x80) {
+        if (obj_frame != f) obj_frame = f, obj_n = 0;
+        float v[32];
+        if (obj_n++ < 3000 && host->gpu_read(s.ubo[0][1].addr, v, sizeof v)) {
+            char b[900];
+            int k = snprintf(b, sizeof b, "vk: dlss-obj f%llu #%d prog %016llx u1=%llx/%llu u3=%llx/%llu n%d%s inst%d va%d vb0=%llx bv%d:",
+                             (unsigned long long)f, obj_n, (unsigned long long)p.key, (unsigned long long)s.ubo[0][1].addr,
+                             (unsigned long long)s.ubo[0][1].size, (unsigned long long)s.ubo[0][3].addr,
+                             (unsigned long long)s.ubo[0][3].size, d.count, d.indexed ? "i" : "a", d.instances, s.nvattr,
+                             (unsigned long long)s.vbuf[0].address, d.base_vertex);
+            for (int i = 0; i < 32 && k < 860; i++) k += snprintf(b + k, sizeof b - k, "%s%.5g", i % 4 ? " " : " | ", v[i]);
+            logf("%s", b);
+        }
+    }
 }
 
 /// (relink) A skinned draw into the scene, for NVIDIA DLSS's actor motion (vk_dlss.cpp). OoT's characters and the things that
 /// move by themselves are indexed draws of one vertex stream: the position at attribute 0 (RGB32F or RGBA16F), the weights at 4
 /// (and 5, RGBA8), the joints at 6 (and 7, RGBA16UI or RGBA8UI), the bone palette in the vertex stage's uniform buffer 6 (NVN's
-/// binding 3: 3 x 4 matrices, a whole number of them) and the object's origin in its buffer 4 (binding 1, at 0x40)
+/// binding 3: 3 x 4 matrices, a whole number of them) and the object's origin in its buffer 4 (binding 1, at 0x40).
+/// (0.7.9.3) And the models skinned rigidly: no weights at 4, one R8UI joint a vertex at 6 (20 draws of a Market frame on
+/// 19/11, program 26399306c91c02e8 with a 10-bone palette): each vertex wholly on its bone. They moved with what is behind
+/// them. RX_VK_DLSS_ONE_JOINT=0: left out, as before
 static void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
     if (d.mesh || !d.indexed || d.indirect || d.instances != 1 || !at.n || !at.color[0] || !at.depth || at.width < 640 ||
         at.color_format[0] != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || s.nvattr < 7 || !dlss_wanted())
@@ -6639,7 +6664,12 @@ static void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs&
     if (!bones.addr || bones.size < 48 || bones.size % 48) return;
     DlssSkin k;
     k.formats = pos.fmt == NVN_FORMAT_RGBA16F ? dlss_actor::kHalfPosition : 0;
-    for (int set = 0; set < 2 && 6 + set < s.nvattr; set++) {
+    static const bool one_joint = !getenv("RX_VK_DLSS_ONE_JOINT") || atoi(getenv("RX_VK_DLSS_ONE_JOINT")) != 0;
+    if (one_joint && attr(4).fmt == 0 && attr(6).fmt == NVN_FORMAT_R8UI && attr(6).stream == 0) {
+        k.formats |= dlss_actor::kOneJoint;
+        k.joints[0] = attr(6).offset, k.weights[0] = 0, k.sets = 1;
+    }
+    for (int set = 0; set < 2 && 6 + set < s.nvattr && !(k.formats & dlss_actor::kOneJoint); set++) {
         const nvn_va_st w = attr(4 + set), j = attr(6 + set);
         if (w.fmt != NVN_FORMAT_RGBA8 || (j.fmt != NVN_FORMAT_RGBA16UI && j.fmt != NVN_FORMAT_RGBA8UI) || w.stream || j.stream ||
             w.offset % 4 || j.offset % 4)

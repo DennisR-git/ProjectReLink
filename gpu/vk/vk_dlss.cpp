@@ -241,6 +241,7 @@ struct State {
     } uploads[6];               // (the cameras: a ring, one in use stays so for a few frames, as what later() frees)
     int upload_at = 0;
     uint64_t actor_draws = 0, actor_frames = 0, actor_skipped = 0;
+    uint64_t actor_one = 0, status_one = 0;   // (the rigidly skinned draws among actor_draws, and at the last status line)
     int64_t actor_ns = 0;       // (the CPU's time in it, since the last status line)
     uint64_t status_draws = 0, status_frames = 0;   // (actor_draws and _frames at the last status line: dlss_status)
     uint64_t status_drawn = 0, status_passed = 0;   // (since the last status line: frames DLSS drew, and frames a network
@@ -729,6 +730,10 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
         a.stride = k.k.stride / 4, a.pos = k.k.pos, a.sets = (uint32_t)k.k.sets;
         for (int i = 0; i < 2; i++) a.joints[i] = k.k.joints[i], a.weights[i] = k.k.weights[i];
         a.formats = k.k.formats;
+        // (RX_VK_DLSS_ACTOR_MARK=1: every actor draw marked, 2: the rigidly skinned ones only; see dlss_actor::kMark)
+        static const int mark = env_switch("RX_VK_DLSS_ACTOR_MARK");
+        if (mark == 1 || (mark == 2 && (a.formats & dlss_actor::kOneJoint))) a.formats |= dlss_actor::kMark;
+        s.actor_one += (a.formats & dlss_actor::kOneJoint) != 0;
         a.tolerance = tolerance;
         draws.push_back(a);
         counts.push_back((uint32_t)k.k.count);
@@ -1134,12 +1139,13 @@ int dlss_status(char* b, size_t n) {
     if (s.status_passed) snprintf(passed, sizeof passed, ", %llu left to the game's network", (unsigned long long)s.status_passed);
     static const char* const names[upscaler_rows::kUpscalers] = {"", "DLSS", "DLAA", "FSR", "FSR native AA", "none"};
     snprintf(b, n, "; %s: %llu frames drawn%s, %llu %s made, jitter %+.3f %+.3f px%s, actor motion %llu draws in %llu "
-             "frames (%.3f ms CPU a frame), its images %llu MB%s",
+             "frames (%.3f ms CPU a frame, %llu of the draws rigidly skinned), its images %llu MB%s",
              names[mode], (unsigned long long)s.status_drawn, passed,
              (unsigned long long)(is_fsr(mode) ? s.fsr_made : s.features_made), is_fsr(mode) ? "upscalers" : "features",
              s.status_jitter[0], s.status_jitter[1], s.status_motion ? "" : " (no motion)",
              (unsigned long long)draws, (unsigned long long)frames, frames ? s.actor_ns / 1e6 / (double)frames : 0.0,
-             (unsigned long long)(own >> 20), feature);
+             (unsigned long long)(s.actor_one - s.status_one), (unsigned long long)(own >> 20), feature);
+    s.status_one = s.actor_one;
     s.status_draws = s.actor_draws, s.status_frames = s.actor_frames, s.actor_ns = 0, s.status_drawn = s.status_passed = 0;
     return mode;
 }
@@ -1214,6 +1220,10 @@ uint32_t bones_used(const DlssSkin& k) {
     uint32_t most = 0;
     for (int64_t i = 0; i < n; i++) {
         const uint8_t* q = v.data() + (size_t)i * k.stride;
+        if (k.formats & dlss_actor::kOneJoint) {   // (one joint a vertex, no weights)
+            most = std::max(most, (uint32_t)q[k.joints[0]] + 1);
+            continue;
+        }
         for (int set = 0; set < k.sets; set++)
             for (int j = 0; j < 4; j++) {
                 if (!q[k.weights[set] + j]) continue;

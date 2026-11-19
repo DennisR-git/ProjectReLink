@@ -35,7 +35,7 @@ struct Push {
     int32_t base_vertex;
     uint32_t pos, sets;  // (bytes in a vertex: the position; the joint and weight sets, 1 or 2)
     uint32_t joints[2], weights[2];
-    uint32_t formats;    // (kHalfPosition, kByteJoints << set)
+    uint32_t formats;    // (kHalfPosition, kByteJoints << set, kOneJoint)
     uint32_t tolerance;  // (depth steps from the scene's within which a pixel is the draw's)
 };
 static_assert(sizeof(Push) == 6 * 8 + 14 * 4 && sizeof(Push) <= 128, "dlss_actor.vert's push constants");
@@ -46,8 +46,12 @@ inline void index_start(uint64_t address, int itype, uint64_t* aligned, uint32_t
     *first = (uint32_t)((address & 3) >> (itype < 0 ? 0 : itype > 2 ? 2 : itype));
 }
 
-/// Push::formats: the position is RGBA16F (else RGB32F); a set's joints are RGBA8UI (else RGBA16UI)
-constexpr uint32_t kHalfPosition = 1, kByteJoints = 2;
+/// Push::formats: the position is RGBA16F (else RGB32F); a set's joints are RGBA8UI (else RGBA16UI); kOneJoint: the first
+/// set is one R8UI joint a vertex and no weights (each vertex wholly on one bone: the models the game skins rigidly)
+constexpr uint32_t kHalfPosition = 1, kByteJoints = 2, kOneJoint = 8;
+/// (a diagnostic, RX_VK_DLSS_ACTOR_MARK) the draw writes a fixed motion of 48 px to the right where it would write its own:
+/// with RX_VK_DLSS_DEBUG=motion the picture then shows which pixels the draw was found to cover
+constexpr uint32_t kMark = 16;
 
 /// The cameras' buffer, 36 words: this frame's camera (as drawn, jittered), the frame before's (its jitter taken off), this
 /// frame's jitter in clip space, the render size
