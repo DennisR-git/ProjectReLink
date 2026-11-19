@@ -1057,6 +1057,13 @@ def main():
             for f in ("win32_posix.c", "gdi_posix.c"):
                 vk_jobs.append((cc, os.path.join(POSIX, f), os.path.join(obj_dir, "vk_posix_" + f[:-2] + ".o"), cflags, pdeps))
         jobs += vk_jobs
+    elif a.standalone and not a.only and os.environ.get("RELINK_ALLOW_NO_VK") != "1":
+        # (relink, issue 79) Without the Vulkan and SPIR-V headers the back end was left out without a word and the build said it
+        # had succeeded: the game then started to a black window with sound and no "vk:" line in its log
+        print("%s cannot be built: no %s in the CPM cache (RX_CPM, or tools/cpm). The game would start to a black window. "
+              "RELINK_ALLOW_NO_VK=1 builds without it." % (VK_LIB, " and no ".join(n for n, d in (("vulkanheaders", vk_headers),
+                                                                                         ("spirv-headers", spirv_headers)) if not d)))
+        return 1
     # (relink) The Vulkan back end the release built already: tools/prebuilt/relink_vk.dll and its key, made by the workflow from
     # these same tools (.github/workflows/windows.yml). Taken as it is when its key is this build's (vk_jobs_key: the sources, the
     # flags, the profile, the headers, the CPM packages, the compiler), and its ~500 files are not compiled here: ~520 of a first
