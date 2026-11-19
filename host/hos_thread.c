@@ -155,12 +155,47 @@ static int log_take_locked(char **out) {
     return n;
 }
 
+/* (relink) A batch goes out in one write: stderr is unbuffered, so every line was a write of its own, 30 to 90 a second in play,
+   each one extending the log file. On a slow or nearly full disk those small writes compete with the game's own reads (its code
+   pages, its files) and stretch them: long frames. */
 static void log_write(char **lines, int n) {
-    for (int i = 0; i < n; i++) {
-        fputs(lines[i], stderr);
-        free(lines[i]);
+    size_t total = 0;
+    for (int i = 0; i < n; i++) total += strlen(lines[i]);
+    char *all = n > 1 ? (char *)malloc(total + 1) : NULL;
+    if (all) {
+        size_t at = 0;
+        for (int i = 0; i < n; i++) {
+            const size_t len = strlen(lines[i]);
+            memcpy(all + at, lines[i], len);
+            at += len;
+            free(lines[i]);
+        }
+        fwrite(all, 1, total, stderr);
+        free(all);
+    } else {   /* (one line, or no memory for the copy: line by line) */
+        for (int i = 0; i < n; i++) {
+            fputs(lines[i], stderr);
+            free(lines[i]);
+        }
     }
     fflush(stderr);
+}
+
+/* (relink) and the writer waits a little after the line it was woken for, so the lines of that time go out together. A queue
+   half full goes out at once (a full queue makes the thread that logs write the line itself). Nothing waiting is lost: the
+   crash filter, hos_fatal, the exit paths and the process's exit write the queue first (log_flush, log_drain_raw), and the
+   writer holds no lock while it waits. HOS_LOG_EACH=1: no wait, each wake's lines at once as before; HOS_LOG_BATCH_MS=<ms>
+   changes the 250 */
+enum { LOG_BATCH_FULL = 1024 };
+static DWORD log_batch_ms(void) {
+    static int ms = -1;
+    if (ms < 0) {
+        const char *each = getenv("HOS_LOG_EACH");
+        const char *e = getenv("HOS_LOG_BATCH_MS");
+        const int v = each && *each && *each != '0' ? 0 : e && *e ? atoi(e) : 250;
+        ms = v < 0 ? 0 : v > 2000 ? 2000 : v;
+    }
+    return (DWORD)ms;
 }
 
 static DWORD WINAPI log_main(void *p) {
@@ -170,6 +205,10 @@ static DWORD WINAPI log_main(void *p) {
     for (;;) {
         AcquireSRWLockExclusive(&log_lock);
         while (!log_count) SleepConditionVariableSRW(&log_cv, &log_lock, INFINITE, 0);
+        /* (log_queue wakes it at each line: until the time is up or the queue half full) */
+        const ULONGLONG until = GetTickCount64() + log_batch_ms();
+        for (ULONGLONG now; log_count < LOG_BATCH_FULL && (now = GetTickCount64()) < until;)
+            SleepConditionVariableSRW(&log_cv, &log_lock, (DWORD)(until - now), 0);
         const int n = log_take_locked(batch);
         AcquireSRWLockExclusive(&log_write_lock);
         ReleaseSRWLockExclusive(&log_lock);

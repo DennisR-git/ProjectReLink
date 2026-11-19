@@ -280,7 +280,15 @@ void hos_region_free(uint64_t addr) {
     }
     UNLOCK();
     if (freed_size) {
+        /* (relink) the discard is a kernel call that runs for milliseconds on the regions a change of area frees, and the game's
+           thread made it holding its virtual core: the workers that share the core waited (frames of 50 to 140 ms on arriving in
+           an area). It touches no guest state, so the core goes to another thread meanwhile, as around a file read.
+           HOS_DISCARD_HOLDS_CORE=1: the core kept, as before */
+        static int holds = -1;
+        if (holds < 0) holds = getenv("HOS_DISCARD_HOLDS_CORE") ? 1 : 0;
+        const int away = holds ? 0 : hos_vcore_away();
         discard_pages(freed, freed_size);
+        if (away) hos_vcore_back();
         /* (relink) and its pages given back, but for those a GPU import holds: those go when the import does */
         extern void rx_guest_release(uint64_t lo, uint64_t hi);
         rx_guest_release(freed, freed + freed_size);

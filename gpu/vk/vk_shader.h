@@ -26,8 +26,11 @@ struct Stage {
 };
 
 /// A texture handle the stage reads from a storage buffer: its handle program (Shader::Info::handle_programs, Eden's
-/// recompiler) run over the stage's constant banks and storage buffers as the draw has them
-uint32_t stage_handle(const NvnState& s, const Stage& st, uint32_t program);
+/// recompiler) run over the stage's constant banks and storage buffers as the draw has them. slot: the array slot of a
+/// lookup table's program (Shader::HandleOp::Slot), whose slot k is the table's entry k
+uint32_t stage_handle(const NvnState& s, const Stage& st, uint32_t program, uint32_t slot = 0);
+/// (relink) The handles of slots 0 .. count-1 of a lookup table's program, into out, reading its constant words once
+void stage_handles(const NvnState& s, const Stage& st, uint32_t program, uint32_t count, uint32_t* out);
 void handle_memo_next();   // (relink) a new draw or dispatch on this thread: the handles kept for the last one go
 
 /// A translated program variant: its stages, in descriptor order. The pipeline layout and pipelines made for it live
