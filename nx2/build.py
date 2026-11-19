@@ -893,6 +893,13 @@ def main():
     # instrumented build (RX_PGO=gen: no profile by definition) compile, and what keeps a function the profile does not match
     # from taking the PC down
     hot_fl = hot_fl + ["-mllvm", "-disable-hoisting-to-hotter-blocks=all"]
+    # (relink, RX_HOT_CAPTURE_USES=<n>, experiment) the hot pieces' own limit for the context's capture tracking (flags() gives every
+    # file 5000): the hottest functions use the context 12 000 to 68 000 times, past the limit the compiler takes the context
+    # for escaped, and every guest load or store then may touch it (each guest register written to memory at once, read back
+    # after every guest store)
+    if os.environ.get("RX_HOT_CAPTURE_USES"):
+        hot_fl = ["-capture-tracking-max-uses-to-explore=" + os.environ["RX_HOT_CAPTURE_USES"]
+                  if f.startswith("-capture-tracking-max-uses-to-explore=") else f for f in hot_fl]
     # (relink) RX_PGO=gen: code_hot.c counts its branches (host/pgo_rt.c writes them; -O1 builds much sooner, and the counters are
     # placed before the optimiser, so a profile from it fits the -O2 build). RX_PGO=<merged .prof>: built with that profile
     if PGO == "gen":
@@ -902,9 +909,14 @@ def main():
         # new profile kept the hot code built from the old one)
         with open(PGO, "rb") as f:
             hot_fl = hot_fl + ["-fprofile-instr-use=" + PGO, "-DRELINK_PROFILE_SHA1=" + hashlib.sha1(f.read()).hexdigest()[:16]]
+    # (relink) the hot pieces' native floating-point helpers (a64_hot_fp.inc, a64_lift.py NATIVE_FP): a file only they include,
+    # so it is in their keys alone and the other chunks' objects stay when it changes
+    hot_inc = os.path.join(gen, "a64_hot_fp.inc")
+    hot_deps = deps + (open(hot_inc, "rb").read() if os.path.exists(hot_inc) else b"")
     jobs = [(cc, s, os.path.join(obj_dir, os.path.basename(s)[:-2] + ".o"),
              giant_flags(s, hot_fl if os.path.basename(s).startswith("code_hot") else fl),
-             shim_deps if os.path.dirname(s) == NX2_RT else deps) for s in srcs]
+             shim_deps if os.path.dirname(s) == NX2_RT else hot_deps if os.path.basename(s).startswith("code_hot") else deps)
+            for s in srcs]
     # (issue 624) what the game code's object keys are made of, as short fingerprints: two builds' logs side by side say which part
     # changed when an update compiled everything again (the headers, the flags, the profile, or the lifted code itself)
     fp = lambda b: hashlib.sha1(b).hexdigest()[:10]
