@@ -189,11 +189,10 @@ bool memory_is_meter(uint64_t guest);
 ///   RX_VK_METER_HOLD  the game's read of those sums given the last result again when no new one has landed
 ///   RX_VK_LATE_SEQ    a capture's late pages wait for the submit that holds their write-back, not the submission's last
 ///   RX_VK_CAPTURE_WAIT_WHO (2 with it)  the presenting thread's captures do not wait
-/// Without the variable it is on for NVIDIA cards, the only ones it was measured and watched on (19/11), and off for the
-/// others until a player has tried it there; RX_VK_FAST_SYNC=0 turns it off. Asked for the first time when the game
-/// submits or draws: the device is known by then.
+/// On by default on every card (the maintainer's choice of 19/11; measured and watched on NVIDIA only: on AMD and Intel
+/// cards nobody has looked at it yet). RX_VK_FAST_SYNC=0 turns it off.
 inline bool fast_sync_all() {
-    static const bool all = getenv("RX_VK_FAST_SYNC") ? atoi(getenv("RX_VK_FAST_SYNC")) != 0 : dev.props.vendorID == 0x10DE;
+    static const bool all = getenv("RX_VK_FAST_SYNC") ? atoi(getenv("RX_VK_FAST_SYNC")) != 0 : true;
     return all;
 }
 inline bool fast_sync_part(const char* name) {
