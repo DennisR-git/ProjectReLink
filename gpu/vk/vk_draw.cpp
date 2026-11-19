@@ -8325,8 +8325,15 @@ std::string warm_marker_now() {
 // (RTX 3060 Ti): from the cache, a median of 1.5 to 2.7 ms and 8.5 ms at most; compiled, a median of 63 ms (3 ms called a warm
 // cache cold once, hs2997: 5 s of warm-up for nothing). Warm, the probe costs kProbe pipelines from the cache and their programs
 // read (0.1 s). RX_VK_WARM_PROBE_MS=0: no probe (the marker alone, as before)
-bool driver_cache_lost(const std::vector<std::unique_ptr<PipeNote>>& notes) {
+double warm_probe_limit_ms() {
     static const double limit_ms = getenv("RX_VK_WARM_PROBE_MS") ? atof(getenv("RX_VK_WARM_PROBE_MS")) : 12.0;
+    return limit_ms;
+}
+/// median_out (when given): the probe's median in ms, -1 when it could not tell. quiet: no "warmed again" verdict in the log (the
+/// measure taken right after a warm-up, warm_run)
+bool driver_cache_lost(const std::vector<std::unique_ptr<PipeNote>>& notes, double* median_out = nullptr, bool quiet = false) {
+    const double limit_ms = warm_probe_limit_ms();
+    if (median_out) *median_out = -1;
     if (limit_ms <= 0 || notes.empty()) return false;
     constexpr size_t kProbe = 16;
     const size_t n = notes.size(), step = std::max<size_t>(1, n / kProbe),
@@ -8359,9 +8366,11 @@ bool driver_cache_lost(const std::vector<std::unique_ptr<PipeNote>>& notes) {
     const double med = ms[ms.size() / 2];
     const size_t cold = (size_t)(ms.end() - std::upper_bound(ms.begin(), ms.end(), limit_ms));
     const bool lost = cold * 4 >= ms.size();
-    logf("vk: the driver's cache probed: %zu pipelines in %.2f s, median %.2f ms, longest %.2f ms, %zu over %.1f ms: %s", ms.size(),
+    if (median_out) *median_out = med;
+    logf("vk: the driver's cache probed%s: %zu pipelines in %.2f s, median %.2f ms, longest %.2f ms, %zu over %.1f ms: %s",
+         quiet ? " right after the warm-up" : "", ms.size(),
          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), med, ms.back(), cold, limit_ms,
-         lost ? "it no longer has them, warmed again" : "warm");
+         !lost ? "warm" : quiet ? "this driver compiles them even so" : "it no longer has them");
     return lost;
 }
 /// The warm-up; its progress counts after more items to come (the start's compute pipelines: precompile_run). How many it
@@ -8370,22 +8379,54 @@ size_t warm_run(void (*progress)(size_t done, size_t total), size_t after) {
     static const char* const sw = getenv("RX_VK_WARM");
     if (sw && !atoi(sw)) return 0;
     const std::string now = warm_marker_now(), path = warm_marker_path();
+    // (relink, issues 111 and 131: a warm-up at every start) The marker's second line, "after <ms> again <n>": the probe's median
+    // right after the last whole warm-up, and how many starts in a row found the cache lost. Two rules come from it. A driver that
+    // still compiled the probe's pipelines right after a warm-up (AMD's on an RX 9070 XT: a median of 355 ms against the 12 ms
+    // limit measured on NVIDIA) does not answer the probe at all: it is no longer asked, the marker decides as before the probe
+    // existed (that card warmed 11400 pipelines again, 118 s, at each start, after 22 s of probe). And a cache found lost at the
+    // start right after a warm-up that had found it lost too does not keep what a warm-up gives it (a driver cache too small for
+    // the game's pipelines): it is not warmed a second time in a row, play builds what it lacks. RX_VK_WARM=1 warms once whatever
     bool marked = false;
+    double after_ms = -1;
+    int again = 0;
     if (!sw) {
-        char had[MAX_PATH + 128] = "";
+        char had[MAX_PATH + 256] = "";
         if (FILE* f = fopen(path.c_str(), "rb")) {
             const size_t n = fread(had, 1, sizeof had - 1, f);
             fclose(f);
             had[n] = 0;
-            if (char* end = strpbrk(had, "\r\n")) *end = 0;
+            if (char* end = strpbrk(had, "\r\n")) {
+                *end = 0;
+                const char* second = end + 1;
+                while (*second == '\r' || *second == '\n') second++;
+                if (sscanf(second, "after %lf again %d", &after_ms, &again) != 2) after_ms = -1, again = 0;
+            }
         }
         marked = now == had;
     }
+    const auto mark = [&](double after, int n) {
+        if (FILE* f = fopen(path.c_str(), "wb")) fprintf(f, "%s\nafter %.2f again %d\n", now.c_str(), after, n), fclose(f);
+    };
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
     if (notes.empty()) return 0;   // (nothing noted yet: play notes them, and the driver's cache has them from their first draw)
     if (marked) {
-        if (!driver_cache_lost(notes)) return 0;
+        if (warm_probe_limit_ms() > 0 && after_ms > warm_probe_limit_ms()) {
+            logf("vk: the driver's cache is not probed: right after the last warm-up its pipelines still took %.1f ms (median), so "
+                 "this driver compiles them whatever its cache holds; not warmed again (RX_VK_WARM=1: once more)", after_ms);
+            return 0;
+        }
+        if (!driver_cache_lost(notes)) {
+            if (again) mark(after_ms, 0);
+            return 0;
+        }
+        if (again >= 1) {
+            logf("vk: the driver's cache lost what the last warm-up gave it (%d starts in a row): not warmed again, play builds what "
+                 "it lacks. A graphics driver's shader cache size set too small does this (RX_VK_WARM=1: once more)", again + 1);
+            mark(after_ms, again + 1);
+            return 0;
+        }
+        logf("vk: the driver's cache is warmed again");
         remove(path.c_str());   // (a warm-up cut short is not marked: the next start warms again without a probe)
     }
     // (the notes' programs read in one pass, as the full precompile reads them: borrowing each from the file for its pipelines,
@@ -8519,8 +8560,11 @@ size_t warm_run(void (*progress)(size_t done, size_t total), size_t after) {
              "starts leave them out%s", stuck_keys.size(), stuck_keys.size() == 1 ? "" : "s", stuck_names.c_str(),
              out_of_time ? " (the warm-up's time budget, RX_VK_WARM_S, ran out)" : stalled ? " (nothing finished for RX_VK_WARM_STALL_S)" : "");
     const bool whole = !prepare_stopped() && !out_of_time && !stalled && all_out && stuck_keys.empty();
-    if (whole)
-        if (FILE* f = fopen(path.c_str(), "wb")) fprintf(f, "%s\n", now.c_str()), fclose(f);
+    if (whole) {
+        double after = -1;   // (what the probe says of a cache that was just given everything: the next starts' reference)
+        driver_cache_lost(notes, &after, true);
+        mark(after, marked ? again + 1 : 0);   // (marked: this warm-up answered a lost cache)
+    }
     logf("vk: warmed the driver's cache: %zu of %zu noted pipelines made in %.1f s (%.1f s of it %zu programs read)%s",
          w->made.load(), notes.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), read_s,
          programs_n, whole ? "" : " (stopped before the end: the rest are made in play, and the next start goes on)");
