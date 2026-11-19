@@ -130,13 +130,14 @@ namespace {
 // takes a null module for a failed program), logged with the SPIR-V kept beside the game for us (the first two), and said once in
 // a box, with what it likely means on a GPU below the minimum. RX_VK_NO_MODULE_GUARD=1: the driver's pointer as before
 bool amd_gcn = false;   // (an AMD GPU with only 64-lane subgroups and no mesh shaders: GCN, RX 400 / 500 / Vega; create_device)
-// (relink, issues 45 66 79 80 107) AMD's Windows driver loses the device or times out on RX 6000 cards (RDNA 2), and every hang
-// report names task + mesh draws as the work in flight. Those chips draw them through the compute fallback by default (the GTX 10
-// and RX 5000 path). It costs frame rate (not measured here: no AMD card on the bench), and whether it ends the hangs waits on testers.
+// (relink, issues 45 66 79 123 130) RX 6000 cards (RDNA 2) lose the device or time out in play, with AMD's Windows driver and
+// with RADV alike, and every hang report names task + mesh draws as the work in flight. Those chips draw them through the compute
+// fallback by default (the GTX 10 and RX 5000 path). What is known: on an RX 6800 XT with RADV the native path hung in 13 runs
+// of 13 and the fallback ran two sessions of 100 to 140 s without a hang (issue 79, 0.7.9.1); with AMD's Windows driver nobody
+// has run the fallback yet. It costs frame rate (not measured: no AMD card on the bench).
 // FLIP THIS to false to give the native mesh shaders back by default. RX_VK_FORCE_MESH_FALLBACK=1 / =0 decide over it either way
 constexpr bool kMeshFallbackOnAmdNavi2x = true;
 /// Navi 21 (RX 6800 / 6900 / 6950 and Pro), Navi 22 (RX 6700) and Navi 23 (RX 6600) device ids; Navi 24 (RX 6400 / 6500 XT) is left out
-#ifdef _WIN32
 static bool amd_navi2x_mesh_fallback(uint32_t vendor, uint32_t device) {
     if (vendor != 0x1002) return false;
     switch (device) {
@@ -146,7 +147,6 @@ static bool amd_navi2x_mesh_fallback(uint32_t vendor, uint32_t device) {
     default: return false;
     }
 }
-#endif
 #ifdef _WIN32
 PFN_vkCreateShaderModule driver_create_shader_module = nullptr;
 std::atomic<int> module_faults{0};
@@ -405,13 +405,11 @@ bool create_device() {
     // programs with a task stage run as compute (create_device below; vk_shader.cpp's mesh_program_locked picks per program). An
     // explicit RX_VK_FORCE_MESH_FALLBACK still decides over it
     const bool task_only = getenv("RX_VK_MESH_FALLBACK_TASK_ONLY") && atoi(getenv("RX_VK_MESH_FALLBACK_TASK_ONLY")) != 0;
-#ifdef _WIN32
     force_fallback = kMeshFallbackOnAmdNavi2x && !task_only && amd_navi2x_mesh_fallback(dev.props.vendorID, dev.props.deviceID);
     const char* force_env = getenv("RX_VK_FORCE_MESH_FALLBACK");
     if (force_fallback && !force_env)
-        logf("vk: AMD RDNA 2 (device %#x) on Windows: task and mesh programs run as compute shaders, as the driver's mesh path lost the "
-             "device there (RX_VK_FORCE_MESH_FALLBACK=0: the driver's mesh shaders)", (unsigned)dev.props.deviceID);
-#endif
+        logf("vk: AMD RDNA 2 (device %#x): task and mesh programs run as compute shaders, as these cards stop in the driver's mesh "
+             "path (RX_VK_FORCE_MESH_FALLBACK=0: the driver's mesh shaders)", (unsigned)dev.props.deviceID);
     if (const char* e = getenv("RX_VK_FORCE_MESH_FALLBACK")) force_fallback = atoi(e) != 0;   // (the switch decides both ways)
     if (force_fallback) dev.mesh_shader = false;
     else optional(VK_EXT_MESH_SHADER_EXTENSION_NAME, dev.mesh_shader);
