@@ -307,6 +307,35 @@ void hos_mark_written(const void *p, size_t n) {
 }
 #endif
 
+/* (relink, 0.7.9.3, issue 153: "crash after the first cinematic", an RTX 3070 Ti laptop with 16 GB of RAM) The heap committed
+   as the game touches it instead of whole when its size is set. Ocarina asks for 6894 MB at its start and Windows charges
+   every committed byte against RAM plus the page file whether touched or not. Measured on 19/11 on a running game
+   (tools/port/py/vmguest.py): of those 6894 MB, 1316 MB were in the working set at the save's load and 2808 MB in the Market,
+   so about 4 GB of commit held pages nothing had touched. That player had 3.7 to 4.5 GB left to commit when the game started,
+   and his five logs end in std::bad_alloc thrown by a small allocation of the renderer once Windows had none left.
+   Lazy, the heap's pages are committed 2 MB at a time by the first-touch handler of mkw_glue.c, and before the two system
+   calls that are handed guest memory (nn_fs.c: a file read into it, a save written from it; the kernel does not fault into
+   our handler). The GPU's imports of guest memory commit what is reserved themselves (vk_memory.cpp import_pool).
+   By default only where it is needed: when, at the time the game sets the heap's size, Windows has under 24 GB left to
+   commit (the game goes on to commit about 21 GB on an 8 GB card: 12 GB of guest memory, what its video memory takes, 2 GB
+   of host heaps). HOS_HEAP_LAZY=1: always, 0: never (committed whole, as before). Windows only: Linux does not charge
+   untouched pages, and large pages are committed whole */
+int hos_heap_lazy;
+static int heap_lazy(void) {
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    extern int hos_large_pages;
+    if (hos_large_pages) return 0;
+    const char *e = getenv("HOS_HEAP_LAZY");
+    if (e && *e) return atoi(e) != 0;
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof ms;
+    if (!GlobalMemoryStatusEx(&ms)) return 0;
+    return ms.ullAvailPageFile < (24ULL << 30);
+#else
+    return 0;
+#endif
+}
+
 /* nn::os::SetMemoryHeapSize(unsigned long) -> Result */
 HLE(_ZN2nn2os17SetMemoryHeapSizeEm) {
     uint64_t size = ARG(0);
@@ -328,9 +357,13 @@ HLE(_ZN2nn2os17SetMemoryHeapSizeEm) {
         for (uint64_t a = HOS_HEAP_BASE + hos_heap_size; a < HOS_HEAP_BASE + size; a += 4096) *(volatile uint8_t *)GP(a) = 0;
         hos_log("heap: %llu MB prefaulted in %.0f ms", (unsigned long long)((size - hos_heap_size) >> 20), (hos_now_ns() - t0) / 1e6);
     }
-    if (size > hos_heap_size) hos_commit(HOS_HEAP_BASE + hos_heap_size, size - hos_heap_size);
+    if (size > hos_heap_size) {
+        if (!hos_heap_lazy && heap_lazy()) hos_heap_lazy = 1;
+        if (!hos_heap_lazy) hos_commit(HOS_HEAP_BASE + hos_heap_size, size - hos_heap_size);
+    }
     hos_heap_size = size;
-    hos_log("heap: %llu MB at %#llx", (unsigned long long)(size >> 20), (unsigned long long)HOS_HEAP_BASE);
+    hos_log("heap: %llu MB at %#llx%s", (unsigned long long)(size >> 20), (unsigned long long)HOS_HEAP_BASE,
+            hos_heap_lazy ? ", committed as the game touches it (HOS_HEAP_LAZY=0: whole, now)" : "");
     RET(0);
 }
 
