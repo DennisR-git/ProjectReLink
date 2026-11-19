@@ -1428,7 +1428,10 @@ HWND app_window() { return main_window; }   // (relink: the Insert menu's Fullsc
 // the frame counter), and players took it for a load that never ends: "black screen after the intro, waited a long time".
 // Said once, in the log in plain words and in a box on its own thread (the replay goes on to write its report); the game is
 // left running so the log keeps what follows
+std::atomic<bool> device_lost_seen{false};
+bool device_was_lost() { return device_lost_seen.load(std::memory_order_relaxed); }
 void device_lost_notice() {
+    device_lost_seen = true;
     logf("vk: THE GRAPHICS CARD STOPPED (device lost): the picture stays black until the game is started again. "
          "Please send relink_log.txt with a report");
 #ifdef _WIN32

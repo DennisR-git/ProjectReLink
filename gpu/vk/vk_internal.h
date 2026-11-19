@@ -379,6 +379,7 @@ void predict_run(void (*progress)(size_t done, size_t total));   // (after a pre
 /// what is done kept (the program cache, the driver's) and not counted as a start that ended inside them
 void prepare_stop();
 bool prepare_stopped();
+bool device_was_lost();   // (vk_main.cpp: device_lost_notice ran)
 void fill_replay_table(MkwVkRenderer& t);     // vk_replay.cpp
 
 } // namespace mkwvk

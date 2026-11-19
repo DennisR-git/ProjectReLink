@@ -1182,6 +1182,7 @@ FaultGate& fault_gate() {
 enum { kGateGo, kGateBusy, kGateFaulted };
 /// Before a build of a program goes to the driver. kGateGo: build, then fault_gate_end. kGateFaulted: do not build. With wait
 /// false (a build that must not block) a program being built right now answers kGateBusy
+void fault_file_add(uint64_t key);
 int fault_gate_begin(uint64_t key, bool wait) {
     if (!driver_faults_mode() || !key) return kGateGo;
     FaultGate& g = fault_gate();
@@ -1205,6 +1206,39 @@ void fault_gate_end(uint64_t key, bool faulted) {
     g.cv.notify_all();
     if (!fresh) return;
     logf("vk: program %016llx is kept out of the driver for the rest of the run", (unsigned long long)key);
+    // (relink, 0.7.9.3) For later runs only once the fault is seen to be this program's. Whatever stops the device with
+    // builds under way (a lost device, a driver reset, the PC going to sleep, the process being ended) faults every build
+    // in flight at once. Seen on 19/11: a shader preparation that was cut logged eleven such faults in the same instant, one
+    // a worker, as its last lines (what cut it is not known). Had their retries faulted too, eleven sound programs would have
+    // been written to the file and never drawn again on that driver version. So the line is written kSettleMs later, and
+    // not at all when the device was lost by then or three programs or more faulted within that time of each other
+    static std::mutex recent_mu;
+    static std::vector<std::chrono::steady_clock::time_point> recent;
+    static constexpr int kSettleMs = 5000;
+    const auto at = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lk(recent_mu);
+        recent.push_back(at);
+    }
+    std::thread([key, at] {
+        Sleep(kSettleMs);
+        size_t close_n = 0;
+        {
+            std::lock_guard lk(recent_mu);
+            for (const auto& t : recent) close_n += std::chrono::abs(t - at) <= std::chrono::milliseconds(kSettleMs);
+        }
+        if (device_was_lost() || close_n >= 3) {
+            static std::atomic<int> told{0};
+            if (told++ < 4)
+                logf("vk: program %016llx is not written to %s: %s, so the fault is not taken for the program's; it is tried again at "
+                     "the next start", (unsigned long long)key, driver_faults_path().c_str(),
+                     device_was_lost() ? "the graphics card stopped" : "several programs faulted within seconds of each other");
+            return;
+        }
+        fault_file_add(key);
+    }).detach();
+}
+void fault_file_add(uint64_t key) {
     FILE* f = fopen(driver_faults_path().c_str(), "ab");
     if (!f) {   // (a folder the game cannot write to)
         static std::atomic<bool> told{false};
