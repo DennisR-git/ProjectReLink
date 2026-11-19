@@ -466,7 +466,9 @@ const char* hn_framegen(int v, int variant) {
              : v == 5 ? "Four made frames" : v == 6 ? "Five made frames" : v == 7 ? "Six made frames" : "Seven made frames");
     return b[std::clamp(v, 2, 8)];
 }
-MENU_HINTS(hn_pace, 0, "As soon as it is ready.", "At an even interval: less stutter, at up to one frame of delay.")
+MENU_HINTS(hn_pace, 0, "As soon as it is ready.",
+           "At an even interval: less stutter, at up to one frame of delay (10 ms at most without Frame generation; not with "
+           "Low latency on).")
 MENU_HINTS(hn_vsync, 0, "Each frame is shown as soon as it is ready: the least delay. Where the driver has no mailbox mode "
            "(AMD's on Windows), a line can tear across the picture.",
            "Each frame waits for the display's refresh: no tearing, a little more delay. Below the display's rate, a frame "

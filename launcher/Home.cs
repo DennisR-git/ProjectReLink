@@ -109,8 +109,9 @@ public partial class MainWindow
                   L("Des images intercalées : plus fluide à l'œil, pas plus réactif. L'écran garde alors sa fréquence.",
                     "Frames made in between: smoother to the eye, not more responsive. The display keeps its own rate then."),
                   "Framegen", (0, L("Aucune", "None")), (2, "×2"), (3, "×3"), (4, "×4"));
-        SwitchRow(RowsSmooth, L("Rythme régulier des images générées", "Even pacing of generated frames"),
-                  L("Avec la génération d'images seulement.", "With frame generation only."), out FramePacing, out _);
+        SwitchRow(RowsSmooth, L("Rythme régulier des images", "Even frame pacing"),
+                  L("Chaque image est montrée à intervalle régulier : moins de saccades, pour 10 ms de délai au plus (une image avec la génération d'images).",
+                    "Each frame is shown at an even interval: less stutter, for 10 ms of delay at most (one frame with frame generation)."), out FramePacing, out _);
         SwitchRow(RowsSmooth, "V-Sync",
                   L("Chaque image attend le rafraîchissement de l'écran : plus de déchirure de l'image, un peu plus de délai. Utile là où le pilote n'a pas de mode mailbox (AMD sous Windows). Le menu en jeu le change aussi, aussitôt.",
                     "Each frame waits for the display's refresh: no more tearing, a little more delay. Useful where the driver has no mailbox mode (AMD on Windows). The in-game menu changes it too, at once."),
@@ -434,7 +435,7 @@ public partial class MainWindow
     {
         SpeedGroup.IsEnabled = s.FrameRate == 0;
         Pick(SpeedGroup, s.FrameRate != 0 ? 1 : s.GameSpeed);
-        FramePacing.IsEnabled = s.FrameGeneration != 0;
+        FramePacing.IsEnabled = true;   // (relink, 0.7.9.3: it paces the game's frames alone too, vk_framegen.cpp pace_only)
         // (NVIDIA DLSS and DLAA to choose only in a game built with them: the NVIDIA DLSS switch)
         foreach (var r in Radios(UpscalerGroup))
             if ((int)r.Tag is 1 or 2) r.Visibility = s.NvidiaDlss || s.Upscaler is 1 or 2 ? Visibility.Visible : Visibility.Collapsed;

@@ -97,6 +97,23 @@ int64_t now_ns() {
 }
 
 int multiplier() { return std::clamp(opts.framegen, 1, kMaxMult); }   // (the Insert menu; 1: the game's frames alone)
+// (relink, 0.7.9.3) Pacing without interpolation. The game's frames reach the window as the replay finishes them, and a
+// frame whose work ran a few milliseconds over (something seen for the first time while the camera turns, the game waiting
+// for the GPU's exposure sums of the frame before) is shown that much late and the next one early: the picture repeats on
+// the display though the rate is 60. With frame interpolation the display thread below has shown every frame at its place
+// on an even line since 0.7; this gives the game's frames alone the same thread and the same line, with no frame made:
+// each is copied once (the luma, the flow and the made frames are left out) and shown at its place, at most
+// RX_VK_PACE_CUSHION_MS (10) after it was handed over. A frame late moves the line, so the ones after it wait that much: a
+// cushion the next late frame of up to that size fits in unseen. Holding the frame on the replay's own thread instead was
+// tried and slowed the game itself (19/11, the Market's camera turn: 53 to 57 fps for 59.9, the picture shown twice 3 to 8
+// times a second for 0.5 to 1.5): the wait must not be the replay's.
+// The Frame pacing row, with Frame generation off, is this (the row did nothing without the interpolation). Not with Low
+// latency on (Reflex / Anti-Lag start each frame as late as they can: the opposite choice), nor under the 30 fps cap, which
+// the display paces. RX_VK_PACE_ONLY=0: off, as before
+bool pace_only() {
+    static const bool on = !getenv("RX_VK_PACE_ONLY") || atoi(getenv("RX_VK_PACE_ONLY")) != 0;
+    return on && opts.pace != 0 && opts.framegen < 2 && opts.reflex == 0 && fps_low_cap() <= 0;
+}
 
 /// A compute pipeline over bindings of these types (push descriptors), push constants of push bytes
 bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_list<VkDescriptorType> types, uint32_t push,
@@ -337,6 +354,16 @@ void display_main() {
             const int64_t now = now_ns();
             if (due < now) due = now;
             if (due > j.at + interval + step) due = j.at + interval + step;
+            int64_t steer = 0;
+            if (shown == 1 && pace_only()) {   // (pacing only: the cushion's most)
+                static const int64_t most = (int64_t)std::clamp(getenv("RX_VK_PACE_CUSHION_MS") ? atoi(getenv("RX_VK_PACE_CUSHION_MS")) : 10, 0, 40) * 1000000;
+                const int64_t cushion = std::min(most, interval / 5 * 3);   // (and three fifths of a frame: a high rate's frame is short)
+                if (due > j.at + cushion) due = j.at + cushion;
+                // (the cushion is kept, not only made by the first late frame: the line is steered, a tenth of a millisecond a
+                // frame at most, so that a frame on time waits four fifths of the cushion. The first late frame of a run of
+                // them then fits too, and a line that drifted (the frame time is an average) comes back)
+                steer = std::clamp<int64_t>((cushion / 5 * 4 - (due - j.at)) / 16, -100000, 100000);
+            }
             if (due - now > 1000000) wait_until_near(due - now - 1000000);
             while (now_ns() < due) SwitchToThread();
             const int64_t t = now_ns();
@@ -348,7 +375,7 @@ void display_main() {
                 hist[d < 7000000 ? 0 : d < 9000000 ? 1 : d < 12000000 ? 2 : d < 17000000 ? 3 : d < 25000000 ? 4 : 5]++;
             }
             shown_at = t;
-            next_show = t + step;
+            next_show = t + step + steer;
             (t - due > 2000000 ? stat.late : stat.on_time)++;
         }
         std::lock_guard lk(fg.mu);
@@ -573,11 +600,12 @@ bool framegen_wanted(int menu_value, int allow) {
 
 bool framegen_on() {
     static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
-    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed;
+    return (framegen_wanted(opts.framegen, allow) || (allow && pace_only())) && !dev.offscreen && !fg.failed;
 }
 
 VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
-    if (!opts.upscale && !opts.sharpness) return VK_NULL_HANDLE;
+    const int sharpness = upscaler_sharpens() ? 0 : opts.sharpness;   // (relink: done on the 3D, under the HUD: vk_dlss.cpp)
+    if (!opts.upscale && !sharpness) return VK_NULL_HANDLE;
     if (!src || !image || !sw || !sh || !dw || !dh) return VK_NULL_HANDLE;
     if (crop && crop[2] > 0 && crop[3] > 0 &&
         (crop[0] < 0 || crop[1] < 0 || (uint32_t)crop[0] >= sw || (uint32_t)crop[1] >= sh)) return VK_NULL_HANDLE;
@@ -673,7 +701,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     full_barrier(cmd);
     const int32_t pc[4] = {x0, y0, w, h};
     pass(cmd, fg.copy, {{src, fg.nearest}, {fg.frames[cur].view, VK_NULL_HANDLE}}, uw, uh, pc, sizeof pc);
-    pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
+    if (m > 1) pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
     set->made = 0;
     if (blend && m > 1) {
         pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
@@ -692,7 +720,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     vkCmdCopyImage(cmd, fg.frames[cur].image, VK_IMAGE_LAYOUT_GENERAL, set->frame[set->made].image,
                    VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     full_barrier(cmd);
-    fg.have_prev = true;
+    fg.have_prev = m > 1;   // (pacing only: no luma was made of this frame, so the first frame after it has nothing to blend with)
     fg.cur = prev;
     fg.recorded = set;
     fg.recorded_at = now;
