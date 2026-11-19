@@ -2624,6 +2624,7 @@ thread_local std::vector<PeekBind> peek_binds;   // (build_descriptors fills it 
 // ab7699ee7f536755's c0+0x30, the same block), for the dispatch's reset
 struct SkySums { VkBuffer buffer = VK_NULL_HANDLE; VkDeviceSize offset = 0, size = 0; };
 thread_local SkySums sky_sums;
+thread_local SkySums meter_out;   // (relink, RX_VK_METER_ZERO: where an exposure program's sums were bound)
 constexpr uint64_t kSkySumsProgram = 0x499dbfd0721d2858ull, kSkyRgblProgram = 0xab7699ee7f536755ull;
 bool peek_prog(uint64_t key) {   // (RX_VK_PEEK_PROG=<key prefix>,... or *; RX_VK_PEEK_FRAME=<n>: that frame only)
     static const char* want = getenv("RX_VK_PEEK_PROG");
@@ -2694,6 +2695,7 @@ bool null_tex_wanted(const Stage& st, const Shader::TextureDescriptor& d) {
 void build_descriptors(const NvnState& s, const Program& p) {
     if (peek_prog(p.key)) peek_binds.clear();
     if (p.key == kSkySumsProgram || p.key == kSkyRgblProgram) sky_sums = {};   // (relink: bound again below)
+    if (p.key == 0x435a0138b9013040ull || p.key == 0x592079442d7129daull) meter_out = {};
     dw().reset();
     draw_sampled().clear();
     light_probe_now = LightProbe{};
@@ -2810,10 +2812,19 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 if (light_probe_on() && st.vk_stage == VK_SHADER_STAGE_FRAGMENT_BIT && light_probe_now.nb < 3)   // (the marker report's)
                     light_probe_now.b[light_probe_now.nb++] = {addr, n, b.buffer != VK_NULL_HANDLE};
                 if ((ui_draw_now || compute_now) && b && d.count == 1) memory_note_ui_buffer(base, n);   // (relink: the HUD's records, a compute pass's blocks)
+                // (relink: OoT's exposure meter, where its two programs bind their block: vk_memory.cpp meter_bases)
+                if ((p.key == 0x435a0138b9013040ull || p.key == 0x592079442d7129daull) && d.is_written && b && n == 0x1040) {
+                    memory_meter_range(host->gpu_guest(base), n);
+                    meter_out = SkySums{b.buffer, b.offset + (addr - base), n - (addr - base)};
+                    if (fast_sync_part("RX_VK_METER_ZERO")) memory_no_late(host->gpu_guest(base), n);
+                }
                 // (relink) OoT's sky light accumulators: where they were bound, for the dispatch's reset (kSkySumsProgram)
                 if (((p.key == kSkySumsProgram && d.cbuf_offset == 0x20) || (p.key == kSkyRgblProgram && d.cbuf_offset == 0x30)) &&
                     d.cbuf_index == 0 && d.count == 1)
                     sky_sums = b ? SkySums{b.buffer, b.offset + (addr - base), n - (addr - base)} : SkySums{};
+                if (((p.key == kSkySumsProgram && d.cbuf_offset == 0x20) || (p.key == kSkyRgblProgram && d.cbuf_offset == 0x30)) &&
+                    d.cbuf_index == 0 && d.count == 1 && b && !getenv("RX_VK_NO_SKY_ZERO"))
+                    memory_no_late(host->gpu_guest(base) + (addr - base), std::min<uint64_t>(n - (addr - base), 0x100));
                 // (AyyBeeDee20738, PR 138) a table entry's region that does not fit its pool this moment bound nothing, and the next
                 // frame bound it again: its reads flipped between the data and 0, the picture between bright and dark. Smaller,
                 // down to 1 MB, rather than nothing (and past what is bound the shaders' search now goes on to the page table)
@@ -8653,6 +8664,17 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     if (work_since_barrier && !no_order) full_barrier(cmd, "barrier (dispatch)");
     work_since_barrier = true;
     if (p.key == kSkySumsProgram || p.key == kSkyRgblProgram || p.key == 0x6ccba775ea111ee9ull) replay_saw_exposure = true;
+    {   // (relink, RX_VK_METER_ZERO=1) OoT's exposure meter: 435a0138b9013040 and 592079442d7129da add a frame's
+        // sums into the first 16 bytes of their block, which the game reads and sets back to zero. With the game ahead of the
+        // GPU its zeros reach the mirror late, or a write-back lands over them first and the old sums come back: the next
+        // frame's are added on top (twice the light). Cleared here right before each, as the sky light's below
+        static const bool meter_zero = fast_sync_part("RX_VK_METER_ZERO");
+        if (meter_zero && (p.key == 0x435a0138b9013040ull || p.key == 0x592079442d7129daull) && meter_out.buffer && meter_out.size >= 16 &&
+            !(meter_out.offset & 3)) {
+            vkCmdFillBuffer(cmd, meter_out.buffer, meter_out.offset, 16, 0);
+            full_barrier(cmd);
+        }
+    }
     if ((p.key == kSkySumsProgram || p.key == kSkyRgblProgram) && sky_sums.buffer && !p.stages.empty()) {
         // (relink) OoT's sky light: 6ccba775ea111ee9 clears 7 x 16 bytes of a block from +0x30, then 499dbfd0721d2858 adds the
         // sky probe into 4 x RGB at c0[0x20] + c1[0] (+0x30) + 16 k with float atomics, and ab7699ee7f536755 its RGBL at
