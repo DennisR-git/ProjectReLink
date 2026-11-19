@@ -61,6 +61,13 @@ struct Pool {
     uint64_t sync_seg = 0;       // (and the parallel replay's segment whose uploads did)
     uint64_t last_value = 0;     // (the newest submission that bound it: its mirror is in use until that one is done)
     uint64_t direct_write_epoch = 0;   // (the part that last wrote it in guest memory, before it had a mirror)
+    // (relink, fast_sync_held) bound without a mirror: the submission of the last look at its pages, the page generation then,
+    // and the last submission whose look found pages the CPU wrote since the look before
+    uint64_t direct_probe_epoch = 0, direct_dyn_epoch = 0;
+    uint32_t direct_probe_gen = 0;
+    // (and, mirrored: the last submissions that synced a page the CPU wrote into its mirror, that bound it for the GPU to write,
+    // and that made the mirror: one that none of the three touched for long holds data nothing changes, mirrors_make_room)
+    uint64_t cpu_dirty_epoch = 0, gpu_write_epoch = 0, mirror_made_epoch = 0;
     uint64_t retired_value = 0;  // (retired: the submission that may still use it)
     bool was_mirrored = false;   // (its mirror was given back: its pages stay in the captures, for the next one)
     // (EvilOOT) retired with its mirror on: the pool that took it in copies the GPU's contents from it when its own mirror is
@@ -934,6 +941,24 @@ std::mutex meter_mu;
 // (the presenting thread's captures stop waiting only once the meter's programs were met: with a game build whose
 // programs have other keys the sums are not cleared on the GPU, and the wait is what keeps the exposure steady there)
 std::atomic<bool> meter_seen{false};
+// (relink, 0.7.9.3: the grass white and flickering since 0.7.9.2 on 6 GB cards, Discord 19/11) Fast sync lets the game run
+// ahead of the GPU, which is safe for a pool with a VRAM mirror: the GPU reads the mirror, filled with the pool's pages as they
+// were at each submit. A pool WITHOUT a mirror (the mirrors' budget full: 512 MB with the 6 GB preset, 1024 with the 8 GB one,
+// where everything the game binds takes 1000 to 1800 MB) is read by the GPU in guest memory itself, while the game writes its
+// next frames there: the grass's and the lights' per-frame data came out half old, half new (two RTX 2060: white grass in 0.7.9.2,
+// none in 0.7.9.1; here with RX_VK_MIRROR_MB=512: 29 % of the shots white with fast sync, 4 % without). Until 0.7.9.2 the wait
+// for the GPU's whole frame at the game's first submit kept the game from running that far ahead. So: while a pool the CPU
+// keeps writing is bound without a mirror, the captures wait as they did without fast sync (fast_sync_held), and such a pool
+// goes before the ones nothing writes when mirrors are made (mirror_make). RX_VK_FAST_SYNC_HOLD=0: no such hold, as 0.7.9.2
+std::atomic<uint64_t> mirror_epoch_pub{0}, direct_dyn_epoch_pub{0};
+// (submissions, six a frame or so: a pool counts as written for 40 frames after its last write, which is what gives it a mirror
+// before the others; the hold itself ends 4 frames after the last binding of such a pool in guest memory, each binding renewing it)
+constexpr uint64_t kDirectDynEpochs = 240, kHoldTailEpochs = 24;
+bool fast_sync_held() {
+    static const bool on = !getenv("RX_VK_FAST_SYNC_HOLD") || atoi(getenv("RX_VK_FAST_SYNC_HOLD")) != 0;
+    const uint64_t at = direct_dyn_epoch_pub.load(std::memory_order_relaxed);
+    return on && at && mirror_epoch_pub.load(std::memory_order_relaxed) - at < kHoldTailEpochs;
+}
 std::unordered_map<uint64_t, uint32_t> meter_bases;
 std::unordered_map<uint32_t, uint32_t> no_late_pages;
 void memory_no_late(uint64_t guest, uint64_t size) {
@@ -1964,13 +1989,14 @@ std::unique_ptr<Capture> capture_make() {
         // frame thread ran (8 % of the time): its own submits' captures wait there, with the whole frame behind them
         static const int wait_who_env = getenv("RX_VK_CAPTURE_WAIT_WHO") ? atoi(getenv("RX_VK_CAPTURE_WAIT_WHO")) : -1;
         static const bool fast_sync = fast_sync_all();
-        const int wait_who = wait_who_env >= 0 ? wait_who_env : fast_sync && meter_seen.load(std::memory_order_relaxed) ? 2 : 0;
+        const bool held = fast_sync_held();   // (a pool the game writes is read in guest memory: the waits of before fast sync)
+        const int wait_who = wait_who_env >= 0 ? wait_who_env : fast_sync && !held && meter_seen.load(std::memory_order_relaxed) ? 2 : 0;
         const bool this_waits = !wait_who || (wait_who == 1) == vk_on_present_thread();
         bool seq_all = false;
         uint64_t seq_max = 0;
         if (cap_wait && this_waits) {
             const uint64_t done = vk_timeline_completed();
-            const bool by_seq = late_seq_on();
+            const bool by_seq = late_seq_on() && !held;
             const uint64_t rec_done = by_seq ? vk_rec_completed() : 0;
             seq_all = by_seq;
             std::lock_guard lk(wb_pages_mu);
@@ -2742,8 +2768,21 @@ void prefetch_chunks(uint64_t lo, uint64_t hi, uint64_t chunk) {
 
 /// (the imports' chunk, for the code outside pool_lookup: the same value as pool_lookup's own. That function is left as it
 /// was written: it is on the replay's path, and a changed one loses its place in the back end's profile, vk_village.profdata)
+// (relink, 0.7.9.3) 4 MB where the mirrors' budget cannot hold every pool the game binds (under 1536 MB: the cards of 6 GB and
+// less, and the small VRAM presets). A chunk the CPU writes one page of needs its mirror whole for fast sync (fast_sync_held):
+// by 16 MB the written chunks were ~750 MB of a 744 MB budget and fast sync was held back all the time; by 4 MB they are
+// 470-560 MB, it is held back a quarter of the time, and what the budget has left goes to chunks the draws read (a 744 MB budget,
+// Market and Kokiri: GPU time 25.6 / 16.0 ms a frame by 16 MB, 12.9 / 8.7 by 4 MB, on an RTX 3060 Ti made to stand for a 6 GB card
+// with RX_VK_MIRROR_MB). Cards whose budget holds everything keep 16 MB: nothing measured there asked for a change
+uint64_t mirror_budget();   // (below)
 uint64_t import_chunk() {
-    static const uint64_t chunk = (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB"))) : 16) << 20;
+    static const uint64_t chunk = [] {
+        if (const char* e = getenv("RX_VK_IMPORT_CHUNK_MB")) return (uint64_t)std::max(0, atoi(e)) << 20;
+        const uint64_t mb = mirror_budget() < (1536ull << 20) ? 4 : 16;
+        if (mb != 16) logf("vk: memory imported by %llu MB chunks: the mirrors' budget is %llu MB (RX_VK_IMPORT_CHUNK_MB=16: as before)",
+                           (unsigned long long)mb, (unsigned long long)(mirror_budget() >> 20));
+        return mb << 20;
+    }();
     return chunk;
 }
 
@@ -2757,7 +2796,7 @@ Pool* pool_lookup(uint64_t guest, uint64_t size) {
     if (guest < it->lo || guest >= it->hi || !size || size > it->hi - guest) return nullptr;
     // (imports by 16 MB chunk (RX_VK_IMPORT_CHUNK_MB), not by pool: each import cost 5-45 ms in the driver, more as
     // their number grew, and the game makes ~13 pools a second; a chunk covers the pools after it at no cost)
-    static const uint64_t chunk = (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB"))) : 16) << 20;
+    static const uint64_t chunk = import_chunk();
     const GuestPool range = chunk ? GuestPool{guest, guest + size} : *it;
     auto covering = [&]() {
         auto c = imported.upper_bound(range.lo);
@@ -2936,6 +2975,27 @@ uint64_t mirror_budget() {
 uint64_t mirror_bytes = 0, mirror_epoch = 0;
 bool mirror_upload = false;   // (a submission is being recorded: its upload command buffer takes the syncs)
 std::vector<Pool*> mirror_wanted, mirror_synced;
+/// (pools_mu held; relink, fast_sync_held) a pool bound for the GPU to read in guest memory: once a submission, whether the CPU
+/// wrote any of its pages since the last look; one written in the last kDirectDynEpochs submissions holds fast sync back
+void direct_bound(Pool& p) {
+    if (p.direct_probe_epoch != mirror_epoch) {
+        // (the first look has nothing to compare with: every pool was written once, when its data came in. A pool bound in
+        // guest memory for one submission, until its mirror is made at the next one's start, never gets a second look: that
+        // was so in 0.7.9.2 on cards whose budget holds every pool, and no picture of theirs showed the defect)
+        if (p.direct_probe_epoch && memory_written_since(p.lo, p.hi - p.lo, p.direct_probe_gen)) p.direct_dyn_epoch = mirror_epoch;
+        p.direct_probe_epoch = mirror_epoch;
+        p.direct_probe_gen = gen_now;
+    }
+    if (!p.direct_dyn_epoch || mirror_epoch - p.direct_dyn_epoch >= kDirectDynEpochs) return;
+    const bool was = fast_sync_held();
+    direct_dyn_epoch_pub.store(mirror_epoch, std::memory_order_relaxed);
+    static int64_t holds;
+    if (!was && fast_sync_all() && (holds++ < 12 || holds % 200 == 0))
+        logf("vk: fast sync held back: pool %#llx (%llu MB), which the game keeps writing, is read in guest memory (the mirrors have "
+             "%llu MB of %llu); the game waits for the GPU as before 0.7.9.2 until it has a mirror (%lld times so)",
+             (unsigned long long)p.lo, (unsigned long long)((p.hi - p.lo) >> 20), (unsigned long long)(mirror_bytes >> 20),
+             (unsigned long long)(mirror_budget() >> 20), (long long)holds);
+}
 struct WriteBack {
     Pool* pool;
     uint64_t lo, hi;   // offsets in the pool
@@ -3426,6 +3486,7 @@ void mirror_sync(Pool& p) {
         }
         const uint32_t pg = page_gen(page);
         const bool dirty = pg > p.synced_gen;
+        if (dirty) p.cpu_dirty_epoch = mirror_epoch;
         if (dirty && gpu_page(page)) {   // (diagnostic: see memory_stamp_gpu)
             st_sync_gpu_pages++;
             gpu_over_by_pool[p.lo]++;
@@ -3855,7 +3916,9 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         Pool* p = tl.p;
         const uint64_t off = guest - p->lo;
         if (p->last_value < mem_rec_value) p->last_value = mem_rec_value;
-        if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED)
+        // (a refused pool takes the locked path once a submission, for direct_bound's look; a wanted one was there already)
+        const bool look = p->mstate == Pool::MIRROR_REFUSED && p->direct_probe_epoch != mirror_epoch_pub.load(std::memory_order_relaxed);
+        if (!look && (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED || p->mstate == Pool::MIRROR_WANTED))
             return remember({p->buffer, off, size, 0, true});
         if (p->mstate == Pool::MIRROR_ON && p->synced_epoch == mirror_epoch && p->sync_seg <= texture_segment())
             return remember({p->mirror, off, size, 0});
@@ -3869,6 +3932,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     const uint64_t off = guest - p->lo;
     if (!mirror_on() || !mirror_upload || p->mstate == Pool::MIRROR_REFUSED) {
         if (mirror_on()) { auto& e = direct_by_pool[p->lo]; e.first++, e.second = mirror_upload ? (int)p->mstate : 9; direct_bytes_by_pool[p->lo] += size; }
+        direct_bound(*p);
         return remember({p->buffer, off, size, 0, true});
     }
     // (a pool's mirror is made at its first binding, in this part's uploads: bound in guest memory until the next
@@ -3892,6 +3956,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
         mirror_wanted.push_back(p);
     }
     if (p->mstate != Pool::MIRROR_ON) {
+        direct_bound(*p);
         auto& e = direct_by_pool[p->lo];
         e.first++, e.second = (int)p->mstate;
         direct_bytes_by_pool[p->lo] += size;
@@ -3902,6 +3967,7 @@ BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     }
     if (p->synced_epoch != mirror_epoch || p->sync_seg > texture_segment()) mirror_sync(*p);
     if (written) {
+        p->gpu_write_epoch = mirror_epoch;
         writebacks.push_back({p, off, std::min(off + size, p->hi - p->lo)});
         rb_hazard_locked(p->lo + off, p->lo + std::min(off + size, p->hi - p->lo));   // (memory_rb_refresh)
         // (RX_VK_WB_LAZY) a range that is a texture's storage as well: its pages are written back at once, now and from now on
@@ -4022,6 +4088,8 @@ void mirror_free(Pool& p) {
     st_mirror_bytes_freed += p.hi - p.lo;
     st_mirrors_freed++;
     p.mstate = Pool::MIRROR_NONE;
+    // (fast_sync_held: bound in guest memory from here on, its writes are counted from now: direct_bound)
+    p.direct_probe_epoch = mirror_epoch, p.direct_probe_gen = gen_now, p.direct_dyn_epoch = 0;
     pools_gen++;   // (a parallel replay thread's pool cache: looked up again)
 }
 void mirrors_give_back(uint64_t want_bytes) {   // (pools_mu held)
@@ -4432,6 +4500,34 @@ void memory_begin_submission() {
     reap_mirrors();
     retired_imports_give_back();
     mirror_epoch++;
+    mirror_epoch_pub.store(mirror_epoch, std::memory_order_relaxed);
+    {   // (how much of the time fast sync is held back: what a 6 GB card's log is read for)
+        static uint64_t held;
+        held += fast_sync_held();
+        if (mirror_epoch % 3600 == 0) {
+            if (held) {
+                // (what the budget would have to hold: the pools written in the last kDirectDynEpochs submissions, with a
+                // mirror and without, against the mirrored ones nothing wrote for kStaticEpochs)
+                uint64_t live_m = 0, live_u = 0, still_m = 0, other_u = 0;
+                for (const auto& [lo, q] : imported) {
+                    const uint64_t n = q.hi - q.lo;
+                    if (q.mstate == Pool::MIRROR_ON) {
+                        const uint64_t touched = std::max({q.cpu_dirty_epoch, q.gpu_write_epoch, q.mirror_made_epoch});
+                        if (mirror_epoch - std::max(q.cpu_dirty_epoch, q.gpu_write_epoch) < kDirectDynEpochs) live_m += n;
+                        else if (mirror_epoch - touched > 1200) still_m += n;
+                    } else if (q.direct_probe_epoch && mirror_epoch - q.direct_probe_epoch < kDirectDynEpochs) {
+                        (q.direct_dyn_epoch && mirror_epoch - q.direct_dyn_epoch < kDirectDynEpochs ? live_u : other_u) += n;
+                    }
+                }
+                logf("vk: fast sync held back in %llu of the last 3600 submissions (a pool the game keeps writing had no mirror: "
+                     "%llu MB of %llu in mirrors; written lately: %llu MB mirrored, %llu MB not; written by nothing: %llu MB "
+                     "mirrored, %llu MB bound without)", (unsigned long long)held, (unsigned long long)(mirror_bytes >> 20),
+                     (unsigned long long)(mirror_budget() >> 20), (unsigned long long)(live_m >> 20), (unsigned long long)(live_u >> 20),
+                     (unsigned long long)(still_m >> 20), (unsigned long long)(other_u >> 20));
+            }
+            held = 0;
+        }
+    }
     mirror_upload = true;
     mirror_synced.clear();
     writebacks.clear();
@@ -4480,6 +4576,41 @@ void memory_sync_mirrors_before_segments() {
 /// A pool's mirror made, filled in the recording's upload command buffer: all of it, then the pages a capture holds
 /// as they were at their submit (pools_mu held). False over the budget (tried again when next bound, as mirrors are
 /// given back) or over 1 GB (never)
+/// (pools_mu held; relink, fast_sync_held) Room in the mirrors' budget for `need` bytes of a pool the game keeps writing: the
+/// mirrors of pools that nothing has written for kStaticEpochs submissions (not the CPU, not the GPU; models' vertices and
+/// indices mostly) are given back, the largest first, until it fits. Such a pool read in guest memory costs the GPU its reads
+/// over PCIe, as any pool past the budget does, but nothing changes under them. False, and nothing given back, when they
+/// would not be enough
+constexpr uint64_t kStaticEpochs = 1200;
+bool mirrors_make_room(const Pool& for_pool, uint64_t need) {
+    if (mirror_bytes + need <= mirror_budget()) return true;
+    if (!wb_orphans.empty()) return false;
+    const uint64_t over = mirror_bytes + need - mirror_budget();
+    std::vector<Pool*> still;
+    uint64_t have = 0;
+    for (auto& [lo, q] : imported) {
+        if (&q == &for_pool || q.mstate != Pool::MIRROR_ON || q.wb_pending_n || q.inherit_pending || q.shadow) continue;
+        const uint64_t touched = std::max({q.cpu_dirty_epoch, q.gpu_write_epoch, q.mirror_made_epoch});
+        if (mirror_epoch - touched <= kStaticEpochs) continue;
+        still.push_back(&q);
+        have += q.hi - q.lo;
+    }
+    if (have < over) return false;
+    std::sort(still.begin(), still.end(), [](const Pool* a, const Pool* b) { return a->hi - a->lo > b->hi - b->lo; });
+    uint64_t freed = 0;
+    int n = 0;
+    for (Pool* q : still) {
+        if (freed >= over) break;
+        freed += q->hi - q->lo, n++;
+        mirror_free(*q);
+    }
+    static int64_t times;
+    if (times++ < 12 || times % 200 == 0)
+        logf("vk: the mirrors of %d pools nothing writes (%llu MB) given back for pool %#llx (%llu MB), which the game keeps "
+             "writing (%lld times so)", n, (unsigned long long)(freed >> 20), (unsigned long long)for_pool.lo,
+             (unsigned long long)(need >> 20), (long long)times);
+    return true;
+}
 bool mirror_make(Pool& pool) {
     Pool* p = &pool;
     {
@@ -4489,6 +4620,11 @@ bool mirror_make(Pool& pool) {
         static const bool tight_rule = getenv("RX_VK_MIRROR_TIGHT") != nullptr;
         uint64_t used = 0, allowed = 0;
         const bool tight = tight_rule && vram_usage(&used, &allowed) && allowed && used > allowed / 100 * 90;
+        // (relink, fast_sync_held) a pool the game keeps writing, bound without a mirror, goes before the pools nothing writes
+        static const bool prio = !getenv("RX_VK_MIRROR_PRIO") || atoi(getenv("RX_VK_MIRROR_PRIO")) != 0;
+        if (prio && !tight && n <= (1ull << 30) && mirror_bytes + n > mirror_budget() && p->direct_dyn_epoch &&
+            mirror_epoch - p->direct_dyn_epoch < kDirectDynEpochs)
+            mirrors_make_room(*p, n);
         if (mirror_bytes + n > mirror_budget() || n > (1ull << 30) || tight) {
             p->mstate = n > (1ull << 30) ? Pool::MIRROR_REFUSED : Pool::MIRROR_NONE;
             static int logged;
@@ -4502,6 +4638,7 @@ bool mirror_make(Pool& pool) {
             p->mstate = Pool::MIRROR_REFUSED;
             return false;
         }
+        p->mirror_made_epoch = mirror_epoch;
         {   // (relink) the page table points at the mirror: what the GPU wrote is there, and guest memory has it only after the write-back
             VkBufferDeviceAddressInfo da{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
             da.buffer = p->mirror;
