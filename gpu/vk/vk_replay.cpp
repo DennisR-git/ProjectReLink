@@ -186,6 +186,27 @@ uint64_t completed() {
     vkGetSemaphoreCounterValue(dev.device, timeline, &v);
     return v;
 }
+// (relink, 0.7.9.3) A recording is not handed to a device that is lost. Each one after the loss failed with -4, as the
+// first had, and went on being sent: on an RX 6800 XT under 0.7.9.2 (a player's log of 19/11) the driver itself then
+// crashed inside one of those submits, a few seconds after the card had stopped (amdvlk64.dll, a read at 0x38, under
+// run_submit), so the game closed on a crash report over the "graphics card stopped" message. The answer the driver gave
+// is given without asking it. RX_VK_TEST_LOSE_AT=<n> (a test): the device is taken for lost at the n-th recording sent
+VkResult submit_recording_to_queue(const VkSubmitInfo2* si, VkFence fence) {
+    static const int64_t lose_at = getenv("RX_VK_TEST_LOSE_AT") ? atoll(getenv("RX_VK_TEST_LOSE_AT")) : 0;
+    static std::atomic<int64_t> sent{0}, refused{0};
+    if (lose_at > 0 && ++sent == lose_at) {
+        logf("vk: the device is taken for lost at recording %lld (RX_VK_TEST_LOSE_AT)", (long long)lose_at);
+        checkpoints_report();
+    }
+    if (device_was_lost()) {
+        const int64_t n = ++refused;
+        if (n == 1 || !(n & (n - 1)))
+            logf("vk: the device is lost: %lld recordings not sent to it since", (long long)n);
+        return VK_ERROR_DEVICE_LOST;
+    }
+    return vkQueueSubmit2(dev.queue, 1, si, fence);
+}
+
 // ---- (test) RX_VK_BATCH=1: the replay's submits held and sent as one vkQueueSubmit2 ----
 // On amdgpu every command submission pays for all imported host memory (userptr) again; the replay made ~6 a frame.
 // Held submits go out at the next point that needs the GPU's results or the queue's order: a wait, a readback, a
@@ -238,7 +259,7 @@ void queue_flush_locked() {   // (dev.present_mu held)
     si.pSignalSemaphoreInfos = sig;
     PROF(PROF_QSUBMIT);
     if (pend.rec) rec_sent_pub.store(pend.rec, std::memory_order_relaxed), stall_watch_start();
-    const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
+    const VkResult res = submit_recording_to_queue(&si, VK_NULL_HANDLE);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: batched submit %llu failed (%d)", (unsigned long long)batch_next, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) checkpoints_report();
@@ -732,7 +753,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     }
     PROF(PROF_QSUBMIT);
     if (seq) rec_sent_pub.store(seq, std::memory_order_relaxed), stall_watch_start();
-    const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
+    const VkResult res = submit_recording_to_queue(&si, r.fence);
     if (tl_log_on()) {   // (every submit, for vk_tl_recent: one that signals nothing has tid 0, shown with a 'u')
         if (signal_value) {
             tl_note_signal(signal.value);
@@ -2195,7 +2216,7 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         const auto ts0 = std::chrono::steady_clock::now();
         std::lock_guard lk(dev.present_mu);
         queue_flush_locked();
-        const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, j->r->fence);
+        const VkResult res = submit_recording_to_queue(&si, j->r->fence);
         j->r->submitted = res == VK_SUCCESS;
         static std::atomic<int> failures{0};   // (relink: once lost, every segment failed: thousands of lines, issue 21's log)
         if (res != VK_SUCCESS && failures++ < 8)

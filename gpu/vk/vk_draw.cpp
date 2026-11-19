@@ -6323,6 +6323,8 @@ bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     return true;
 }
 
+thread_local bool fallback_compile_ahead = false;   // (eager_graphics's: said in the "compiling" lines, and counted)
+std::atomic<int64_t> st_fallback_ahead{0}, st_fallback_at_draw{0};
 bool fallback_compute_pipelines(Program& p) {
     // (relink) The lock covers the lookup and the publishing only, not the compiles: one 12 s AMD compile held every recording
     // thread. A program being built by another thread is waited for (never two builds of one program); other programs go on.
@@ -6378,7 +6380,10 @@ bool fallback_compute_pipelines(Program& p) {
         // ended on "could not be made" for one of them and then nothing: no present, no other line. Each compile now says it
         // starts, how long it took and what the driver answered, so a log that stops says whether a compile was under way
         static std::atomic<int> told_start{0};
-        if (told_start++ < 64) logf("vk: fallback: compiling stage %zu of %016llx", i, (unsigned long long)p.key);
+        if (told_start++ < 64)
+            logf("vk: fallback: compiling stage %zu of %016llx%s", i, (unsigned long long)p.key,
+                 fallback_compile_ahead ? " (ahead of its first draw)" : "");
+        (fallback_compile_ahead ? st_fallback_ahead : st_fallback_at_draw)++;
         const auto t0 = std::chrono::steady_clock::now();
         const VkResult r = guarded_compute(pcache, &ci, &made[i]);
         const long long ms = (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -9210,6 +9215,15 @@ void eager_graphics(const nvn_prog& prog) {
                          "draw, as before", (unsigned long long)(ms.ullAvailPageFile >> 20));
                 return;
             }
+        }
+        // (0.7.9.3) A mesh fallback program's compute pipelines with it: they were made at the program's first draw, on the
+        // recording thread (64 "fallback: compiling" lines in a run through two areas with the fallback forced, a 572 ms
+        // frame at an arrival). Only for a program the state lists name in this mesh mode: this PC's own list, once it
+        // has played the place (the shipped list is noted with mesh shaders, and its mesh records are left out above)
+        if (p->fallback) {
+            fallback_compile_ahead = true;
+            fallback_compute_pipelines(const_cast<Program&>(*p));
+            fallback_compile_ahead = false;
         }
         const auto t0 = std::chrono::steady_clock::now();
         compiles_running++;
