@@ -184,7 +184,7 @@ sealed class Settings
         Handheld = Int(g, "handheld_profile", 0, 0, 1);
         Ultrawide = Int(g, "ultrawide", 0, 0, 1);
         FpsCounter = Int(g, "fps_counter", 0, 0, 1);
-        Upscaler = Int(g, "dlss", 0, 0, 4);
+        Upscaler = Int(g, "dlss", 0, 0, 5);
         other.Clear();
         foreach (var (k, v) in g)
             if (!Known.Contains(k)) other[k] = v;

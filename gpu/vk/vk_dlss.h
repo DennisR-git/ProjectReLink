@@ -64,6 +64,9 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
 /// Once a frame (the game's present): after 120 frames without DLSS (off, or the upscale not taken) its feature, images and
 /// deferred frees are let go, so its video memory comes back. Nothing to do costs one atomic load
 void dlss_idle();
+/// (relink, 0.7.9.3) the Sharpness row sharpened the upscaler's 3D picture under the HUD in the last frames: the window's pass
+/// leaves its own sharpening out
+bool upscaler_sharpens();
 
 /// For the renderer's status line (vk_replay.cpp status_tick): while an upscaler draws, its details since the last call
 /// into b ("; DLSS: jitter ..., actor motion ..., its images ... MB") and its dlss_mode() (1 to 4); else 0 and b left alone

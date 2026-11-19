@@ -88,10 +88,26 @@ int env_switch(const char* name) {   // (-1: unset)
     const char* e = getenv(name);
     return e && *e ? atoi(e) : -1;
 }
+// (relink, 0.7.9.3) The Sharpness row with DLSS, DLAA or FSR: on their 3D picture, before the HUD (dlss_out.comp), not on the
+// finished picture as it goes to the window (RX_VK_UPSCALER_SHARPEN=0: there, as before). kSharpenGain and kSharpenOver: the
+// row's 100 %. MEASURED (19/11, RTX 3060 Ti, the Market's house fronts from the arrival's still camera, pictures at the
+// output's own 2048x1152, the mean luma step between neighbours; relink_release sharp_sc6.txt and the ledger): the game's own
+// network at 75 % 9.6 to 10.1; DLSS from the same 1536x864 5.9 unsharpened, 8.5 at the row's 50 %, 10.8 to 11.7 at 100 %; FSR 3.1 5.6, 8.1
+// and 11.0. So about 80 % looks like the game's own, which is what the row's hint has advised. With the pixel held
+// between its neighbours (no overshoot) the measure stopped at 7.2 whatever the gain
+bool upscaler_sharpen_on() {
+    static const bool on = env_switch("RX_VK_UPSCALER_SHARPEN") != 0;
+    return on;
+}
+static const float kSharpenGain = getenv("RX_VK_UPSCALER_SHARPEN_GAIN") ? (float)atof(getenv("RX_VK_UPSCALER_SHARPEN_GAIN")) : 2.0f;
+// (how far past its neighbours a sharpened pixel may go, as a share of their spread, at the row's 100 %: dlss_out.comp)
+static const float kSharpenOver = getenv("RX_VK_UPSCALER_SHARPEN_OVER") ? (float)atof(getenv("RX_VK_UPSCALER_SHARPEN_OVER")) : 0.5f;
 /// (relink) The Upscaler's values (upscaler_rows.h): which backend, and whether the 3D is drawn at full size
 bool is_fsr(int mode) { return mode == upscaler_rows::FSR || mode == upscaler_rows::FSR_AA; }
 bool native_aa(int mode) { return mode == upscaler_rows::DLAA || mode == upscaler_rows::FSR_AA; }
-const char* backend_name(int mode) { return is_fsr(mode) ? "AMD FSR" : "NVIDIA DLSS"; }
+/// (relink, 0.7.9.3) No upscaling: no backend, the scene shown as it is (dlss_upscale)
+bool is_plain(int mode) { return mode == upscaler_rows::NONE; }
+const char* backend_name(int mode) { return is_plain(mode) ? "No upscaling" : is_fsr(mode) ? "AMD FSR" : "NVIDIA DLSS"; }
 /// (relink) FSR's view-space units in metres (FFX's viewSpaceToMetersFactor, which scales its depth tolerances): 1, a guess
 /// from the scene camera's planes as read in the Market (0.1 to 25041: a near plane of 10 cm, as a game in metres has)
 constexpr float kFsrMeters = 1.0f;
@@ -116,12 +132,16 @@ int dlss_asked() {
 int dlss_mode() {
     // (what is asked for, when it can run here: DLSS and DLAA where dlss_why() lets them, FSR where fsr_why() does)
     const int want = dlss_asked();
+    if (is_plain(want)) return want;   // (no backend to ask)
     if (is_fsr(want)) return fsr_why() == FSR_OK ? want : 0;
     if (dlss_why() != DLSS_OK) return 0;
     return want;
 }
 bool dlss_wanted() { return dlss_mode() != 0; }
-bool dlss_full_scale() { return native_aa(dlss_mode()); }
+bool dlss_full_scale() {
+    const int mode = dlss_mode();
+    return native_aa(mode) || is_plain(mode);
+}
 
 namespace {
 
@@ -522,7 +542,7 @@ bool make_pipelines() {
     const VkDescriptorType prep_types[5] = {S, S, I, I, I}, out_types[2] = {S, I};
     if (!s.prep && !make_pipeline(DLSS_PREP_COMP_SPV, sizeof DLSS_PREP_COMP_SPV, prep_types, 5, 84, s.prep_set, s.prep_layout, s.prep))
         return false;
-    if (!s.out && !make_pipeline(DLSS_OUT_COMP_SPV, sizeof DLSS_OUT_COMP_SPV, out_types, 2, 8, s.out_set, s.out_layout, s.out))
+    if (!s.out && !make_pipeline(DLSS_OUT_COMP_SPV, sizeof DLSS_OUT_COMP_SPV, out_types, 2, 16, s.out_set, s.out_layout, s.out))
         return false;
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
@@ -1005,7 +1025,7 @@ void dlss_probe() {
 void dlss_note_scene_draw(const Texture* color0, uint32_t width, uint32_t height, Texture* depth, uint64_t camera,
                           uint64_t camera_size) {
     if (!color0 || !depth || !camera || camera_size < 0x230 || width < 640 || height < 360) return;
-    if (color0->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || !dlss_wanted()) return;
+    if (color0->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || !dlss_wanted() || is_plain(dlss_mode())) return;
     State& s = st();
     std::lock_guard lk(s.mu);
     const uint64_t now = texture_frame_no();
@@ -1042,6 +1062,7 @@ namespace {
 /// The upscaler that runs has failed (its upscale left to the network): DLSS's or FSR's
 bool backend_failed(int mode) {
     const State& s = st();
+    if (is_plain(mode)) return false;
     return (is_fsr(mode) ? s.fsr_failed : s.failed).load(std::memory_order_relaxed);
 }
 }  // namespace
@@ -1052,9 +1073,16 @@ uint32_t dlss_jitter_size(int axis) {
     State& s = st();
     const uint64_t last = s.last_frame.load(std::memory_order_relaxed);
     const int mode = dlss_mode();
-    if (off || !mode || backend_failed(mode) || !last || texture_frame_no() - last > 30) return 0;
+    if (off || !mode || is_plain(mode) || backend_failed(mode) || !last || texture_frame_no() - last > 30) return 0;
     if (axis == 2) return s.jitter_phases.load(std::memory_order_relaxed);
     return axis ? s.jitter_h.load(std::memory_order_relaxed) : s.jitter_w.load(std::memory_order_relaxed);
+}
+
+/// (relink, 0.7.9.3) The window's pass leaves its sharpening out: the upscaler's picture was sharpened under the HUD in the last frames
+bool upscaler_sharpens() {
+    if (!upscaler_sharpen_on()) return false;
+    const uint64_t last = st().last_frame.load(std::memory_order_relaxed);
+    return last && texture_frame_no() - last <= 30 && dlss_mode() != 0;
 }
 
 float upscaler_lod_bias() {
@@ -1071,6 +1099,11 @@ int dlss_status(char* b, size_t n) {
     const int mode = dlss_mode();
     if (!mode || backend_failed(mode) || !last || texture_frame_no() - last > 30) return 0;
     std::lock_guard lk(s.mu);
+    if (is_plain(mode)) {
+        snprintf(b, n, "; no upscaling: %llu frames drawn", (unsigned long long)s.status_drawn);
+        s.status_drawn = s.status_passed = 0;
+        return mode;
+    }
     // (its own video memory: the images and buffers it made here, and what NGX says its feature holds (FFX its upscaler),
     // when it says)
     uint64_t own = 0;
@@ -1094,7 +1127,7 @@ int dlss_status(char* b, size_t n) {
     if (held_known) snprintf(feature, sizeof feature, ", its %s %llu MB", is_fsr(mode) ? "upscaler" : "feature", held >> 20);
     char passed[64] = "";
     if (s.status_passed) snprintf(passed, sizeof passed, ", %llu left to the game's network", (unsigned long long)s.status_passed);
-    static const char* const names[upscaler_rows::kUpscalers] = {"", "DLSS", "DLAA", "FSR", "FSR native AA"};
+    static const char* const names[upscaler_rows::kUpscalers] = {"", "DLSS", "DLAA", "FSR", "FSR native AA", "none"};
     snprintf(b, n, "; %s: %llu frames drawn%s, %llu %s made, jitter %+.3f %+.3f px%s, actor motion %llu draws in %llu "
              "frames (%.3f ms CPU a frame), its images %llu MB%s",
              names[mode], (unsigned long long)s.status_drawn, passed,
@@ -1118,7 +1151,7 @@ void dlss_idle() {
     // the row changes, as before. RX_VK_UPSCALER_IDLE_FREE=1: let go after 120 frames whatever the row says, as before
     static const bool idle_free = getenv("RX_VK_UPSCALER_IDLE_FREE") != nullptr;
     const int mode = dlss_mode();
-    if (!idle_free && mode != 0 && (s.fsr ? is_fsr(mode) : s.feature_ow && !is_fsr(mode))) return;
+    if (!idle_free && mode != 0 && !is_plain(mode) && (s.fsr ? is_fsr(mode) : s.feature_ow && !is_fsr(mode))) return;
     if (s.fsr || s.feature_ow) {
         const char* name = s.fsr ? "AMD FSR" : "NVIDIA DLSS";
         drop_fsr();
@@ -1188,7 +1221,9 @@ uint32_t bones_used(const DlssSkin& k) {
 
 void dlss_note_skinned_draw(const DlssSkin& k) {
     static const bool off = env_switch("RX_VK_DLSS_ACTORS") == 0;
-    if (off || !dlss_wanted() || !k.depth || !k.bones || k.bones_size < 48 || !k.object || k.object_size < 0x4c) return;
+    if (off || !dlss_wanted() || is_plain(dlss_mode()) || !k.depth || !k.bones || k.bones_size < 48 || !k.object ||
+        k.object_size < 0x4c)
+        return;
     State& s = st();
     std::lock_guard lk(s.mu);
     if (s.skins.size() >= 512) s.skins.clear();   // (no upscale for a while: what was kept is stale)
@@ -1214,6 +1249,32 @@ void dlss_note_skinned_draw(const DlssSkin& k) {
     s.skins.push_back(std::move(d));
 }
 
+namespace {
+/// dlss_out.comp: a perceptual picture (an upscaler's output, or the scene itself) squared into the game's picture, sharpened
+/// first when the Sharpness row asks. same_size: read texel for texel; else through the linear filter (DLAA's and FSR's
+/// native AA's picture is at the render size)
+// (relink, 0.7.9.3: the Sharpness row on the 3D alone, before the HUD is drawn over it. The window's pass leaves its own
+// sharpening out meanwhile, upscaler_sharpens. RX_VK_UPSCALER_SHARPEN=0: as before, after the HUD)
+void out_pass(VkCommandBuffer cmd, State& s, VkImageView src, bool same_size, VkImageView out_view, uint32_t ow, uint32_t oh) {
+    const float amount = upscaler_sharpen_on() ? std::clamp(opts.sharpness, 0, 100) / 100.0f : 0.0f;
+    const struct {
+        int32_t size[2];
+        float sharp, over;
+    } opc{{(int32_t)ow, (int32_t)oh}, amount * kSharpenGain, amount * kSharpenOver};
+    const VkDescriptorImageInfo info[2] = {{same_size ? s.point : s.linear, src, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[0].pImageInfo = &info[0];
+    w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[1].pImageInfo = &info[1];
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out_layout, 0, 2, w);
+    vkCmdPushConstants(cmd, s.out_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof opc, &opc);
+    vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
+}
+}  // namespace
+
 bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImageView in_view, Texture* out,
                   VkImageView out_view, uint32_t out_level) {
     const int mode = dlss_mode();
@@ -1237,6 +1298,32 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
                                             out->width >> out_level, out->height >> out_level);
     }
     free_dead(false);
+    if (is_plain(mode)) {
+        // (relink, 0.7.9.3) No upscaling: the scene, drawn at the output's size (dlss_full_scale), goes into the picture as the
+        // network's output would hold it, the square of its perceptual encoding, and nothing else is done to it: no history,
+        // no camera shift, no smoothing of edges. Only the full-size pass, known by its key: a frame the game still draws
+        // smaller (the row just changed) keeps the game's network. The Sharpness row applies, as with the others
+        if (!known || !in || !in_view || !out || !out_view) return false;
+        const uint32_t rw = in->width, rh = in->height;
+        const uint32_t ow = std::max(1u, out->width >> out_level), oh = std::max(1u, out->height >> out_level);
+        if (out->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || ow < rw || oh < rh || ow > rw * 3 || oh > rh * 3)
+            return fail("unexpected output");
+        if (!make_pipelines()) return fail("its shader was not made");
+        struct Disturbed {
+            ~Disturbed() { descriptors_disturbed(); }
+        } disturbed;
+        full_barrier(cmd);   // (the scene's colour, written before)
+        out_pass(cmd, s, in_view, rw == ow && rh == oh, out_view, ow, oh);
+        // (s.asked is left alone: a backend still held from the row's last choice is let go by dlss_idle)
+        s.last_frame = texture_frame_no();
+        s.lod_bias = 0.0f;
+        s.status_drawn++;
+        if (s.drawn_mode != mode) {
+            s.drawn_mode = mode;
+            logf("vk: no upscaling: the scene is shown as it is drawn, %ux%u -> %ux%u", rw, rh, ow, oh);
+        }
+        return true;
+    }
     const Camera cam = s.cam;
     s.cam.valid = false;   // (each frame's own camera)
     struct SkinsDone {     // (the skinned draws, each frame's own too: actor_motion takes them, or they go here)
@@ -1298,7 +1385,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
 
     const uint64_t now = texture_frame_no();
     const uint64_t last = s.last_frame;
-    const bool reset = !last || now - last > 2;
+    bool reset = !last || now - last > 2;
     struct {
         float reproject[16];
         float jitter[2];
@@ -1312,7 +1399,19 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     float previous[16];
     std::memcpy(previous, s.last_vp, sizeof previous);
     dlss_math::unjitter(previous, s.last_jitter);
-    const bool motion = !reset && dlss_math::reprojection(cam.current, previous, pc.reproject);
+    bool motion = !reset && dlss_math::reprojection(cam.current, previous, pc.reproject);
+    // (relink, 0.7.9.3) A camera cut (a cutscene's, a door, a warp: dlss_math::camera_cut), or a frame whose reprojection
+    // cannot be made: the history is of another view, and DLSS and FSR both ask to be told (their reset). It was kept, with
+    // a motion of the wrong view or of zero, and the view before showed through the new one for a few frames.
+    // RX_VK_UPSCALER_CUT_RESET=0: kept, as before
+    static const bool cut_reset = env_switch("RX_VK_UPSCALER_CUT_RESET") != 0;
+    if (!reset && cut_reset && (!motion || dlss_math::camera_cut(pc.reproject))) {
+        static std::atomic<int> told{0};
+        if (told++ < 6)
+            logf("vk: %s: a camera cut at frame %llu (%s): its history is reset", backend_name(mode), (unsigned long long)now,
+                 motion ? "the view before is not this one" : "no reprojection from the frame before");
+        reset = true, motion = false;
+    }
     pc.jitter[0] = cam.jitter[0], pc.jitter[1] = cam.jitter[1];
     pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh, pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0);
 
@@ -1421,20 +1520,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
 #endif
     }
     full_barrier(cmd);
-    {
-        const int32_t opc[2] = {(int32_t)ow, (int32_t)oh};
-        const VkDescriptorImageInfo info[2] = {{native ? s.linear : s.point, s.output.view, VK_IMAGE_LAYOUT_GENERAL},
-                                               {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
-        VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
-        w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        w[0].pImageInfo = &info[0];
-        w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        w[1].pImageInfo = &info[1];
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out);
-        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.out_layout, 0, 2, w);
-        vkCmdPushConstants(cmd, s.out_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof opc, opc);
-        vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
-    }
+    out_pass(cmd, s, s.output.view, !native, out_view, ow, oh);
     s.last_frame = now;
     s.last_jitter[0] = cam.jitter[0], s.last_jitter[1] = cam.jitter[1];
     // (for the status line, dlss_status: the jitter DLSS (or FSR) was given, in render pixels)
@@ -1455,7 +1541,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     if (s.drawn_mode != mode) {   // (once for each Upscaler that draws)
         s.drawn_mode = mode;
         static const char* const names[upscaler_rows::kUpscalers] = {"", "NVIDIA DLSS", "NVIDIA DLAA", "AMD FSR",
-                                                                     "AMD FSR native AA"};
+                                                                     "AMD FSR native AA", "No upscaling"};
         logf("vk: %s draws OoT's upscale: %ux%u -> %ux%u%s", names[mode], rw, rh, ow, oh,
              show_motion ? " (its motion shown)" : "");
     }

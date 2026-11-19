@@ -151,7 +151,7 @@ int upscaler() { return dlss_mode(); }
 bool dlss_ok() { return dlss_why() == DLSS_OK; }
 bool fsr_ok() { return fsr_why() == FSR_OK; }
 const char* tx_upscaler(int) {
-    static const char* t[] = {"Game's own", "NVIDIA DLSS", "NVIDIA DLAA", "AMD FSR", "AMD FSR native AA"};
+    static const char* t[] = {"Game's own", "NVIDIA DLSS", "NVIDIA DLAA", "AMD FSR", "AMD FSR native AA", "None"};
     return t[std::clamp(upscaler(), 0, ur::kUpscalers - 1)];
 }
 /// The Upscaler: the one shown (what runs, upscaler()), and with the game's own, why DLSS and DLAA, and FSR, are not offered
@@ -166,6 +166,8 @@ const char* hn_upscaler(int v, int variant) {
         "that move by themselves can trail for now.",
         "AMD's FSR 3.1, the 3D at full size with its edges smoothed, on any GPU; slower. A little softer than the game's "
         "own. Things that move by themselves can trail for now.",
+        "No upscaler: the 3D at full size, shown as it is drawn. Nothing is smoothed and nothing trails; edges are "
+        "jagged, and leaves, fences and far lines shimmer. Softer than the game's own, which sharpens: Sharpness helps.",
     };
     static const char* const why[DLSS_WHY_COUNT] = {
         nullptr,
@@ -274,6 +276,7 @@ const char* tx_resolution(int v) {
     const int up = upscaler();
     if (up == ur::DLAA) return "Native (DLAA)";
     if (up == ur::FSR_AA) return "Native (FSR native AA)";
+    if (up == ur::NONE) return "Native (no upscaler)";
     if (!ur::percent(v)) return "Auto (dynamic)";
     if (const char* mode = ur::temporal_steps(up) ? ur::dlss_mode_name(v) : nullptr) {
         snprintf(b, sizeof b, "%s (%d%%)", mode, ur::percent(v));
@@ -294,6 +297,9 @@ const char* hn_resolution(int v, int variant) {
     if (up == ur::FSR_AA)
         return "FSR native AA draws the 3D at full size: nothing to set here. Choose AMD FSR or the game's own upscaler to "
                "draw it smaller.";
+    if (up == ur::NONE)
+        return "Without an upscaler the 3D is drawn at full size: nothing to set here. Choose an upscaler to draw it "
+               "smaller.";
     const int p = ur::percent(v);
     if (up == ur::FSR) {   // (relink) FSR's modes are DLSS's shares, by the same names
         switch (p) {
@@ -589,7 +595,7 @@ Row rows[] = {
     {TAB_GRAPHICS, "Window scaling filter", &opts.upscale, 0, 2, 1, tx_filter,
      "How the finished picture is scaled to the window, when its size differs from the Output resolution.", hn_filter},
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
-     "Sharpens the picture as it goes to the window, with any filter. Too much shows halos around edges.", hn_sharpness},
+     "Sharpens the picture: the 3D alone with DLSS, DLAA or FSR, else as it goes to the window. Too much shows halos.", hn_sharpness},
     {TAB_GRAPHICS, "Handheld profile", &opts.handheld, 0, 1, 1, tx_onoff,
      "Runs the game as if the console were undocked. Applies after a restart.", hn_handheld, true},
     {TAB_GRAPHICS, "Ultrawide", &opts.ultrawide, 0, 1, 1, tx_ultrawide,

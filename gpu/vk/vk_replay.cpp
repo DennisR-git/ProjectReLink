@@ -3644,7 +3644,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         // (relink) the item wheel open: the game's picture covered with its scene before the HUD, dimmed, and the wheel over it
         // (the game's own item row, its hints and the HUD gone from behind the wheel; before frame interpolation and shots read it)
         if (tex) framegen_wheel_backdrop(r.cmd, tex->image, tex->format, sw, sh, crop);
-        if (tex && !dev.offscreen && (opts.upscale || opts.sharpness)) {
+        if (tex && !dev.offscreen && (opts.upscale || (opts.sharpness && !upscaler_sharpens()))) {
             // Keep the sampled view with the same cached image as the direct present, before advancing its age.
             direct_view = texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample);
             tex->last_frame = texture_frame_no();
