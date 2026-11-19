@@ -12,6 +12,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+static void inj_after_wait(void);   /* (HOS_DELAY, below) */
+
 enum { K_MUTEX = 1, K_COND, K_EVENT, K_SEMA, K_QUEUE, K_RWLOCK, K_MULTIWAIT, K_HOLDER, K_TIMER };
 
 typedef struct Obj {
@@ -676,6 +678,7 @@ HLE(_ZN2nn2os21WaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTyp
     while (cv->gen == gen) hos_cv_sleep(&cv->cv, &cv->lk, INFINITE);
     const int owed = cv_leave(cv, m);
     ReleaseSRWLockExclusive(&cv->lk);
+    inj_after_wait();
     if (w) watch_log(owed ? "cv woken, owed the mutex" : "cv woken", ARG(1), ARG(0), c, m);
     mutex_lock_owed(m, ARG(1), owed);
     m->count = count;
@@ -739,6 +742,53 @@ static void wake_lat_note(int how, int64_t lat_ns) {   /* how: 0 ready, 1 spun, 
     ReleaseSRWLockExclusive(&lk);
 }
 
+/* HOS_DELAY=<thread name prefix>:<us>[,...] (diagnostic, the frame's slack map): a thread whose name starts with a prefix
+   spins that long each time a blocking wait returns (events, message queues, condition variables, semaphores), as if its
+   next piece of work were that much longer. The frame time's slope against the delay a frame says whether that kind of
+   thread is on the frame's critical path. Every 5 s: the wakes a second each prefix had (us 0 = count only). */
+static struct { char pre[40]; int64_t ns; volatile long long wakes; } inj_tab[8];
+static int inj_n = -1;
+static void inj_after_wait(void) {
+    if (inj_n == 0) return;
+    if (inj_n < 0) {
+        int n = 0;
+        const char *e = getenv("HOS_DELAY");
+        while (e && *e && n < 8) {
+            const char *colon = strchr(e, ':'), *comma = strchr(e, ',');
+            if (!colon || (comma && comma < colon) || colon - e >= 40) break;
+            memcpy(inj_tab[n].pre, e, (size_t)(colon - e));
+            inj_tab[n].pre[colon - e] = 0;
+            inj_tab[n].ns = atoll(colon + 1) * 1000;
+            n++;
+            e = comma ? comma + 1 : NULL;
+        }
+        inj_n = n;
+        if (!n) return;
+    }
+    static __thread int slot = -2;
+    if (slot == -2) {
+        HosThread *self = hos_self();
+        const char *name = self ? hos_thread_name(self) : NULL;
+        slot = -1;
+        for (int i = 0; name && i < inj_n; i++)
+            if (!strncmp(name, inj_tab[i].pre, strlen(inj_tab[i].pre))) { slot = i; break; }
+    }
+    if (slot < 0) return;
+    __atomic_add_fetch(&inj_tab[slot].wakes, 1, __ATOMIC_RELAXED);
+    if (inj_tab[slot].ns > 0) {
+        const int64_t end = hos_now_ns() + inj_tab[slot].ns;
+        while (hos_now_ns() < end) YieldProcessor();
+    }
+    static volatile long long last;
+    const int64_t now = hos_now_ns(), l = __atomic_load_n(&last, __ATOMIC_RELAXED);
+    if (now - l > 5000000000LL && __atomic_compare_exchange_n(&last, (long long *)&l, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        const double s = l ? (now - l) / 1e9 : 5.0;
+        for (int i = 0; i < inj_n; i++)
+            hos_log("delay: %s %.0f us a wake, %.0f wakes a second", inj_tab[i].pre, inj_tab[i].ns / 1e3,
+                    __atomic_exchange_n(&inj_tab[i].wakes, 0, __ATOMIC_RELAXED) / s);
+    }
+}
+
 static int event_wait(Obj *e, int64_t timeout_ns, int try_only) {
     int64_t deadline = timeout_ns > 0 ? hos_now_ns() + timeout_ns : 0;
     const int was_set = e->signaled > 0;
@@ -755,6 +805,7 @@ static int event_wait(Obj *e, int64_t timeout_ns, int try_only) {
     if (got && !try_only && wake_lat_on()) wake_lat_note(slept ? 2 : spun ? 1 : 0, slept ? hos_now_ns() - e->sig_ns : 0);
     if (got && e->autoclear) e->signaled = 0;
     ReleaseSRWLockExclusive(&e->lk);
+    if (got && !try_only) inj_after_wait();
     return got;
 }
 
@@ -1002,6 +1053,7 @@ static void sema_acquire(Obj *s) {
     while (s->sem <= 0) hos_cv_sleep(&s->cv, &s->lk, INFINITE);
     s->sem--;
     ReleaseSRWLockExclusive(&s->lk);
+    inj_after_wait();
 }
 static void sema_release(Obj *s, int n) {
     AcquireSRWLockExclusive(&s->lk);
@@ -1082,6 +1134,7 @@ static int queue_get(Obj *q, uint64_t *out, int take, int64_t timeout_ns) {
         WakeAllConditionVariable(&q->cv);
         poke_multiwait(q);
     }
+    if (timeout_ns != 0) inj_after_wait();
     return 1;
 }
 
@@ -1361,6 +1414,7 @@ HLE(_ZN2nn2os26TimedWaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9Mut
     }
     const int owed = cv_leave(cv, m);
     ReleaseSRWLockExclusive(&cv->lk);
+    inj_after_wait();
     mutex_lock_owed(m, ARG(1), owed);
     m->count = count;
     RET(signaled);

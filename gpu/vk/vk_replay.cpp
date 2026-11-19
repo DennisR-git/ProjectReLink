@@ -1985,6 +1985,14 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
     state.occ_limit = occ_room(state) ? state.occ_next + kOccBuffer : 0;
     const uint64_t frame = texture_frame_no();
     if (frame != par_hist.frame) {
+        // (relink, diagnostic, the frame's slack map) RX_VK_REPLAY_DELAY_US=<us>: the replaying thread spins that long at
+        // a frame's first command buffer, as if the replay were that much longer: the frame time's slope says whether
+        // the replay is on the frame's critical path
+        static const int64_t replay_delay_ns = getenv("RX_VK_REPLAY_DELAY_US") ? atoll(getenv("RX_VK_REPLAY_DELAY_US")) * 1000 : 0;
+        if (replay_delay_ns > 0) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(replay_delay_ns);
+            while (std::chrono::steady_clock::now() < until) __builtin_ia32_pause();
+        }
         // (relink, 12/11, diagnostic, RX_VK_LOG_CBS=1: every 600 frames, the frame before's command buffers in stream order,
         // by their draws and dispatches; p: big enough for the threads)
         static const bool log_cbs = getenv("RX_VK_LOG_CBS") != nullptr;

@@ -900,7 +900,10 @@ HLE(_ZN2nn2os19GetCurrentStackInfoEPmS1_) {
 
 HLE(_ZN2nn2os11YieldThreadEv) {
     hos_vcore_yield();
-    SwitchToThread();
+    /* HOS_YIELD_KEEP_CPU=1 (experiment): the yield gives up the virtual core only, not the processor */
+    static int keep = -1;
+    if (keep < 0) keep = getenv("HOS_YIELD_KEEP_CPU") != NULL;
+    if (!keep) SwitchToThread();
 }
 /* HOS_SLEEP_LOG=1 (diagnostic): guest sleeps by caller (LR) every 5 s: count, asked, slept */
 void hos_sleep_logged(int64_t ns, uint64_t lr) {
