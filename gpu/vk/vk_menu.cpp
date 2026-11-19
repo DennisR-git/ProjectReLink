@@ -1602,7 +1602,11 @@ void picture_worker() {
                 count = (int)teleport_captures.size();
             }
             logf("menu: Travel picture of %s (%s) taken (%d in memory)%s", place.label, place.key, count, saved ? "" : "; not saved");
-            if (saved) {   // (the line over the game for 2.5 s)
+            // (0.7.9.3, a suggestion on the Discord, 19/11: "being able to turn off the popups as I travel around would be
+            // great. They're pretty annoying") The picture is taken and kept as before; the line over the game is no longer
+            // shown unless asked for: RX_VK_TRAVEL_NOTICE=1. The log has the line above either way
+            static const bool notice = getenv("RX_VK_TRAVEL_NOTICE") && atoi(getenv("RX_VK_TRAVEL_NOTICE")) != 0;
+            if (saved && notice) {   // (the line over the game for 2.5 s)
                 snprintf(notice_text, sizeof notice_text, "Travel picture saved: %s", place.label);
                 notice_new.store(true, std::memory_order_release);
                 notice_until.store(prof_now() + 2500000000LL, std::memory_order_relaxed);
