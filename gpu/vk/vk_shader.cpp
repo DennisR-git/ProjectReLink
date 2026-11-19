@@ -2564,7 +2564,13 @@ std::unique_ptr<Program> seed_translate(const SeedStage* const by_stage[8], cons
     p->key = key;
     p->compute = by_stage[5] != nullptr;
     p->mesh = by_stage[7] != nullptr;
-    if (p->mesh && dev.task_mesh_fallback && by_stage[6]) p->fallback = true, p->mesh = false;   // (task-only GPUs: as play makes it)
+    // (as play makes it, mesh_program_locked: on a GPU that runs these stages as compute shaders the program is a fallback one.
+    // 0.7.9.3: on every such GPU. Only the task-only ones were taken here, so with no mesh shaders at all (RX 6000 by
+    // default, GTX 10) the preparation kept each mesh program in its native form, which play then left aside ("another
+    // GPU's") and translated again at its first draw: 60 of the 63 programs translated in play in a two-area run with the
+    // fallback forced, 19/11. And the predictions built pipelines of those native programs on a device without the
+    // feature: the driver faulted in each (vk_draw.cpp fault_retry_on))
+    if (p->mesh && dev.uses_mesh_fallback(by_stage[6] != nullptr)) p->fallback = true, p->mesh = false;
     if (by_stage[7])
         translate_mesh_into(*p, *blank, by_stage[6] ? &code[6] : nullptr, code[7], nullptr, by_stage[1] ? &code[1] : nullptr, color_types);
     else if (p->compute) {

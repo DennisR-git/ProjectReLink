@@ -984,13 +984,17 @@ bool depth_aspect(VkFormat f) {
 }
 
 // (relink) A driver's compiler that faults on a shader (amdvlk64.dll on a mesh program) costs that one draw, not the game
+std::atomic<int64_t> st_driver_faults{0};   // (builds the driver faulted in, this run)
 #ifdef _WIN32
-__declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
+__declspec(noinline) VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl, uint64_t key) {
     __try {
         return vkCreateGraphicsPipelines(dev.device, cache, 1, ci, nullptr, pl);
     } __except (1) {
         *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
-        logf("vk: the driver faulted compiling a graphics pipeline (exception %#lx): that one is left out", (unsigned long)GetExceptionCode());
+        st_driver_faults++;
+        logf("vk: the driver faulted compiling a graphics pipeline of program %016llx (exception %#lx, %u stages%s): that one is "
+             "left out", (unsigned long long)key, (unsigned long)GetExceptionCode(), (unsigned)ci->stageCount,
+             (ci->flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) ? ", without its optimizer" : "");
         return (VkResult)-77;   // (a fault, told apart from the driver's own VK_ERROR_UNKNOWN: fault_gate_end keeps the program out)
     }
 }
@@ -998,6 +1002,7 @@ __declspec(noinline) VkResult guarded_compute_once(VkPipelineCache cache, const 
     __try {
         return vkCreateComputePipelines(dev.device, cache, 1, ci, nullptr, pl);
     } __except (1) {
+        st_driver_faults++;
         return (VkResult)-77;   // (a fault in the driver, told apart from what it returns)
     }
 }
@@ -1039,11 +1044,12 @@ static void install_driver_fault_guard() {
     });
 }
 
-VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
+VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl, uint64_t key) {
     install_driver_fault_guard();
     if (sigsetjmp(fault_jmp, 1) != 0) {
         *pl = VK_NULL_HANDLE;
-        logf("vk: the driver faulted compiling a graphics pipeline: that one is left out");
+        st_driver_faults++;
+        logf("vk: the driver faulted compiling a graphics pipeline of program %016llx: that one is left out", (unsigned long long)key);
         return (VkResult)-77;
     }
     fault_armed = 1;
@@ -1054,6 +1060,7 @@ VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateI
 VkResult guarded_compute_once(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     install_driver_fault_guard();
     if (sigsetjmp(fault_jmp, 1) != 0) {
+        st_driver_faults++;
         logf("vk: the driver faulted compiling a compute pipeline: that one is left out");
         return (VkResult)-77;
     }
@@ -1138,14 +1145,31 @@ void compute_cache_save(bool force) {
     logf("vk: compute pipeline cache written: %zu KB, %lld pipelines made through it since the last time (%.0f ms)", n >> 10,
          (long long)built, std::chrono::duration<double, std::milli>(last - t0).count());
 }
-/// (relink) A compute pipeline the driver's compiler fails on (AMD's crashes, -13, or faults, -77, on some programs) is built
-/// again without its optimizer, as a graphics one is (build_graphics): run a little slower rather than left out
+// (relink, 0.7.9.3) A build the driver faulted in is not sent to it again. The fault is caught on our thread in the middle of
+// the driver's compile, and what the driver had taken for it (its own locks, its job's state) stays as it was: the second
+// build of the same program, the one without the optimizer, then waited inside the driver for good. Seen on 19/11 on the
+// RTX 3060 Ti with the mesh fallback forced: the shader preparation stopped at 70 % twice, its eleven workers each having
+// logged one fault and each asleep on a condition variable inside nvoglv64.dll under the retry's vkCreateGraphicsPipelines
+// (a dump of the hung process); AMD's driver was already known to keep a faulted program's later builds waiting (the fault
+// gate below). An error the driver returns (-13 on AMD) is another matter and is still retried. RX_VK_FAULT_RETRY=1: a fault
+// is retried too, as before
+bool fault_retry_on() {
+    static const bool on = getenv("RX_VK_FAULT_RETRY") && atoi(getenv("RX_VK_FAULT_RETRY")) != 0;
+    return on;
+}
+/// (relink) A compute pipeline the driver's compiler fails on (AMD's, -13, on some programs) is built again without its
+/// optimizer, as a graphics one is (build_graphics): run a little slower rather than left out. Not one it faulted in (-77)
 VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     if (!cache && (cache = compute_cache()) != VK_NULL_HANDLE) ccache_built++;   // (a lean start: the compute pipelines' own cache)
     const VkResult r = guarded_compute_once(cache, ci, pl);
     if (r == VK_SUCCESS || r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
         (ci->flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT))
         return r;
+    if ((int)r == -77 && !fault_retry_on()) {
+        static std::atomic<int> told{0};
+        if (told++ < 20) logf("vk: the driver faulted compiling a compute pipeline: that one is left out, and not built again without the optimizer");
+        return r;
+    }
     VkComputePipelineCreateInfo again = *ci;
     again.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     *pl = VK_NULL_HANDLE;
@@ -1164,6 +1188,7 @@ VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInf
 // keys are written to relink_driver_faults.txt beside the exe, per vendor and driver version, so later runs skip them from the
 // start. RX_VK_DRIVER_FAULTS=0: off; 1 (default): as above, the gate on AMD only; 2: the gate on every driver
 constexpr VkResult kDriverFault = (VkResult)-77;
+thread_local bool driver_cache_only = false;   // (predict_run's: pipelines for the driver's own cache, not into ours)
 struct FaultGate {
     std::mutex mu;
     std::condition_variable cv;
@@ -1232,12 +1257,16 @@ void fault_gate_end(uint64_t key, bool faulted) {
     g.cv.notify_all();
     if (!fresh) return;
     logf("vk: program %016llx is kept out of the driver for the rest of the run", (unsigned long long)key);
+    // (relink, 0.7.9.3) Not for later runs when the build was a prediction's (predict_run): its state is a guess put together
+    // from other programs' draws, not one the game drew this program with, and a fault on a guess says nothing of the
+    // program's real pipelines. Kept out for this run only, as the driver may still hold that build
+    if (driver_cache_only) return;
     // (relink, 0.7.9.3) For later runs only once the fault is seen to be this program's. Whatever stops the device with
-    // builds under way (a lost device, a driver reset, the PC going to sleep, the process being ended) faults every build
-    // in flight at once. Seen on 19/11: a shader preparation that was cut logged eleven such faults in the same instant, one
-    // a worker, as its last lines (what cut it is not known). Had their retries faulted too, eleven sound programs would have
-    // been written to the file and never drawn again on that driver version. So the line is written kSettleMs later, and
-    // not at all when the device was lost by then or three programs or more faulted within that time of each other
+    // builds under way (a lost device, a driver reset, the PC going to sleep) may fault every build in flight at once, and
+    // sound programs would be written to the file and never drawn again on that driver version. So the line is written
+    // kSettleMs later, and not at all when the device was lost by then or three programs or more faulted within that time
+    // of each other. A precaution, not something seen: the eleven faults of 19/11 it was first written for turned out to
+    // be eleven predictions' builds of a preparation with the mesh fallback forced (fault_retry_on), not a stopped device
     static std::mutex recent_mu;
     static std::vector<std::chrono::steady_clock::time_point> recent;
     static constexpr int kSettleMs = 5000;
@@ -1280,7 +1309,6 @@ void fault_file_add(uint64_t key) {
 }
 
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part = -1);
-thread_local bool driver_cache_only = false;   // (predict_run's: pipelines for the driver's own cache, not into ours)
 
 /// A target's write mask: the state's channel mask, nothing for a target the fragment shader leaves unwritten
 /// (Maxwell keeps its texels; Vulkan writes undefined values: TOTK's maxwell.md 1.1)
@@ -1952,6 +1980,17 @@ static bool amd_own_driver() {
 }
 
 VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at, VkPrimitiveTopology topo, int part) {
+    // (relink, 0.7.9.3) Task and mesh stages never go to a device made without mesh shaders: NVIDIA's compiler faulted in
+    // every such pipeline (23 and more in one preparation with the fallback forced, 19/11, the predictions' of programs
+    // the preparation had kept in their native form). No draw asks for one (a GPU without the feature draws the
+    // fallback's programs): this is for whatever else walks the kept programs
+    if (p.mesh && !dev.mesh_shader) {
+        static std::atomic<int> told{0};
+        if (told++ < 4)
+            logf("vk: a pipeline of the mesh program %016llx is not made: this device has no mesh shaders (its fallback program "
+                 "is the one drawn)", (unsigned long long)p.key);
+        return VK_NULL_HANDLE;
+    }
     const Shader::Info& vs = *vertex_info(p);
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<VkPipelineShaderStageCreateInfo> stages;
@@ -2164,18 +2203,32 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     const int gate = fault_gate_begin(p.key, !driver_cache_only);   // (a warm-up build never waits behind another build)
     if (gate == kGateBusy) return VK_NULL_HANDLE;
     if (gate == kGateGo) {
-        r = guarded_graphics(part >= 0 || driver_cache_only ? VK_NULL_HANDLE : pcache, &ci, &pl);
+        r = guarded_graphics(part >= 0 || driver_cache_only ? VK_NULL_HANDLE : pcache, &ci, &pl, p.key);
+        if (r == kDriverFault) {   // (what was handed to the driver, for whoever reads the log)
+            static std::atomic<int> told{0};
+            if (told++ < 24) {
+                uint32_t bits = 0;
+                for (const VkPipelineShaderStageCreateInfo& si : stages) bits |= (uint32_t)si.stage;
+                logf("vk: the faulted build: program %016llx variant %016llx%s%s%s, stages %#x, topology %d, %d targets (%d %d %d %d) "
+                     "x%d, depth %d, %zu vertex attributes in %zu streams, library part %d", (unsigned long long)p.key,
+                     (unsigned long long)p.variant, p.mesh ? " mesh" : "", p.fallback ? " mesh fallback" : "",
+                     driver_cache_only ? " (a prediction)" : "", bits, (int)topo, at.n, (int)at.color_format[0], (int)at.color_format[1],
+                     (int)at.color_format[2], (int)at.color_format[3], (int)at.samples, at.depth ? (int)at.depth_format : 0, va.size(),
+                     vb.size(), part);
+            }
+        }
         // (relink, the Market's and Kakariko's dogs white on an RX 6600 in 0.7.9.1: "graphics pipeline for 4e5ce183a33b0855 not
-        // made (-13)") A driver whose compiler fails or faults on a program (AMD's proprietary one on some Ocarina shaders, the
-        // dogs' among them; 5fa56485a6b07619 and 6eaa646d07ea4e43 on an RX 6600 XT since 0.7.8) builds it again without its
+        // made (-13)") A driver whose compiler fails on a program (AMD's proprietary one on some Ocarina shaders, the dogs'
+        // among them; 5fa56485a6b07619 and 6eaa646d07ea4e43 on an RX 6600 XT since 0.7.8) builds it again without its
         // optimizer, which it does: the draws are then drawn, a little slower, instead of left out. Not for the memory errors,
-        // which the optimizer does not cause. Only a program that faults without the optimizer too is kept out of the driver
+        // which the optimizer does not cause, nor for a fault (fault_retry_on: the second build waited in the driver for
+        // good): a program the driver faulted in is kept out of it
         if (r != VK_SUCCESS && r != VK_ERROR_OUT_OF_HOST_MEMORY && r != VK_ERROR_OUT_OF_DEVICE_MEMORY &&
-            !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
+            (r != kDriverFault || fault_retry_on()) && !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
             const VkResult first = r;
             ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
             pl = VK_NULL_HANDLE;
-            r = guarded_graphics(part >= 0 || driver_cache_only ? VK_NULL_HANDLE : pcache, &ci, &pl);
+            r = guarded_graphics(part >= 0 || driver_cache_only ? VK_NULL_HANDLE : pcache, &ci, &pl, p.key);
             static std::atomic<int> told{0};
             if (told++ < 20)
                 logf("vk: %s %016llx failed (%d) with the driver's optimizer: %s", part >= 0 ? "a library of" : "graphics pipeline for",
@@ -8840,73 +8893,108 @@ void precompile_run(void (*progress)(size_t done, size_t total)) {
 // it 1.7 GB), nor kept: each program is borrowed from relink_programs.bin for its pipelines and let go
 void predict_run(void (*progress)(size_t done, size_t total)) {
     const auto t0 = std::chrono::steady_clock::now();
-    const std::vector<std::unique_ptr<PipeNote>> notes = pipe_notes_read();
-    if (notes.empty() || getenv("RX_VK_NO_PREDICT")) return;
+    std::vector<std::unique_ptr<PipeNote>> notes_read = pipe_notes_read();
+    if (notes_read.empty() || getenv("RX_VK_NO_PREDICT")) return;
     size_t programs = 0;
     size_t too_big = 0;
-    const std::vector<std::unique_ptr<PipeNote>> predicted = predict_pipelines(notes, &programs, &too_big);
     // (relink) The driver's compiles take their memory from the system's commit, and a refused allocation hurts the game and every
     // other program: stop predicting (the rest is built in play) when less than RX_VK_PREDICT_RESERVE_MB (3072; 0: no check) is left
     static const unsigned long long reserve_mb =
         getenv("RX_VK_PREDICT_RESERVE_MB") ? strtoull(getenv("RX_VK_PREDICT_RESERVE_MB"), nullptr, 10) : 3072;
-    std::atomic<bool> low_commit{false};
-    const auto commit_short = [&] {
+    const auto commit_short = [] {
         if (!reserve_mb) return false;
         MEMORYSTATUSEX ms{};
         ms.dwLength = sizeof ms;
         if (!GlobalMemoryStatusEx(&ms)) return false;
         return (unsigned long long)(ms.ullAvailPageFile >> 20) < reserve_mb;
     };
-    std::unordered_map<uint64_t, std::vector<const PipeNote*>> by_program;
-    for (const auto& n : predicted) by_program[n->prog].push_back(n.get());
-    std::vector<uint64_t> keys;
-    for (const auto& kv : by_program) keys.push_back(kv.first);
-    std::atomic<size_t> next{0}, done{0}, made{0};
+    // (relink, 0.7.9.3) What the workers share lives on the heap, theirs as much as this function's: a worker the driver never
+    // gives back (below) is left behind, and must find its lists still there should the driver ever answer
+    struct Shared {
+        std::vector<std::unique_ptr<PipeNote>> notes, predicted;
+        std::unordered_map<uint64_t, std::vector<const PipeNote*>> by_program;
+        std::vector<uint64_t> keys;
+        std::atomic<size_t> next{0}, done{0}, made{0}, tried{0}, ended{0};
+        std::atomic<bool> out_of_time{false}, low_commit{false}, left{false};
+    };
+    const auto sh = std::make_shared<Shared>();
+    sh->notes = std::move(notes_read);
+    const std::vector<std::unique_ptr<PipeNote>>& notes = sh->notes;
+    sh->predicted = predict_pipelines(notes, &programs, &too_big);
+    for (const auto& n : sh->predicted) sh->by_program[n->prog].push_back(n.get());
+    for (const auto& kv : sh->by_program) sh->keys.push_back(kv.first);
+    const size_t predicted_n = sh->predicted.size();
     // (relink) A time budget, RX_VK_PREDICT_S (90 s by default; 0: none): once #1051 let the prediction find its programs again it
     // predicted ~28000 pipelines, and a first start after an update spent many minutes on them before the game's first frame (20 with
     // the CPU busy). Those not built by then are built in play when first drawn, as before the prediction worked
     static const int budget_s = getenv("RX_VK_PREDICT_S") ? atoi(getenv("RX_VK_PREDICT_S")) : 90;
-    std::atomic<bool> out_of_time{false};
-    const auto worker = [&] {
+    const auto worker = [sh, t0, commit_short] {
         ub_thread_off();   // (a background thread: see ub_thread_off)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // (as prepare_run's)
         driver_cache_only = true;
         for (;;) {
-            if (prepare_stopped()) return;
+            if (prepare_stopped() || sh->left.load()) break;
             if (budget_s > 0 && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(budget_s)) {
-                out_of_time = true;
-                return;
+                sh->out_of_time = true;
+                break;
             }
-            if (low_commit.load() || commit_short()) {
-                low_commit = true;
-                return;
+            if (sh->low_commit.load() || commit_short()) {
+                sh->low_commit = true;
+                break;
             }
-            const size_t i = next++;
-            if (i >= keys.size()) return;
-            const auto& list = by_program[keys[i]];
-            program_cache_borrow(keys[i], [&](Program& p) {
+            const size_t i = sh->next++;
+            if (i >= sh->keys.size()) break;
+            const auto& list = sh->by_program[sh->keys[i]];
+            program_cache_borrow(sh->keys[i], [&](Program& p) {
                 ensure_layout(p);
-                for (const PipeNote* n : list)
+                for (const PipeNote* n : list) {
+                    if (sh->left.load()) return;
                     if (n->variant == p.variant)
                         if (const VkPipeline pl = build_graphics(p, n->s, note_targets(*n), (VkPrimitiveTopology)n->topo))
-                            vkDestroyPipeline(dev.device, pl, nullptr), made++;
+                            vkDestroyPipeline(dev.device, pl, nullptr), sh->made++;
+                    sh->tried++;
+                }
             });
-            done += list.size();
+            sh->done += list.size();
         }
+        sh->ended++;
     };
     std::vector<std::thread> threads;
-    const unsigned cpus = std::max(1u, std::thread::hardware_concurrency());
     for (unsigned i = 0; i < prepare_threads(); i++) threads.emplace_back(worker);
-    while (next.load() < keys.size() + threads.size() && !prepare_stopped() && !out_of_time.load() && !low_commit.load()) {
-        if (progress) progress(done.load(), predicted.size());
+    // (relink, 0.7.9.3) No pipeline tried for RX_VK_PREDICT_STALL_S (60 s; 0: wait whatever it takes) with workers still
+    // out: they are inside the driver and it is not answering (on 19/11 a preparation with the mesh fallback forced sat at
+    // 70 % until it was ended by hand, every worker asleep in the driver after a fault). The predictions are for the driver's
+    // cache only, nothing of ours waits on them: the workers are left where they are and the preparation goes on to its end
+    // Only once the driver has faulted in a build of this run: a long compile alone is waited for, as before
+    static const int stall_s = getenv("RX_VK_PREDICT_STALL_S") ? atoi(getenv("RX_VK_PREDICT_STALL_S")) : 60;
+    const int64_t faults_before = st_driver_faults.load();
+    size_t last_tried = 0;
+    auto last_change = std::chrono::steady_clock::now();
+    bool stalled = false;
+    while (sh->ended.load() < threads.size()) {
+        if (progress) progress(sh->done.load(), predicted_n);
         Sleep(100);
+        const auto now = std::chrono::steady_clock::now();
+        if (const size_t n = sh->tried.load() + sh->ended.load(); n != last_tried) last_tried = n, last_change = now;
+        else if (stall_s > 0 && st_driver_faults.load() > faults_before && now - last_change > std::chrono::seconds(stall_s)) {
+            stalled = true;
+            sh->left = true;
+            break;
+        }
     }
-    for (std::thread& t : threads) t.join();
+    if (stalled) {
+        for (std::thread& t : threads) t.detach();
+        logf("vk: predictions: no pipeline came back from the driver for %d s (%zu of %zu workers still in it, %lld builds it "
+             "faulted in this run): they are left there and the preparation goes on; the rest are built in play "
+             "(RX_VK_PREDICT_STALL_S)", stall_s, threads.size() - sh->ended.load(), threads.size(), (long long)st_driver_faults.load());
+    } else {
+        for (std::thread& t : threads) t.join();
+    }
     logf("vk: predicted %zu pipelines from %zu notes for %zu program variants no note names: %zu made in %.1f s%s%s; %zu giant "
-         "programs left to play (RX_VK_PREDICT_MAX_KWORDS)", predicted.size(),
-         notes.size(), programs, made.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-         out_of_time.load() ? " (the time budget, RX_VK_PREDICT_S, ran out: the rest are built in play)" : "",
-         low_commit.load() ? " (little commit left, RX_VK_PREDICT_RESERVE_MB: the rest are built in play)" : "", too_big);
+         "programs left to play (RX_VK_PREDICT_MAX_KWORDS)", predicted_n,
+         notes.size(), programs, sh->made.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+         sh->out_of_time.load() ? " (the time budget, RX_VK_PREDICT_S, ran out: the rest are built in play)" : "",
+         sh->low_commit.load() ? " (little commit left, RX_VK_PREDICT_RESERVE_MB: the rest are built in play)" : "", too_big);
 }
 
 // (relink) Compute pipelines made ahead. A dispatch's compute pipeline was made where the dispatch was, the first time: 0.5-6 s each
