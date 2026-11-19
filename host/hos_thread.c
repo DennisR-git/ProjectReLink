@@ -730,11 +730,30 @@ int64_t hos_now_ns(void) {
 }
 
 static void sleep_ns(int64_t ns);
+/* (relink) HOS_YIELD_MODE (experiment): what a guest thread's spin-wait does to let others run. 0: SwitchToThread, which
+   hands the processor to ANY ready thread on it, of a lower priority too (another app's, a background service's) for the
+   rest of a time slice; 1: Sleep(0), which yields only to threads of the same or a higher priority (the game's own: the
+   process runs above normal), 2: a pause only. Returns nonzero when another thread ran. */
+static int yield_mode(void) {
+    static int m = -1;
+    if (m < 0) {
+        const char *e = getenv("HOS_YIELD_MODE");
+        m = e ? atoi(e) : 0;
+    }
+    return m;
+}
+static int yield_cpu(void) {
+    switch (yield_mode()) {
+    case 1: Sleep(0); return 0;
+    case 2: YieldProcessor(); return 0;
+    default: return SwitchToThread() != 0;
+    }
+}
 /* (virtual cores: a sleep gives the core up, SleepThread(0) offers it to a waiter as good) */
 void hos_sleep_ns(int64_t ns) {
     if (ns <= 0) {
         hos_vcore_yield();
-        SwitchToThread();
+        yield_cpu();
         return;
     }
     const int away = hos_vcore_away();
@@ -795,7 +814,7 @@ static void sleep_ns(int64_t ns) {
     if (ns < 1000000 && !short_timer) {
         const int sp = __atomic_load_n(&short_sleep_pause, __ATOMIC_RELAXED);
         if (sp > 0) {
-            SwitchToThread();
+            yield_cpu();
             while (hos_now_ns() < until) {
                 for (int i = 0; i < sp; i++) YieldProcessor();
             }
@@ -809,7 +828,7 @@ static void sleep_ns(int64_t ns) {
         }
 #endif
         while (hos_now_ns() < until)
-            if (!SwitchToThread()) {
+            if (!yield_cpu()) {
                 YieldProcessor();
                 for (int i = 1; i < pauses; i++) YieldProcessor();
             }
@@ -828,7 +847,7 @@ static void sleep_ns(int64_t ns) {
         }
     }
     if (ns > 2000000) Sleep((DWORD)((ns - 1000000) / 1000000));
-    while (hos_now_ns() < until) SwitchToThread();
+    while (hos_now_ns() < until) yield_cpu();
 }
 
 /* ---- nn::os threads -------------------------------------------------------------------------------------- */
@@ -903,7 +922,7 @@ HLE(_ZN2nn2os11YieldThreadEv) {
     /* HOS_YIELD_KEEP_CPU=1 (experiment): the yield gives up the virtual core only, not the processor */
     static int keep = -1;
     if (keep < 0) keep = getenv("HOS_YIELD_KEEP_CPU") != NULL;
-    if (!keep) SwitchToThread();
+    if (!keep) yield_cpu();
 }
 /* HOS_SLEEP_LOG=1 (diagnostic): guest sleeps by caller (LR) every 5 s: count, asked, slept */
 void hos_sleep_logged(int64_t ns, uint64_t lr) {
@@ -975,7 +994,7 @@ static int present_poll(Ctx *c, int64_t ns) {
     const int away = hos_vcore_away();
     const int64_t end = hos_now_ns() + ns;
     while (v != 1 && hos_now_ns() < end) {
-        SwitchToThread();
+        yield_cpu();
         for (int i = 0; i < 64; i++) _mm_pause();
         hos_nvn_event_value(ev, &v);
     }
