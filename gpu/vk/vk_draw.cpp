@@ -1090,6 +1090,11 @@ void compute_cache_save(bool force) {
     const auto t0 = now;
     size_t n = 0;
     if (vkGetPipelineCacheData(dev.device, ccache, &n, nullptr) != VK_SUCCESS || !n) return;
+    static size_t in_file = ccache_loaded;   // (what the file holds: pipelines made from the cache add nothing to it)
+    if (n == in_file) {
+        ccache_built -= built;
+        return;
+    }
     std::vector<uint8_t> data(n);
     if (vkGetPipelineCacheData(dev.device, ccache, &n, data.data()) != VK_SUCCESS) return;
     const std::string path = compute_cache_path(), tmp = path + ".tmp";
@@ -1102,6 +1107,7 @@ void compute_cache_save(bool force) {
         return;
     }
     ccache_built -= built;
+    in_file = n;
     last = std::chrono::steady_clock::now();
     logf("vk: compute pipeline cache written: %zu KB, %lld pipelines made through it since the last time (%.0f ms)", n >> 10,
          (long long)built, std::chrono::duration<double, std::milli>(last - t0).count());
