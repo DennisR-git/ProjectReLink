@@ -1346,6 +1346,10 @@ void state_record(const Program& p, const NvnState& s, const Targets& at, VkPrim
     for (int i = 0; i < 8; i++) std::memcpy(&r.blend[i], &s.blend[i], 8);
     r.blend_en = (uint32_t)s.color.blend_en, r.chmask = s.chmask.mask, r.poly_mode = (uint32_t)s.poly.mode;
     r.depth_clamp = s.depth_clamp ? 1 : 0, r.a2c = s.ms.a2c ? 1 : 0;
+    // (relink, issue 79) which stage list the answers below count in: bit 1 = this field is written (records of 0.7.9.2 and before
+    // have 0: not known), bit 0 = the compute fallback's (a vertex stage before the fragment). state_list_prepare makes a record's
+    // variant only in the mode that noted it
+    r.pad = 2u | (p.fallback ? 1u : 0u);
     if (p.answers.size() <= 24 && p.questions.size() <= 32) {
         r.nanswers = (uint32_t)p.answers.size(), r.nquestions = (uint32_t)p.questions.size();
         for (size_t i = 0; i < p.answers.size(); i++) {
@@ -1445,11 +1449,18 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
     program_cache_load_some(keys, [](Program& p) { ensure_layout(p); }, false);
     // the variants made by other textures (the seed's are for nothing bound): translated with the answers the game's gave
     std::vector<size_t> variant_of;   // (a record of each variant the cache lacks)
+    size_t other_mode = 0;
     {
         std::unordered_set<uint64_t> seen;
         for (size_t i = 0; i < recs.size(); i++) {
             const StateRec& r = recs[i];
             const uint64_t key = want[rec_program[i]].key;
+            // (a mesh record noted in the other mesh mode: its answers count another stage list; older records, whose mode is not
+            // written, are tried and kept only when their answers fit the program: seed_variant_of)
+            if (r.mesh && (r.pad & 2) && ((r.pad & 1) != 0) != dev.uses_mesh_fallback(r.code[2] != 0)) {
+                other_mode++;
+                continue;
+            }
             if (key && (r.nanswers || r.nquestions) && !program_find(key, r.variant) && seen.insert(mix(key, r.variant)).second)
                 variant_of.push_back(i);
         }
@@ -1505,6 +1516,7 @@ void state_list_prepare(void (*progress)(size_t done, size_t total)) {
          "by their textures (%zu made), %zu noted, %zu whose program variant was not made, in %.1f s", recs.size(), shipped,
          want.size(), made.load(), missing.load(), variant_of.size(), variants_made.load(), noted_n, no_variant,
          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (other_mode) logf("vk: state list: %zu records noted in the other mesh mode (native or compute fallback) are left to play", other_mode);
 }
 
 // ---- (relink) Stage libraries, as TotK Recomp's runtime/vk_pipeline.c: the part of a pipeline that costs is its shaders, and with

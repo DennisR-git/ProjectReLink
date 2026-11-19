@@ -797,9 +797,23 @@ uint8_t texture_answer(uint32_t handle) {
 // packing the bits itself; a variant translated while that slot held a float texture wrote the packed words as
 // floats, which the R32UI view converted: the scene went NaN and yellow before the TAAU
 uint32_t answer_handle(const NvnState& s, const Program& p, const Program::Answer& a) {
+    if (a.stage >= p.stages.size()) return 0;   // (answers_fit keeps such a program out; this is the last guard: read as unbound)
     const Stage& st = p.stages[a.stage];
+    if (a.desc >= (a.image ? st.info.image_descriptors.size() : st.info.texture_descriptors.size())) return 0;
     return a.image ? descriptor_handle(s, st, st.info.image_descriptors[a.desc])
                    : descriptor_handle(s, st, st.info.texture_descriptors[a.desc]);
+}
+/// (relink, issue 79) Whether each of a program's texture answers names a stage and a descriptor the program has. An answer keeps
+/// its stage by index, and the compute fallback of a mesh program has one stage more than the mesh program (the vertex stage made
+/// for it, before the fragment), so answers noted in one mode do not fit the same program in the other: a state list or a program
+/// cache written with the fallback, then read without it, crashed the game at the first draw (read past the stages)
+bool answers_fit(const Program& p) {
+    for (const Program::Answer& a : p.answers) {
+        if (a.stage >= p.stages.size()) return false;
+        const Shader::Info& info = p.stages[a.stage].info;
+        if (a.desc >= (a.image ? info.image_descriptors.size() : info.texture_descriptors.size())) return false;
+    }
+    return true;
 }
 uint8_t answer_of(uint32_t handle, bool image) {
     return image ? (uint8_t)(handle ? texture_answer(handle) & 0x80 : 0xFF) : texture_answer(handle);
@@ -1444,6 +1458,13 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
             }
             st.module = make_module(spirv);
             ok = ok && st.module;
+        }
+        if (ok && !answers_fit(*p)) {   // (kept by a version that took another mode's answers: see answers_fit)
+            ok = false;
+            static std::atomic<int> told{0};
+            if (told++ < 5)
+                logf("vk: program cache: a kept variant of program %016llx has texture answers for stages it does not have "
+                     "(noted in the other mesh mode): left out, translated again", (unsigned long long)key);
         }
         if (!ok) {
             static std::atomic<int> logged{0};
@@ -2737,7 +2758,11 @@ const Program* seed_variant_of(const uint64_t code[3], bool mesh, const uint32_t
     struct Reset { ~Reset() { questions_in = nullptr, answers_in = nullptr; } } reset;
     if (mesh) translate_mesh_into(*p, *blank, by_stage[6] ? &code_of[6] : nullptr, code_of[7], nullptr, fs, color_types);
     else translate_into(*p, *blank, &code_of[0], fs, nullptr, color_types);
-    if (p->failed) return nullptr;
+    if (p->failed || !answers_fit(*p)) {   // (answers noted in the other mesh mode: not this program's, the variant is made in play)
+        for (Stage& st : p->stages)
+            if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
+        return nullptr;
+    }
     std::lock_guard lk(shader_mu);
     auto& variants = programs[p->key];
     for (auto& v : variants)
