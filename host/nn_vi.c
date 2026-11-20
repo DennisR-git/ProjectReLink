@@ -609,6 +609,12 @@ static void realtime_step(int64_t now) {
     ratio = ratio < least ? least : ratio > 4.0 ? 4.0 : ratio;
     int fps = (int)(60.0 / ratio + 0.5);
     fps = fps < 15 ? 15 : fps > top ? top : fps;
+    {   /* (test runs) HOS_TEST_STEP_FPS=<n>: the game's step is 1/n s whatever the frames take: the steps of a frame rate
+           the bench cannot reach, in slow motion (issue 158 names 144 fps, the bench draws that room at 100 to 113) */
+        static int forced = -1;
+        if (forced < 0) forced = getenv("HOS_TEST_STEP_FPS") ? atoi(getenv("HOS_TEST_STEP_FPS")) : 0;
+        if (forced >= 15 && forced <= 240) fps = forced;
+    }
     int *slot = (int *)GP(mod + 0x2c8);
     if (*slot < 15 || *slot > 240) {
         static int logged;
