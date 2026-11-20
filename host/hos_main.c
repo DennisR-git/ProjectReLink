@@ -427,6 +427,7 @@ static void load_relink_env(void) {
 
 int hos_oot_protect_hearts;
 volatile int hos_oot_live_action;   /* (test runs) the live input file's "!cheat <action>": host/nn_hid.c */
+char hos_oot_live_event[96];        /* (test runs) the live input file's "!event <name>": oot_teleport asks for that event */
 /* (test runs) the live input file's "!pos x y z": Link moved there, as the mark and return cheats move him (actions 2, 3) */
 volatile int hos_oot_live_pos_pending;
 volatile float hos_oot_live_pos[3];
@@ -810,7 +811,7 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
     memcpy(A64_PTR(strings + 128), start, strlen(start) + 1);
     memcpy(A64_PTR(strings + 256), boot, strlen(boot) + 1);
 
-    const char *event_env = getenv("HOS_OOT_TELEPORT_EVENT");
+    const char *event_env = hos_oot_live_event[0] ? hos_oot_live_event : getenv("HOS_OOT_TELEPORT_EVENT");
     const int carrier = place_target.banc && place_target.carrier;
     const char *event = carrier ? "DefaultParentEvent" : event_env && *event_env ? event_env : "Dm_SY_BancChangeGo";
     const char *starter_env = getenv("HOS_OOT_TELEPORT_STARTER");
