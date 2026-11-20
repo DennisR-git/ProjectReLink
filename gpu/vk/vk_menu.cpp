@@ -285,17 +285,32 @@ struct Out {
 };
 constexpr Out kOutputs[] = {{2048, 1152}, {2560, 1440}, {3840, 2160}, {1920, 1080}};
 constexpr int kLastOutput = std::size(kOutputs) - 1;
-int output_choice(int v) { return v >= 0 && v <= kLastOutput ? v : 0; }
-// Display the sizes from smallest to largest while keeping the IDs used by saved settings.
-constexpr int kOutputOrder[] = {3, 0, 1, 2};
-static_assert(std::size(kOutputOrder) == std::size(kOutputs));
+// (relink, 20/11) 4: Auto, the screen's: the largest of the four sizes that fits the screen (host/nn_applet.c
+// hos_output_auto_pick, the same rule: the game reads it there at the start). The upscaler then scales the 3D straight to the
+// screen's size and the HUD is drawn at it, with no stretch of the whole frame to the window after
+constexpr int kAutoOutput = 4;
+int output_auto_pick() {
+#ifdef _WIN32
+    DEVMODEW dm{};
+    dm.dmSize = sizeof dm;
+    const int h = EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) ? (int)dm.dmPelsHeight : 0;
+#else
+    const int h = 0;
+#endif
+    return h >= 1440 ? 1 : h >= 1152 || h == 0 ? 0 : 3;
+}
+int output_choice(int v) { return (v >= 0 && v <= kLastOutput) || v == kAutoOutput ? v : 0; }
+int output_resolved(int v) { return v == kAutoOutput ? output_auto_pick() : output_choice(v); }
+// Display the sizes from smallest to largest while keeping the IDs used by saved settings (Auto first).
+constexpr int kOutputOrder[] = {kAutoOutput, 3, 0, 1, 2};
+constexpr int kLastOrder = std::size(kOutputOrder) - 1;
 int step_output_choice(int id, int dir) {
     const int* pos = std::find(std::begin(kOutputOrder), std::end(kOutputOrder), output_choice(id));
-    const int next = std::clamp((int)(pos - std::begin(kOutputOrder)) + dir, 0, kLastOutput);
+    const int next = std::clamp((int)(pos - std::begin(kOutputOrder)) + dir, 0, kLastOrder);
     return kOutputOrder[next];
 }
 Out shown_output() {
-    return opts.handheld ? Out{1536, 864} : kOutputs[output_choice(opts.output_res)];
+    return opts.handheld ? Out{1536, 864} : kOutputs[output_resolved(opts.output_res)];
 }
 // The size the game draws the 3D at for a fixed scale of its output, a twelfth of it: every twelfth asked came out exact at the three
 // outputs (2048x1152: 0.58 drew 1195x672, 0.6667 1366x768). So the scale the game is given is the twelfth too: 0.67 drew 2615x1471 at
@@ -370,8 +385,10 @@ bool row_fixed(const int* value) {
 const char* tx_output_res(int v) {
     static char b[32];
     v = output_choice(v);
-    const Out o = kOutputs[v];
-    snprintf(b, sizeof b, "%ux%u%s", o.w, o.h, v ? "" : " (game's)");
+    const int r = output_resolved(v);
+    const Out o = kOutputs[r];
+    if (v == kAutoOutput) snprintf(b, sizeof b, "Auto (%ux%u)", o.w, o.h);
+    else snprintf(b, sizeof b, "%ux%u%s", o.w, o.h, v ? "" : " (game's)");
     return b;
 }
 const char* tx_speed(int v) { return v ? "Real time" : "Per frame"; }
@@ -518,7 +535,9 @@ MENU_HINTS(hn_vsync, 0, "Each frame is shown as soon as it is ready: the least d
 MENU_HINTS(hn_output_res, 0, "The game's own size.",
            "The sharpest on a 2560x1440 screen: nothing to scale to the window.",
            "The sharpest on a 3840x2160 screen. The game's render targets get a bigger GPU pool, so a full-size 3D fits.",
-           "The sharpest on a 1920x1080 screen: the HUD and text pixel for pixel, nothing to scale to the window.")
+           "The sharpest on a 1920x1080 screen: the HUD and text pixel for pixel, nothing to scale to the window.",
+           "The size that fits this screen: the upscaler scales the 3D straight to it and the HUD is drawn at it, nothing "
+           "stretched to the window after. A larger screen asks more of the GPU.")
 /// The Window scaling filter: its filter, or that none is needed at this window's size
 const char* hn_filter(int v, int variant) {
     static const char* const t[] = {"The plain copy.", "Sharper.", "Sharper still; can ring on edges."};
@@ -619,7 +638,7 @@ Row rows[] = {
     {TAB_GRAPHICS, "Low latency", &opts.reflex, 0, 2, 1, tx_reflex,
      "NVIDIA Reflex / AMD Anti-Lag 2: starts each frame as late as it can, for less input delay. Not used with frame generation.", hn_reflex},
     // (the picture's way, top to bottom: the output's size, what fills it from the 3D, the 3D's size, then the window)
-    {TAB_GRAPHICS, "Output resolution", &opts.output_res, 0, kLastOutput, 1, tx_output_res,
+    {TAB_GRAPHICS, "Output resolution", &opts.output_res, 0, kAutoOutput, 1, tx_output_res,
      "The game's whole frame, HUD included, before it is scaled to the window. Docked only. Applies after a restart.",
      hn_output_res, true},
     {TAB_GRAPHICS, "Upscaler", &opts.dlss, 0, ur::kUpscalers - 1, 1, tx_upscaler, "What scales the 3D up to the Output resolution.",
