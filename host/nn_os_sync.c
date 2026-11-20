@@ -723,11 +723,32 @@ static void mxf_stats(void) {   /* (HOS_OBJ_STATS: every 5 s) */
             __atomic_exchange_n(&mxf_n_wake, 0, __ATOMIC_RELAXED), __atomic_exchange_n(&mxf_n_slowret, 0, __ATOMIC_RELAXED));
 }
 #define MXF_COUNT(x) do { if (obj_stats_on()) __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED); } while (0)
-static uint32_t mxf_self(void) {   /* (a thread's small id, 1..32767) */
-    static _Thread_local uint32_t id;
-    static volatile LONG next;
-    if (!id) id = (uint32_t)(InterlockedIncrement(&next) % 32767) + 1;
-    return id;
+/* A thread's small id, 1..32767, unique among the live threads: an id comes back to a free list when its thread ends
+   (hos_mxf_thread_exit, from thread_main). The first version counted on modulo 32767: a session that started that many
+   threads would have given a new thread a live one's id, and it would have taken that thread's held mutex as its own
+   nested lock. (A mutex a thread ended holding then belongs to the next thread given its id; on the console it stays held
+   for good: either way no two live threads hold it.) */
+static _Thread_local uint32_t mxf_id;
+static SRWLOCK mxf_ids_lock = SRWLOCK_INIT;
+static uint16_t mxf_free_ids[32768];
+static int mxf_nfree;
+static uint32_t mxf_next_id;
+static uint32_t mxf_self(void) {
+    if (mxf_id) return mxf_id;
+    AcquireSRWLockExclusive(&mxf_ids_lock);
+    if (mxf_nfree) mxf_id = mxf_free_ids[--mxf_nfree];
+    else if (mxf_next_id < 32767) mxf_id = ++mxf_next_id;
+    ReleaseSRWLockExclusive(&mxf_ids_lock);
+    if (!mxf_id) hos_fatal(NULL, "nn::os mutexes: 32 767 live threads (HOS_MUTEX_FAST=0: host objects)");
+    if (mxf_id == 4096) hos_log("nn::os mutexes: 4096 thread ids in use at once");
+    return mxf_id;
+}
+void hos_mxf_thread_exit(void) {
+    if (!mxf_id) return;
+    AcquireSRWLockExclusive(&mxf_ids_lock);
+    if (mxf_nfree < 32768) mxf_free_ids[mxf_nfree++] = (uint16_t)mxf_id;
+    ReleaseSRWLockExclusive(&mxf_ids_lock);
+    mxf_id = 0;
 }
 static volatile uint32_t *mxf_word(uint64_t m) { return (volatile uint32_t *)GP(m + MXF_OFFSET); }
 static int mxf_use(uint64_t m) { return m && mxf_on() && mxf_ready(); }
