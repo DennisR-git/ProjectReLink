@@ -104,12 +104,13 @@ static void process_priority(void) {
    from outside, the same runs alternated): 2 and 3 late, 0 and 18 ms lost, the longest 27 and 35 ms; the Market 34 / 36
    against 41 / 48. A soft minimum (QUOTA_LIMITS_HARDWS_MIN_DISABLE) is a target the memory manager trims the game down to
    only when memory is short, not a lock: other programs are trimmed first. HOS_WS_MIN_MB=<n>: that many MB (0: none);
-   default 3/8 of the RAM, at most 6144 MB */
+   default 3/8 of the RAM, at most 6144 MB, and none under 12 GB of RAM: an 8 GB PC (stood for on the bench by a program
+   touching 8 GB every 2 s) was chaotic with or without a 3 GB minimum, freezes of 1-9 s both ways, no side shown better */
 static void working_set_floor(void) {
     MEMORYSTATUSEX ms = {sizeof ms};
     const uint64_t ram_mb = GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys >> 20 : 0;
     const char *e = getenv("HOS_WS_MIN_MB");
-    uint64_t mb = e ? (uint64_t)atoll(e) : ram_mb * 3 / 8;
+    uint64_t mb = e ? (uint64_t)atoll(e) : ram_mb >= 12 * 1024 ? ram_mb * 3 / 8 : 0;
     if (!e && mb > 6144) mb = 6144;
     if (!mb || mb >= ram_mb) return;
     HANDLE tok;
