@@ -835,12 +835,12 @@ HLE(_ZN2nn2os12TryLockMutexEPNS0_9MutexTypeE) {
     if (mxf_use(ARG(0)) && !watched(ARG(0))) {
         volatile uint32_t *w = mxf_word(ARG(0));
         const uint32_t mine = mxf_self() << 16;
-        uint32_t c = 0;
-        if (__atomic_compare_exchange_n(w, &c, mine | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) { RET(1); return; }
+        uint32_t cw = 0;
+        if (__atomic_compare_exchange_n(w, &cw, mine | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) { RET(1); return; }
         for (;;) {
-            if (c & MXF_SLOW) break;
-            if ((c & 0x7fff0000u) != mine || (c & MXF_DEPTH_MASK) == MXF_DEPTH_MASK) { RET(0); return; }
-            if (__atomic_compare_exchange_n(w, &c, c + MXF_DEPTH_ONE, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { RET(1); return; }
+            if (cw & MXF_SLOW) break;
+            if ((cw & 0x7fff0000u) != mine || (cw & MXF_DEPTH_MASK) == MXF_DEPTH_MASK) { RET(0); return; }
+            if (__atomic_compare_exchange_n(w, &cw, cw + MXF_DEPTH_ONE, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { RET(1); return; }
         }
     }
     Obj *m = obj(ARG(0), K_MUTEX);
@@ -853,8 +853,8 @@ HLE(_ZN2nn2os12TryLockMutexEPNS0_9MutexTypeE) {
 }
 HLE(_ZN2nn2os28IsMutexLockedByCurrentThreadEPKNS0_9MutexTypeE) {
     if (mxf_use(ARG(0))) {
-        const uint32_t c = __atomic_load_n(mxf_word(ARG(0)), __ATOMIC_RELAXED);
-        if (!(c & MXF_SLOW)) { RET(c && (c & 0x7fff0000u) == (mxf_self() << 16)); return; }
+        const uint32_t cw = __atomic_load_n(mxf_word(ARG(0)), __ATOMIC_RELAXED);
+        if (!(cw & MXF_SLOW)) { RET(cw && (cw & 0x7fff0000u) == (mxf_self() << 16)); return; }
     }
     RET(__atomic_load_n(&obj(ARG(0), K_MUTEX)->owner, __ATOMIC_RELAXED) == hos_self());
 }
