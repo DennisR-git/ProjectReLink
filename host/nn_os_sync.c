@@ -708,6 +708,19 @@ static int mxf_ready(void) {
 #else
 static int mxf_ready(void) { return 0; }
 #endif
+static volatile long long mxf_n_fast, mxf_n_nest, mxf_n_contend, mxf_n_sleep, mxf_n_wake, mxf_n_slowret;
+static void mxf_stats(void) {   /* (HOS_OBJ_STATS: every 5 s) */
+    if (!obj_stats_on()) return;
+    static volatile long long last;
+    const long long now = hos_now_ns(), l = __atomic_load_n(&last, __ATOMIC_RELAXED);
+    if (now - l < 5000000000LL || !__atomic_compare_exchange_n(&last, (long long *)&l, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED) || !l)
+        return;
+    hos_log("mutex fast: in 5 s %lld free takes, %lld nested, %lld contended, %lld sleeps, %lld wakes, %lld host way",
+            __atomic_exchange_n(&mxf_n_fast, 0, __ATOMIC_RELAXED), __atomic_exchange_n(&mxf_n_nest, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&mxf_n_contend, 0, __ATOMIC_RELAXED), __atomic_exchange_n(&mxf_n_sleep, 0, __ATOMIC_RELAXED),
+            __atomic_exchange_n(&mxf_n_wake, 0, __ATOMIC_RELAXED), __atomic_exchange_n(&mxf_n_slowret, 0, __ATOMIC_RELAXED));
+}
+#define MXF_COUNT(x) do { if (obj_stats_on()) __atomic_add_fetch(&(x), 1, __ATOMIC_RELAXED); } while (0)
 static uint32_t mxf_self(void) {   /* (a thread's small id, 1..32767) */
     static _Thread_local uint32_t id;
     static volatile LONG next;
@@ -721,12 +734,13 @@ static int mxf_lock(uint64_t m) {
     volatile uint32_t *w = mxf_word(m);
     const uint32_t self = mxf_self(), mine = self << 16;
     uint32_t c = 0;
-    if (__atomic_compare_exchange_n(w, &c, mine | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 1;
+    if (__atomic_compare_exchange_n(w, &c, mine | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) { MXF_COUNT(mxf_n_fast); mxf_stats(); return 1; }
+    if ((c & 0x7fff0000u) != mine && !(c & MXF_SLOW)) MXF_COUNT(mxf_n_contend);
     for (int spun = 0;;) {
-        if (c & MXF_SLOW) return 0;
+        if (c & MXF_SLOW) { MXF_COUNT(mxf_n_slowret); return 0; }
         if ((c & 0x7fff0000u) == mine) {   /* (nested: the depth, the state bits kept) */
             if ((c & MXF_DEPTH_MASK) == MXF_DEPTH_MASK) return 0;   /* (deeper than 16 383: never seen; the host way would be wrong too) */
-            if (__atomic_compare_exchange_n(w, &c, c + MXF_DEPTH_ONE, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return 1;
+            if (__atomic_compare_exchange_n(w, &c, c + MXF_DEPTH_ONE, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { MXF_COUNT(mxf_n_nest); return 1; }
             continue;
         }
         if (c == 0) {
@@ -754,6 +768,7 @@ static int mxf_lock(uint64_t m) {
         {
             const int away = hos_vcore_away();
             uint32_t expect = c;
+            MXF_COUNT(mxf_n_sleep);
             mxf_wait_fn((volatile VOID *)w, &expect, 4, 50);   /* (50 ms at most: a lost wake costs that, never a hang) */
             if (away) hos_vcore_back();
         }
@@ -780,6 +795,7 @@ static int mxf_unlock(uint64_t m) {
         __atomic_exchange_n(w, 0u, __ATOMIC_RELEASE);
 #ifdef _WIN32
         mxf_wake_one((PVOID)w);
+        MXF_COUNT(mxf_n_wake);
 #endif
         return 1;
     }
