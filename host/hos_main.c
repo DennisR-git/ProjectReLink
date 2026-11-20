@@ -98,11 +98,10 @@ static void process_priority(void) {
 }
 
 /* (relink) A floor under the game's working set. On a 16 GB PC the game alone pages (available RAM ~0.9 GB, up to 14 000 page
-   reads a second from the disk, bench 20/11); with another program holding 3 GB (a browser), Windows trimmed the game's
-   working set to 0.8-1 GB in Hyrule Field and the game read its own memory back from the disk all the time: 49 and 53 frames
-   shown late in 65 s, 1.3 and 1.9 s lost in frames of 35+ ms, the longest 353 and 576 ms. With a soft minimum of 6 GB (set
-   from outside, the same runs alternated): 2 and 3 late, 0 and 18 ms lost, the longest 27 and 35 ms; the Market 34 / 36
-   against 41 / 48. A soft minimum (QUOTA_LIMITS_HARDWS_MIN_DISABLE) is a target the memory manager trims the game down to
+   reads a second, bench 20/11); with another program holding 3 GB (touching it every 2 s), Windows trimmed the game's working
+   set to 0.8-1 GB in Hyrule Field: 49, 53 and 12 frames shown late in 65 s against 2, 3 and 3 with a soft minimum of 6 GB
+   (alternated runs); the Market 41, 48, 31 against 34, 36, 21. (The longest frames, 250-580 ms against ~30, came with a burst
+   of ~700 texture uploads ~34 s into the Field that some runs had and others not: not claimed for the minimum.) A soft minimum (QUOTA_LIMITS_HARDWS_MIN_DISABLE) is a target the memory manager trims the game down to
    only when memory is short, not a lock: other programs are trimmed first. HOS_WS_MIN_MB=<n>: that many MB (0: none);
    default 3/8 of the RAM, at most 6144 MB, and none under 12 GB of RAM: an 8 GB PC (stood for on the bench by a program
    touching 8 GB every 2 s) was chaotic with or without a 3 GB minimum, freezes of 1-9 s both ways, no side shown better */
