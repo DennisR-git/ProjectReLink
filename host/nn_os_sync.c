@@ -661,7 +661,7 @@ static int watched_cv(uint64_t cv) {
     return 0;
 }
 
-/* ---- (relink) HOS_MUTEX_FAST=1: a mutex lives in a 32-bit word of the game's own MutexType, as on the console ----
+/* ---- (relink) HOS_MUTEX_FAST (on unless =0): a mutex lives in a 32-bit word of the game's own MutexType, as on the console ----
    The game locks ~3.5 million mutexes a second at the Market (~42 000 a frame), most of them its objects' own; each took a
    lookup of the host object by address (a per-thread cache that missed one time in eight, then the shared table: 0.22 us
    and cache misses each) and the host object's line. On the frame's serial stretches LockMutex was 14 % of the running time,
@@ -680,8 +680,10 @@ static int watched_cv(uint64_t cv) {
 static int mxf_on(void) {
     static int v = -1;
     if (v < 0) {
+        /* (on by default since 20/11: Market +3.6 % with the replay as it is, 3 alternated pairs; +12 % with the replay
+           lifted. HOS_MUTEX_FAST=0: the host objects for every mutex, as before) */
         const char *e = getenv("HOS_MUTEX_FAST");
-        v = e && atoi(e) != 0 && !mx_ix_on();
+        v = (!e || atoi(e) != 0) && !mx_ix_on();
 #ifndef _WIN32
         v = 0;
 #endif
@@ -736,6 +738,7 @@ static int mxf_lock(uint64_t m) {
     uint32_t c = 0;
     if (__atomic_compare_exchange_n(w, &c, mine | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) { MXF_COUNT(mxf_n_fast); mxf_stats(); return 1; }
     if ((c & 0x7fff0000u) != mine && !(c & MXF_SLOW)) MXF_COUNT(mxf_n_contend);
+    int64_t told_at = 0;   /* (a wait of over 10 s is logged once, with the owner's id: the host way's "waiting 10 s") */
     for (int spun = 0;;) {
         if (c & MXF_SLOW) { MXF_COUNT(mxf_n_slowret); return 0; }
         if ((c & 0x7fff0000u) == mine) {   /* (nested: the depth, the state bits kept) */
@@ -770,6 +773,14 @@ static int mxf_lock(uint64_t m) {
             uint32_t expect = c;
             MXF_COUNT(mxf_n_sleep);
             mxf_wait_fn((volatile VOID *)w, &expect, 4, 50);   /* (50 ms at most: a lost wake costs that, never a hang) */
+            if (!told_at) told_at = hos_now_ns() + 10000000000ll;
+            else if (told_at > 0 && hos_now_ns() > told_at) {
+                HosThread *me = hos_self();
+                hos_log("mutex %#llx (fast): %s waiting 10 s; word %#x (owner id %u, this thread's %u; HOS_MUTEX_FAST=0: host objects)",
+                        (unsigned long long)m, me ? hos_thread_name(me) : "?", (unsigned)expect, (unsigned)(expect >> 16) & 0x7fffu,
+                        (unsigned)self);
+                told_at = -1;
+            }
             if (away) hos_vcore_back();
         }
 #endif
