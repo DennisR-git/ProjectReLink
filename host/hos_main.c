@@ -96,6 +96,36 @@ static void process_priority(void) {
         hos_log("GPU scheduling class: %s (%s)", glevel >= 2 ? "high" : "above normal", st == 0 ? "set" : "refused");
     }
 }
+
+/* (relink) A floor under the game's working set. On a 16 GB PC the game alone pages (available RAM ~0.9 GB, up to 14 000 page
+   reads a second from the disk, bench 20/11); with another program holding 3 GB (a browser), Windows trimmed the game's
+   working set to 0.8-1 GB in Hyrule Field and the game read its own memory back from the disk all the time: 49 and 53 frames
+   shown late in 65 s, 1.3 and 1.9 s lost in frames of 35+ ms, the longest 353 and 576 ms. With a soft minimum of 6 GB (set
+   from outside, the same runs alternated): 2 and 3 late, 0 and 18 ms lost, the longest 27 and 35 ms; the Market 34 / 36
+   against 41 / 48. A soft minimum (QUOTA_LIMITS_HARDWS_MIN_DISABLE) is a target the memory manager trims the game down to
+   only when memory is short, not a lock: other programs are trimmed first. HOS_WS_MIN_MB=<n>: that many MB (0: none);
+   default 3/8 of the RAM, at most 6144 MB */
+static void working_set_floor(void) {
+    MEMORYSTATUSEX ms = {sizeof ms};
+    const uint64_t ram_mb = GlobalMemoryStatusEx(&ms) ? ms.ullTotalPhys >> 20 : 0;
+    const char *e = getenv("HOS_WS_MIN_MB");
+    uint64_t mb = e ? (uint64_t)atoll(e) : ram_mb * 3 / 8;
+    if (!e && mb > 6144) mb = 6144;
+    if (!mb || mb >= ram_mb) return;
+    HANDLE tok;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {   /* (raising the minimum needs it) */
+        TOKEN_PRIVILEGES tp = {1};
+        if (LookupPrivilegeValueA(NULL, "SeIncreaseWorkingSetPrivilege", &tp.Privileges[0].Luid)) {
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(tok, FALSE, &tp, 0, NULL, NULL);
+        }
+        CloseHandle(tok);
+    }
+    const SIZE_T lo = (SIZE_T)(mb << 20), hi = (SIZE_T)((mb + 4096) << 20);
+    const BOOL ok = SetProcessWorkingSetSizeEx(GetCurrentProcess(), lo, hi, QUOTA_LIMITS_HARDWS_MIN_DISABLE | QUOTA_LIMITS_HARDWS_MAX_DISABLE);
+    hos_log("working set: a soft minimum of %llu MB (of %llu MB of RAM; HOS_WS_MIN_MB=0: none): %s", (unsigned long long)mb,
+            (unsigned long long)ram_mb, ok ? "set" : "refused");
+}
 #endif
 
 int hos_game_is_mkw(void) { return !strcmp(hos_main_build_id, "d00e4f399e411d0613aa8d26b1c02fef"); }
@@ -1617,6 +1647,7 @@ static int game_main(int argc, char **argv) {
     timeBeginPeriod(1);   /* 1 ms timer resolution: the 60 Hz vsync and the game's frame pacing sleep in short steps */
     no_power_throttling();
     process_priority();
+    working_set_floor();
 #endif
     void hos_display_start(void);
     hos_display_start();  /* the game's window; HOS_HEADLESS=1 for none */
