@@ -197,11 +197,38 @@ static void insert_locked(Obj *o) {
     __atomic_store_n(&table[i], o, __ATOMIC_RELEASE);
 }
 
+/* (relink) HOS_OBJ_STATS=1 (diagnostic): the object lookups every 5 s: per-thread cache hits, table probes without the lock and
+   their steps, the exclusive-lock path (an object made or initialized again), and the time inside obj_lookup, misses by kind */
+static int obj_stats_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("HOS_OBJ_STATS") != NULL;
+    return on;
+}
+static volatile long long os_slow, os_hit, os_unl_hit, os_unl_miss, os_steps, os_excl, os_ns, os_miss_kind[12];
+static void obj_stats_log(void) {
+    static volatile long long last;
+    const long long now = hos_now_ns(), l = __atomic_load_n(&last, __ATOMIC_RELAXED);
+    if (now - l < 5000000000LL || !__atomic_compare_exchange_n(&last, (long long *)&l, now, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+        return;
+    if (!l) return;
+    const long long slow = __atomic_exchange_n(&os_slow, 0, __ATOMIC_RELAXED), hit = __atomic_exchange_n(&os_hit, 0, __ATOMIC_RELAXED),
+                    uh = __atomic_exchange_n(&os_unl_hit, 0, __ATOMIC_RELAXED), um = __atomic_exchange_n(&os_unl_miss, 0, __ATOMIC_RELAXED),
+                    st = __atomic_exchange_n(&os_steps, 0, __ATOMIC_RELAXED), ex = __atomic_exchange_n(&os_excl, 0, __ATOMIC_RELAXED),
+                    ns = __atomic_exchange_n(&os_ns, 0, __ATOMIC_RELAXED);
+    long long k[12];
+    for (int i = 0; i < 12; i++) k[i] = __atomic_exchange_n(&os_miss_kind[i], 0, __ATOMIC_RELAXED);
+    hos_log("objs: in 5 s %lld lookups, %lld cache hits (%.1f %%); table %lld found, %lld not (%.2f steps a probe); %lld exclusive; "
+            "%.1f ms in obj_lookup (%.2f us each); misses by kind mutex %lld cond %lld event %lld sema %lld queue %lld rw %lld other %lld",
+            slow, hit, slow ? 100.0 * hit / slow : 0.0, uh, um, (uh + um) ? (double)st / (uh + um) : 0.0, ex, ns / 1e6,
+            (uh + um) ? ns / 1e3 / (uh + um) : 0.0, k[1], k[2], k[3], k[4], k[5], k[6], k[0] + k[7] + k[8] + k[9]);
+}
+
 static Obj *find_unlocked(uint64_t key, int kind) {
     const Table *t = __atomic_load_n(&live, __ATOMIC_ACQUIRE);
     if (!t) return NULL;
     const uint64_t *keys = table_keys_of(t);
     for (uint64_t i = slot_of(key, t->cap), n = 0; n < t->cap; i = (i + 1) & (t->cap - 1), n++) {
+        if (obj_stats_on()) __atomic_add_fetch(&os_steps, 1, __ATOMIC_RELAXED);
         Obj *o = __atomic_load_n(&t->slot[i], __ATOMIC_ACQUIRE);
         if (!o) return NULL;
         /* (the key beside the slot first; a slot changing meanwhile gives a miss, and the locked lookup answers) */
@@ -282,9 +309,12 @@ static Obj *obj_nockpt_slow(uint64_t key, int kind) {
     if (!off) {
         const unsigned i = (unsigned)((key * 0x9E3779B97F4A7C15ULL) >> 52);
         Obj *o = cache[i].o;
+        if (obj_stats_on()) __atomic_add_fetch(&os_slow, 1, __ATOMIC_RELAXED);
         if (cache[i].key == key && o && __atomic_load_n(&o->key, __ATOMIC_RELAXED) == key &&
-            __atomic_load_n(&o->kind, __ATOMIC_ACQUIRE) == kind)
+            __atomic_load_n(&o->kind, __ATOMIC_ACQUIRE) == kind) {
+            if (obj_stats_on()) __atomic_add_fetch(&os_hit, 1, __ATOMIC_RELAXED);
             return o;
+        }
         o = obj_lookup(key, kind);
         cache[i].key = key, cache[i].o = o;
         return o;
@@ -292,18 +322,33 @@ static Obj *obj_nockpt_slow(uint64_t key, int kind) {
     return obj_lookup(key, kind);
 }
 
+static Obj *obj_lookup_inner(uint64_t key, int kind);
 static Obj *obj_lookup(uint64_t key, int kind) {
+    if (!obj_stats_on()) return obj_lookup_inner(key, kind);
+    const int64_t t0 = hos_now_ns();
+    Obj *o = obj_lookup_inner(key, kind);
+    __atomic_add_fetch(&os_ns, hos_now_ns() - t0, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&os_miss_kind[kind < 12 && kind >= 0 ? kind : 0], 1, __ATOMIC_RELAXED);
+    obj_stats_log();
+    return o;
+}
+static Obj *obj_lookup_inner(uint64_t key, int kind) {
     static int locked_reads = -1;
     if (locked_reads < 0) locked_reads = getenv("HOS_SYNC_TABLE_LOCK") != NULL;
     Obj *o;
     if (!locked_reads) {
-        if ((o = find_unlocked(key, kind))) return o;
+        if ((o = find_unlocked(key, kind))) {
+            if (obj_stats_on()) __atomic_add_fetch(&os_unl_hit, 1, __ATOMIC_RELAXED);
+            return o;
+        }
+        if (obj_stats_on()) __atomic_add_fetch(&os_unl_miss, 1, __ATOMIC_RELAXED);
     } else {
         AcquireSRWLockShared(&table_lock);
         o = find_locked(key);
         ReleaseSRWLockShared(&table_lock);
         if (o && o->kind == kind) return o;
     }
+    if (obj_stats_on()) __atomic_add_fetch(&os_excl, 1, __ATOMIC_RELAXED);
     AcquireSRWLockExclusive(&table_lock);
     uint64_t at = find_slot_locked(key, 1);
     o = at == ~0ull ? NULL : table[at];
@@ -754,8 +799,10 @@ static void inj_after_wait(void) {
         int n = 0;
         const char *e = getenv("HOS_DELAY");
         while (e && *e && n < 8) {
-            const char *colon = strchr(e, ':'), *comma = strchr(e, ',');
-            if (!colon || (comma && comma < colon) || colon - e >= 40) break;
+            const char *comma = strchr(e, ','), *colon = NULL;
+            for (const char *q = e; *q && (!comma || q < comma); q++)
+                if (*q == ':') colon = q;   /* (the last ':' of the entry: names like sead::MainThread hold some) */
+            if (!colon || colon - e >= 40) break;
             memcpy(inj_tab[n].pre, e, (size_t)(colon - e));
             inj_tab[n].pre[colon - e] = 0;
             inj_tab[n].ns = atoll(colon + 1) * 1000;
