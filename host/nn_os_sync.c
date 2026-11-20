@@ -661,27 +661,188 @@ static int watched_cv(uint64_t cv) {
     return 0;
 }
 
+/* ---- (relink) HOS_MUTEX_FAST=1: a mutex lives in a 32-bit word of the game's own MutexType, as on the console ----
+   The game locks ~3.5 million mutexes a second at the Market (~42 000 a frame), most of them its objects' own; each took a
+   lookup of the host object by address (a per-thread cache that missed one time in eight, then the shared table: 0.22 us
+   and cache misses each) and the host object's line. On the frame's serial stretches LockMutex was 14 % of the running time,
+   89 % of it from one caller (f_8027bfe0), nearly all of it in the lookup (hs bt09_prof / bt23_objs, 20/11).
+   The word (MutexType + 8, the SDK's nesting count, which the HLE never kept there: PR 83's slot too, so not with
+   HOS_MUTEX_IX) holds the owner's small id (bits 16-30), the nesting depth less one (bits 2-15) and a state (bits 0-1:
+   0 free, 1 held, 2 held with waiters). An uncontended lock or unlock is one atomic operation on memory the game touches
+   anyway; a contended one waits on the word itself (WaitOnAddress), its virtual core given up. A mutex a condition
+   variable waits with goes for good to the host object (bit 31): the signal's hand-off to the woken waiter (reserved, the
+   movie freeze of 11-07) lives there, unchanged. Initialize and Finalize clear the word. */
+#define MXF_OFFSET 8
+#define MXF_SLOW 0x80000000u
+#define MXF_STATE 3u
+#define MXF_DEPTH_ONE 4u
+#define MXF_DEPTH_MASK 0xfffcu
+static int mxf_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("HOS_MUTEX_FAST");
+        v = e && atoi(e) != 0 && !mx_ix_on();
+#ifndef _WIN32
+        v = 0;
+#endif
+    }
+    return v;
+}
+#ifdef _WIN32
+typedef BOOL(WINAPI *WaitOnAddressFn)(volatile VOID *, PVOID, SIZE_T, DWORD);
+typedef VOID(WINAPI *WakeByAddressFn)(PVOID);
+static WaitOnAddressFn mxf_wait_fn;
+static WakeByAddressFn mxf_wake_one, mxf_wake_all;
+static int mxf_ready(void) {
+    static int r = -1;
+    if (r < 0) {
+        HMODULE k = GetModuleHandleA("kernelbase.dll");
+        mxf_wait_fn = k ? (WaitOnAddressFn)(void *)GetProcAddress(k, "WaitOnAddress") : NULL;
+        mxf_wake_one = k ? (WakeByAddressFn)(void *)GetProcAddress(k, "WakeByAddressSingle") : NULL;
+        mxf_wake_all = k ? (WakeByAddressFn)(void *)GetProcAddress(k, "WakeByAddressAll") : NULL;
+        r = mxf_wait_fn && mxf_wake_one && mxf_wake_all;
+        hos_log("nn::os mutexes: in the game's own MutexType (HOS_MUTEX_FAST)%s", r ? "" : ": WaitOnAddress missing, host objects kept");
+    }
+    return r;
+}
+#else
+static int mxf_ready(void) { return 0; }
+#endif
+static uint32_t mxf_self(void) {   /* (a thread's small id, 1..32767) */
+    static _Thread_local uint32_t id;
+    static volatile LONG next;
+    if (!id) id = (uint32_t)(InterlockedIncrement(&next) % 32767) + 1;
+    return id;
+}
+static volatile uint32_t *mxf_word(uint64_t m) { return (volatile uint32_t *)GP(m + MXF_OFFSET); }
+static int mxf_use(uint64_t m) { return m && mxf_on() && mxf_ready(); }
+/* 1: locked here; 0: the mutex is the host object's (MXF_SLOW): the caller goes the host way */
+static int mxf_lock(uint64_t m) {
+    volatile uint32_t *w = mxf_word(m);
+    const uint32_t self = mxf_self(), mine = self << 16;
+    uint32_t c = 0;
+    if (__atomic_compare_exchange_n(w, &c, mine | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 1;
+    for (int spun = 0;;) {
+        if (c & MXF_SLOW) return 0;
+        if ((c & 0x7fff0000u) == mine) {   /* (nested: the depth, the state bits kept) */
+            if ((c & MXF_DEPTH_MASK) == MXF_DEPTH_MASK) return 0;   /* (deeper than 16 383: never seen; the host way would be wrong too) */
+            if (__atomic_compare_exchange_n(w, &c, c + MXF_DEPTH_ONE, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return 1;
+            continue;
+        }
+        if (c == 0) {
+            /* (a waiter takes it in state 2: others may still sleep on the word) */
+            if (__atomic_compare_exchange_n(w, &c, mine | (spun ? 2u : 1u), 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return 1;
+            continue;
+        }
+        if (!spun) {   /* (a short spin first, as the host mutexes do: most holds are short) */
+            spun = 1;
+            const int64_t end = hos_now_ns() + spin_ns();
+            while (hos_now_ns() < end) {
+                for (int i = 0; i < 16; i++) YieldProcessor();
+                c = __atomic_load_n(w, __ATOMIC_RELAXED);
+                if (c == 0 || (c & MXF_SLOW)) break;
+            }
+            if (c == 0 || (c & MXF_SLOW)) { spun = 0; continue; }
+            spun = 1;
+        }
+        if ((c & MXF_STATE) != 2u) {
+            const uint32_t c2 = (c & ~MXF_STATE) | 2u;
+            if (!__atomic_compare_exchange_n(w, &c, c2, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) continue;
+            c = c2;
+        }
+#ifdef _WIN32
+        {
+            const int away = hos_vcore_away();
+            uint32_t expect = c;
+            mxf_wait_fn((volatile VOID *)w, &expect, 4, 50);   /* (50 ms at most: a lost wake costs that, never a hang) */
+            if (away) hos_vcore_back();
+        }
+#endif
+        c = __atomic_load_n(w, __ATOMIC_RELAXED);
+    }
+}
+/* 1: unlocked here; 0: the host way */
+static int mxf_unlock(uint64_t m) {
+    volatile uint32_t *w = mxf_word(m);
+    const uint32_t mine = mxf_self() << 16;
+    uint32_t c = __atomic_load_n(w, __ATOMIC_RELAXED);
+    for (;;) {
+        if (c & MXF_SLOW) return 0;
+        if ((c & 0x7fff0000u) != mine) return 1;   /* (not ours: ignored, as the host way ignores it) */
+        if (c & MXF_DEPTH_MASK) {
+            if (__atomic_compare_exchange_n(w, &c, c - MXF_DEPTH_ONE, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return 1;
+            continue;
+        }
+        if ((c & MXF_STATE) == 1u) {
+            if (__atomic_compare_exchange_n(w, &c, 0u, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return 1;
+            continue;
+        }
+        __atomic_exchange_n(w, 0u, __ATOMIC_RELEASE);
+#ifdef _WIN32
+        mxf_wake_one((PVOID)w);
+#endif
+        return 1;
+    }
+}
+/* A condition variable waits with m (held by this thread): m becomes the host object's for good, held by this thread at
+   the depth the word had; the threads sleeping on the word wake and go the host way */
+static void mxf_to_host(uint64_t m, Obj *o) {
+    if (!mxf_use(m)) return;
+    volatile uint32_t *w = mxf_word(m);
+    uint32_t c = __atomic_load_n(w, __ATOMIC_ACQUIRE);
+    if (c & MXF_SLOW) return;
+    const uint32_t mine = mxf_self() << 16;
+    if ((c & 0x7fff0000u) == mine) {
+        HosThread *self = hos_self();
+        HosThread *none = NULL;
+        __atomic_compare_exchange_n(&o->owner, &none, self, 0, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED);
+        o->count = (int)((c & MXF_DEPTH_MASK) >> 2) + 1;
+    }
+    c = __atomic_exchange_n(w, MXF_SLOW, __ATOMIC_SEQ_CST);
+#ifdef _WIN32
+    if ((c & MXF_STATE) == 2u) mxf_wake_all((PVOID)w);
+#endif
+}
+
 HLE(_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi) {
+    if (mxf_use(ARG(0))) __atomic_store_n(mxf_word(ARG(0)), 0u, __ATOMIC_RELEASE);
     fresh(ARG(0), K_MUTEX);
     if (watched(ARG(0))) watch_log("init", ARG(0), 0, c, NULL);
 }
 HLE(_ZN2nn2os13FinalizeMutexEPNS0_9MutexTypeE) {
     if (watched(ARG(0))) watch_log("finalize", ARG(0), 0, c, NULL);
     if (ARG(0) && mx_ix_on()) __atomic_store_n((uint32_t *)GP(ARG(0) + MX_IX_OFFSET), 0u, __ATOMIC_RELAXED);
+    if (mxf_use(ARG(0))) __atomic_store_n(mxf_word(ARG(0)), 0u, __ATOMIC_RELEASE);
     drop(ARG(0));
 }
 HLE(_ZN2nn2os9LockMutexEPNS0_9MutexTypeE) {
+    if (mxf_use(ARG(0)) && !watched(ARG(0))) {
+        hos_vcore_checkpoint();
+        if (mxf_lock(ARG(0))) return;
+    }
     Obj *m = obj(ARG(0), K_MUTEX);
     if (watched(ARG(0))) watch_log("lock", ARG(0), 0, c, m);
     mutex_lock(m, ARG(0), c);
     if (watched(ARG(0))) watch_log("locked", ARG(0), 0, c, m);
 }
 HLE(_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE) {
+    if (mxf_use(ARG(0)) && !watched(ARG(0)) && mxf_unlock(ARG(0))) return;
     Obj *m = obj(ARG(0), K_MUTEX);
     if (watched(ARG(0))) watch_log("unlock", ARG(0), 0, c, m);
     mutex_unlock(m);
 }
 HLE(_ZN2nn2os12TryLockMutexEPNS0_9MutexTypeE) {
+    if (mxf_use(ARG(0)) && !watched(ARG(0))) {
+        volatile uint32_t *w = mxf_word(ARG(0));
+        const uint32_t mine = mxf_self() << 16;
+        uint32_t c = 0;
+        if (__atomic_compare_exchange_n(w, &c, mine | 1u, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) { RET(1); return; }
+        for (;;) {
+            if (c & MXF_SLOW) break;
+            if ((c & 0x7fff0000u) != mine || (c & MXF_DEPTH_MASK) == MXF_DEPTH_MASK) { RET(0); return; }
+            if (__atomic_compare_exchange_n(w, &c, c + MXF_DEPTH_ONE, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) { RET(1); return; }
+        }
+    }
     Obj *m = obj(ARG(0), K_MUTEX);
     HosThread *self = hos_self();
     if (__atomic_load_n(&m->owner, __ATOMIC_RELAXED) == self) { m->count++; RET(1); return; }
@@ -691,6 +852,10 @@ HLE(_ZN2nn2os12TryLockMutexEPNS0_9MutexTypeE) {
     RET(ok);
 }
 HLE(_ZN2nn2os28IsMutexLockedByCurrentThreadEPKNS0_9MutexTypeE) {
+    if (mxf_use(ARG(0))) {
+        const uint32_t c = __atomic_load_n(mxf_word(ARG(0)), __ATOMIC_RELAXED);
+        if (!(c & MXF_SLOW)) { RET(c && (c & 0x7fff0000u) == (mxf_self() << 16)); return; }
+    }
     RET(__atomic_load_n(&obj(ARG(0), K_MUTEX)->owner, __ATOMIC_RELAXED) == hos_self());
 }
 
@@ -715,6 +880,7 @@ HLE(_ZN2nn2os21WaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTyp
         if (i < 8) watch_cvs[i] = ARG(0);
         watch_log("cv wait", ARG(1), ARG(0), c, m);
     }
+    mxf_to_host(ARG(1), m);
     AcquireSRWLockExclusive(&cv->lk);
     uint64_t gen = cv->gen;
     cv_enter(cv, m);
@@ -1451,6 +1617,7 @@ HLE(_ZN2nn2os17TryWaitTimerEventEPNS0_14TimerEventTypeE) {
 HLE(_ZN2nn2os26TimedWaitConditionVariableEPNS0_21ConditionVariableTypeEPNS0_9MutexTypeENS_8TimeSpanE) {
     Obj *cv = obj(ARG(0), K_COND), *m = obj(ARG(1), K_MUTEX);
     int64_t deadline = hos_now_ns() + ((int64_t)ARG(2) > 0 ? (int64_t)ARG(2) : 0);
+    mxf_to_host(ARG(1), m);
     AcquireSRWLockExclusive(&cv->lk);
     uint64_t gen = cv->gen;
     cv_enter(cv, m);
