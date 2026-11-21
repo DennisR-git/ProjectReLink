@@ -71,8 +71,8 @@ public partial class MainWindow
                     "Native is the sharpest. The percentages lighten the graphics card's work; the game scales the picture up afterwards."),
                   "Resolution", (1, L("Native", "Native")), (0, L("Automatique", "Automatic")), (2, "75 %"), (3, "67 %"), (5, "58 %"), (4, "50 %"));
         UpscalerGroup = ChoiceRow(RowsDisplay, L("Agrandissement de la 3D", "Upscaler"),
-                  L("Ce qui agrandit la 3D jusqu'à l'écran et lisse ses bords. AMD FSR marche sur toutes les cartes graphiques (FSR 4 sur les Radeon RX 6000 et plus récentes) ; NVIDIA DLSS demande une carte RTX et la case NVIDIA DLSS ci-dessous. Avec FSR ou DLSS, mettez la netteté vers 80 %. Aucun : la 3D en pleine taille, montrée telle qu'elle est dessinée : rien de lissé, rien qui traîne, des bords crénelés.",
-                    "What scales the 3D up to the screen and smooths its edges. AMD FSR works on every graphics card (FSR 4 on Radeon RX 6000 and newer); NVIDIA DLSS needs an RTX card and the NVIDIA DLSS switch below. With FSR or DLSS, set Sharpness to about 80 %. None: the 3D at full size, shown as it is drawn: nothing smoothed, nothing that trails, jagged edges."),
+                  L("Ce qui agrandit la 3D jusqu'à l'écran et lisse ses bords. AMD FSR marche sur toutes les cartes graphiques (FSR 4 sur les Radeon RX 6000 et plus récentes) ; NVIDIA DLSS demande une carte RTX et la case NVIDIA DLSS ci-dessous. Avec FSR ou DLSS, la netteté est à 50 % par défaut : à peu près aussi net que l'agrandissement du jeu. Aucun : la 3D en pleine taille, montrée telle qu'elle est dessinée : rien de lissé, rien qui traîne, des bords crénelés.",
+                    "What scales the 3D up to the screen and smooths its edges. AMD FSR works on every graphics card (FSR 4 on Radeon RX 6000 and newer); NVIDIA DLSS needs an RTX card and the NVIDIA DLSS switch below. With FSR or DLSS, Sharpness is 50 % by default: about as crisp as the game's own. None: the 3D at full size, shown as it is drawn: nothing smoothed, nothing that trails, jagged edges."),
                   "Upscaler", (0, L("Celui du jeu", "The game's own")), (3, "AMD FSR"), (4, L("AMD FSR, AA natif", "AMD FSR native AA")), (1, "NVIDIA DLSS"), (2, "NVIDIA DLAA"), (5, L("Aucun", "None")));
         FsrVersionGroup = ChoiceRow(RowsDisplay, L("Version d'AMD FSR", "AMD FSR version"),
                   L("Auto : FSR 4, le réseau d'AMD, plus net et plus stable, là où la carte le fait tourner (Radeon RX 6000 et plus récentes, pilote récent), sinon FSR 3.1. FSR 3.1 : plus léger pour la carte graphique.",
@@ -332,7 +332,7 @@ public partial class MainWindow
         LooksText.Text = $"{(s.Fullscreen != 0 ? L("Plein écran", "Full screen") : L("Fenêtre", "Window"))} · {res} · {up}";
         var rate = s.FrameRate switch { 1 => L("FPS débloqués", "Unlocked fps"), 2 => L("30 fps réguliers", "Even 30 fps"), _ => "60 fps" };
         MovesText.Text = s.FrameGeneration >= 2 ? $"{rate} · ×{s.FrameGeneration}" : rate;
-        LooksSub.Text = L($"Netteté {s.Sharpness} %", $"Sharpness {s.Sharpness} %") + (s.Ultrawide != 0 ? L(" · ultra-large", " · ultrawide") : "");
+        LooksSub.Text = L($"Netteté {s.ShownSharpness} %", $"Sharpness {s.ShownSharpness} %") + (s.Ultrawide != 0 ? L(" · ultra-large", " · ultrawide") : "");
         MovesSub.Text = (s.FrameGeneration >= 2 ? L("Génération d'images", "Frame generation") : L("Sans génération d'images", "No frame generation")) +
                         (s.VSync != 0 ? " · V-Sync" : "");
         // (the sky's line: once, after an install or an update, what the first start does; the rest of the time the name's)
@@ -393,7 +393,16 @@ public partial class MainWindow
                 Dispatcher.BeginInvoke(() => Rebuild(tools, s.Folder));
         });
         OnPick(ResolutionGroup, v => s.Resolution = v);
-        OnPick(UpscalerGroup, v => s.Upscaler = v);
+        OnPick(UpscalerGroup, v =>
+        {
+            s.Upscaler = v;
+            // (relink, 0.7.9.3: DLSS, DLAA and FSR have a Sharpness of their own: the slider shows the chosen upscaler's)
+            var was = loading;
+            loading = true;
+            Sharpness.Value = s.ShownSharpness;
+            SharpnessText.Text = $"{s.ShownSharpness} %";
+            loading = was;
+        });
         OnPick(FsrVersionGroup, v => s.FsrVersion = v);
         OnPick(UpscaleGroup, v => s.Upscaling = v);
         OnPick(FrameRateGroup, v => s.FrameRate = v);
@@ -404,7 +413,7 @@ public partial class MainWindow
         Sharpness.ValueChanged += (_, e) =>
         {
             SharpnessText.Text = $"{(int)e.NewValue} %";
-            if (!loading) { s.Sharpness = (int)e.NewValue; Changed(); }
+            if (!loading) { s.ShownSharpness = (int)e.NewValue; Changed(); }
         };
         LanguageBox.SelectionChanged += (_, _) =>
         {
@@ -433,8 +442,8 @@ public partial class MainWindow
         Pick(FramegenGroup, s.FrameGeneration);
         Pick(UiLanguageGroup, s.UiLanguage == "fr" ? 1 : 0);
         Pick(ThemeGroup, s.LauncherTheme == Theme.Dark ? 1 : 0);
-        Sharpness.Value = s.Sharpness;
-        SharpnessText.Text = $"{s.Sharpness} %";
+        Sharpness.Value = s.ShownSharpness;
+        SharpnessText.Text = $"{s.ShownSharpness} %";
         var items = (List<LangItem>)LanguageBox.ItemsSource;
         LanguageBox.SelectedItem = items.FirstOrDefault(l => l.Code == s.Language) ?? items[0];
         FolderText.Text = s.Folder;

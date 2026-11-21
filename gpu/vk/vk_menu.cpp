@@ -150,6 +150,11 @@ const char* hn_reflex(int v, int variant) {
 namespace ur = upscaler_rows;
 int upscaler() { return dlss_mode(); }
 /// (relink, 0.7.9.3) NVIDIA DLSS Frame Generation can be chosen in the Frame generator row: it runs here, or NGX was not asked yet
+/// (relink, 0.7.9.3) DLSS, DLAA or FSR is the Upscaler (not the game's own, nor None): the Sharpness row is their own value
+bool up_sharpened() {
+    const int up = upscaler();
+    return up == ur::DLSS || up == ur::DLAA || up == ur::FSR || up == ur::FSR_AA;
+}
 bool dlssg_choosable() { return dlssg_why() == DLSSG_OK || dlssg_why() == DLSSG_UNKNOWN; }
 bool dlss_ok() { return dlss_why() == DLSS_OK; }
 bool fsr_ok() { return fsr_why() == FSR_OK; }
@@ -164,14 +169,14 @@ const char* tx_upscaler(int) {
 const char* hn_upscaler(int v, int variant) {
     static const char* const t[] = {
         "The game's own network.",
-        "NVIDIA's, from a smaller 3D. Softer than the game's own: set Sharpness to around 80%. Things that move by "
-        "themselves can trail for now.",
-        "NVIDIA's, the 3D at full size with its edges smoothed; the slowest. Softer than the game's own: set Sharpness to "
-        "around 80%. Things that move by themselves can trail for now.",
-        "AMD's FSR 3.1, from a smaller 3D, on any GPU. Softer than the game's own: set Sharpness to around 80%. Things "
-        "that move by themselves can trail for now.",
-        "AMD's FSR 3.1, the 3D at full size with its edges smoothed, on any GPU; slower. A little softer than the game's "
-        "own. Things that move by themselves can trail for now.",
+        "NVIDIA's, from a smaller 3D. Sharpened to the game's own crispness by default (the Sharpness row). "
+        "Things that move by themselves can trail for now.",
+        "NVIDIA's, the 3D at full size with its edges smoothed; the slowest. Sharpened to the game's own crispness by "
+        "default (the Sharpness row). Things that move by themselves can trail for now.",
+        "AMD's FSR 3.1, from a smaller 3D, on any GPU. Sharpened to the game's own crispness by default (the Sharpness "
+        "row). Things that move by themselves can trail for now.",
+        "AMD's FSR 3.1, the 3D at full size with its edges smoothed, on any GPU; slower. Sharpened to the game's own "
+        "crispness by default (the Sharpness row). Things that move by themselves can trail for now.",
         "No upscaler: the 3D at full size, shown as it is drawn. Nothing is smoothed and nothing trails; edges are "
         "jagged, and leaves, fences and far lines shimmer. Softer than the game's own, which sharpens: Sharpness helps.",
     };
@@ -365,11 +370,11 @@ const char* hn_resolution(int v, int variant) {
     }
     if (up == ur::DLSS) {
         switch (p) {
-        case 0: return "The game lowers it when the GPU is busy, and DLSS follows. Set Sharpness to around 80%.";
-        case 67: return "DLSS's sharpest mode. Set Sharpness to around 80%.";
-        case 58: return "Between Quality and Performance. Set Sharpness to around 80%.";
-        case 50: return "Faster, and softer. Set Sharpness to around 80%.";
-        case 33: return "DLSS's fastest mode, and its softest. Set Sharpness to around 80%.";
+        case 0: return "The game lowers it when the GPU is busy, and DLSS follows.";
+        case 67: return "DLSS's sharpest mode.";
+        case 58: return "Between Quality and Performance.";
+        case 50: return "Faster, and softer.";
+        case 33: return "DLSS's fastest mode, and its softest.";
         default: return nullptr;   // (not one of DLSS's steps: the row moves to one)
         }
     }
@@ -575,16 +580,22 @@ const char* hn_filter(int v, int variant) {
     if (variant < 0) return filter_needed() ? t[std::clamp(v, 0, 2)] : none;
     return variant == 0 ? t[std::clamp(v, 0, 2)] : variant == 1 ? none : nullptr;
 }
-/// Sharpness: with DLSS or DLAA, the amount that suits them
+/// Sharpness, with the game's own upscaler or None
 const char* hn_sharpness(int v, int variant) {
-    static const char* const dlss = "DLSS and DLAA look softer than the game's own upscaler: around 80% suits them.";
-    // (relink) FSR measured as soft as DLSS in the Market (the mean edge strength of a house front at 67%: the game's own
-    // 19, DLSS 10.8, FSR 9.1): the same advice. Its native AA is nearer the game's own (15): none
-    static const char* const fsr = "AMD FSR looks softer than the game's own upscaler, as DLSS does: around 80% suits it.";
-    const int up = upscaler();
-    const int which = variant < 0 ? (up == ur::DLSS || up == ur::DLAA ? 1 : up == ur::FSR ? 2 : 0) : variant;
-    if (which > 2) return nullptr;
-    return which == 1 ? dlss : which == 2 ? fsr : v == 0 ? "Off: the picture as it is." : nullptr;
+    static const char* const off = "Off: the picture as it is.";
+    if (variant >= 0) return variant == 0 ? off : nullptr;   // (each hint the row can show, for the menu's layout)
+    return v == 0 ? off : nullptr;
+}
+/// (relink, 0.7.9.3) Sharpness while DLSS, DLAA or FSR draws: what the amounts do, as measured (vk_menu.h up_sharpness)
+const char* hn_up_sharpness(int v, int variant) {
+    static const char* const t[] = {
+        "Off: as soft as the upscaler leaves it, a little softer than the 3D drawn at full size.",
+        "Less than the default: around 30% is about as crisp as the 3D drawn at full size.",
+        "The default: about as crisp as the game's own upscaler.",
+        "Crisper than the game's own upscaler; edges get halos as it goes up.",
+    };
+    if (variant >= 0) return variant < 4 ? t[variant] : nullptr;
+    return t[v == 0 ? 0 : v < 50 ? 1 : v == 50 ? 2 : 3];
 }
 MENU_HINTS(hn_handheld, 0, "Docked: the Output resolution's size.", "Lower resolutions, lighter on the GPU.")
 MENU_HINTS(hn_ultrawide, 0, "The game's own shape.",
@@ -683,7 +694,10 @@ Row rows[] = {
     {TAB_GRAPHICS, "Window scaling filter", &opts.upscale, 0, 2, 1, tx_filter,
      "How the finished picture is scaled to the window, when its size differs from the Output resolution.", hn_filter},
     {TAB_GRAPHICS, "Sharpness", &opts.sharpness, 0, 100, 10, tx_percent,
-     "Sharpens the picture: the 3D alone with DLSS, DLAA or FSR, else as it goes to the window. Too much shows halos.", hn_sharpness},
+     "Sharpens the picture as it goes to the window. Too much shows halos.", hn_sharpness},
+    // (relink, 0.7.9.3) the same row while DLSS, DLAA or FSR draws, a value of its own (row_shown shows one of the two)
+    {TAB_GRAPHICS, "Sharpness", &opts.up_sharpness, 0, 100, 10, tx_percent,
+     "Sharpens the 3D under the HUD. 50% by default; too much shows halos.", hn_up_sharpness},
     {TAB_GRAPHICS, "Handheld profile", &opts.handheld, 0, 1, 1, tx_onoff,
      "Runs the game as if the console were undocked. Applies after a restart.", hn_handheld, true},
     {TAB_GRAPHICS, "Ultrawide", &opts.ultrawide, 0, 1, 1, tx_ultrawide,
@@ -922,7 +936,9 @@ std::string restart_line(HDC dc, int width) {
 bool row_shown(int i) {
     return (i != kCheatsRow || cheats_enabled) && (rows[i].value != &opts.dlss || ur::upscaler_shown()) &&
            (rows[i].value != &opts.dlss_model || ur::model_shown(dlss_built())) &&
-           (rows[i].value != &opts.fg_kind || dlss_built());   // (relink: the Frame generator row in a build with DLSS)
+           (rows[i].value != &opts.fg_kind || dlss_built()) &&   // (relink: the Frame generator row in a build with DLSS)
+           // (relink, 0.7.9.3: one Sharpness row: DLSS's, DLAA's and FSR's own value while one of them is chosen)
+           (rows[i].value != &opts.sharpness || !up_sharpened()) && (rows[i].value != &opts.up_sharpness || up_sharpened());
 }
 int tab_row_count(int t) {
     int c = 0;
@@ -990,7 +1006,7 @@ bool menu_refresh = false;
 int hover_tab = -1;
 int drag_row = -1;
 bool mouse_read = false;   // (the menu has read the mouse since it opened)
-bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.volume; }
+bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.up_sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.volume; }
 /// (a scale: the arrows, a click and the wheel stop at its ends; Rumble strength would go from Off to its strongest)
 bool stops_at_ends(const Row& r) { return r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.deadzone_l || r.value == &opts.deadzone_r || r.value == &opts.fov || r.value == &opts.volume; }
 /// (the ini's Rumble strength on the menu's steps: 0 to 150, the nearest 25)
@@ -1007,6 +1023,7 @@ const char* ini_key(const Row& r) {
     if (r.value == &opts.resolution) return "resolution";
     if (r.value == &opts.upscale) return "upscaling";
     if (r.value == &opts.dlss) return "dlss";   // (as opts.dlss and RX_VK_DLSS)
+    if (r.value == &opts.up_sharpness) return "upscaler_sharpness";   // (relink, 0.7.9.3: the Sharpness row under DLSS or FSR)
     static char k[32];
     size_t n = 0;
     for (const char* p = r.name; *p && n + 1 < sizeof k; p++) k[n++] = *p == ' ' ? '_' : (char)tolower(*p);
@@ -3272,7 +3289,7 @@ void menu_init() {
         has_options = true;
         char line[80];
         bool has_resolution = false;
-        bool v2 = false, pacing_rev = false;
+        bool v2 = false, pacing_rev = false, up_sharp = false;
         int old_dynres = -1;   // (the row before Resolution: 0, the full scale, is its 100%; 1 is Auto)
         while (fgets(line, sizeof line, f)) {
             char* eq = strchr(line, '=');
@@ -3286,6 +3303,7 @@ void menu_init() {
             has_resolution |= !strcmp(line, "resolution");
             v2 |= !strcmp(line, "options_version");
             pacing_rev |= !strcmp(line, "pacing_rev");
+            up_sharp |= !strcmp(line, "upscaler_sharpness");
             if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
             if (!strcmp(line, "hdr_paper_white")) opts.hdr_paper_white = std::clamp(atoi(eq + 1), 80, 500);   // (relink: HDR)
             if (!strcmp(line, "microphone_device")) {   // (relink: the microphone, by its name)
@@ -3315,6 +3333,9 @@ void menu_init() {
         // it is on for that file too, until the file is saved with pacing_rev (here or by the launcher), which says the row's
         // value was seen as it works now. With frame generation on, the row did what it does: left as saved
         if (!pacing_rev && opts.framegen == 0) opts.pace = 1;
+        // (relink, 0.7.9.3) a file from before DLSS's, DLAA's and FSR's own Sharpness: the one row's value where it was set
+        // (the hints advised 80% for them), else their default
+        if (!up_sharp && opts.sharpness > 0) opts.up_sharpness = opts.sharpness;
     }
     // An opt-in profile for 4 GB cards: keep existing options authoritative, but make a first run usable on
     // low-VRAM hardware without requiring the menu to render first.

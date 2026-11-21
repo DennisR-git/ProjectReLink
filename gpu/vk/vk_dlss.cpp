@@ -53,6 +53,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -60,6 +61,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "dlss_actor.h"
 #include "dlss_math.h"
@@ -626,7 +628,7 @@ bool make_pipelines() {
     const VkDescriptorType prep_types[5] = {S, S, I, I, I}, out_types[2] = {S, I};
     if (!s.prep && !make_pipeline(DLSS_PREP_COMP_SPV, sizeof DLSS_PREP_COMP_SPV, prep_types, 5, 84, s.prep_set, s.prep_layout, s.prep))
         return false;
-    if (!s.out && !make_pipeline(DLSS_OUT_COMP_SPV, sizeof DLSS_OUT_COMP_SPV, out_types, 2, 16, s.out_set, s.out_layout, s.out))
+    if (!s.out && !make_pipeline(DLSS_OUT_COMP_SPV, sizeof DLSS_OUT_COMP_SPV, out_types, 2, 20, s.out_set, s.out_layout, s.out))
         return false;
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
@@ -1544,12 +1546,16 @@ void fg_capture(VkCommandBuffer cmd, State& s, const Camera& cam, const float* b
 /// native AA's picture is at the render size)
 // (relink, 0.7.9.3: the Sharpness row on the 3D alone, before the HUD is drawn over it. The window's pass leaves its own
 // sharpening out meanwhile, upscaler_sharpens. RX_VK_UPSCALER_SHARPEN=0: as before, after the HUD)
-void out_pass(VkCommandBuffer cmd, State& s, VkImageView src, bool same_size, VkImageView out_view, uint32_t ow, uint32_t oh) {
-    const float amount = upscaler_sharpen_on() ? std::clamp(opts.sharpness, 0, 100) / 100.0f : 0.0f;
+void out_pass(VkCommandBuffer cmd, State& s, VkImageView src, bool same_size, VkImageView out_view, uint32_t ow, uint32_t oh,
+              bool linear = false) {
+    // (relink, 0.7.9.3: DLSS's, DLAA's and FSR's own Sharpness value, 50 % by default; None's is the game's own row's)
+    const int row = is_plain(dlss_mode()) ? opts.sharpness : opts.up_sharpness;
+    const float amount = upscaler_sharpen_on() ? std::clamp(row, 0, 100) / 100.0f : 0.0f;
     const struct {
         int32_t size[2];
         float sharp, over;
-    } opc{{(int32_t)ow, (int32_t)oh}, amount * kSharpenGain, amount * kSharpenOver};
+        int32_t linear;   // (the picture is linear colour: its square root first)
+    } opc{{(int32_t)ow, (int32_t)oh}, amount * kSharpenGain, amount * kSharpenOver, linear ? 1 : 0};
     const VkDescriptorImageInfo info[2] = {{same_size ? s.point : s.linear, src, VK_IMAGE_LAYOUT_GENERAL},
                                            {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
@@ -1702,7 +1708,15 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         reset = true, motion = false;
     }
     pc.jitter[0] = cam.jitter[0], pc.jitter[1] = cam.jitter[1];
-    pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh, pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0);
+    // (relink, 0.7.9.3) FSR 3.1 given linear colour: its provider ignores the dispatch's sRGB flag (AMD's FSR 3.1 source reads
+    // no such flag), so the square root of the colour was accumulated and weighed as if it were linear. dlss_prep.comp squares
+    // it (bit 3) and dlss_out.comp takes FSR's linear picture back. FSR 4 is told the colour is gamma-encoded at its creation:
+    // it keeps it. RX_VK_FSR_LINEAR=0 / 1 over the default
+    static const int fsr_linear_env = env_switch("RX_VK_FSR_LINEAR");
+    const bool fsr4_used = fsr && !(s.fsr_flags & FSR_V31) && fsr4_available();
+    const bool fsr_linear = fsr && !fsr4_used && fsr_linear_env > 0;
+    pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh;
+    pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0) | (fsr_linear ? 8 : 0);
 
     full_barrier(cmd);   // (the scene's colour and depth, written before)
     {
@@ -1750,9 +1764,42 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     // (x, y)). RX_VK_FSR_JITTER=flip gives FSR the other sign, a test that it is this one: shaking and a softer picture)
     float jitter_px[2];
     dlss_math::jitter_to_pixels(cam.jitter, rw, rh, jitter_px);
-    if (fsr) {
-        static const bool flip = getenv("RX_VK_FSR_JITTER") && !strcmp(getenv("RX_VK_FSR_JITTER"), "flip");
+    {
+        // (a test that the sign is this one: RX_VK_DLSS_JITTER_TEST=flip gives DLSS or FSR the other sign (a shaking, softer
+        // picture if ours is right); RX_VK_FSR_JITTER=flip as before for FSR alone)
+        static const char* const test = getenv("RX_VK_DLSS_JITTER_TEST");
+        static const bool flip = (test && !strcmp(test, "flip")) ||
+                                 (fsr && getenv("RX_VK_FSR_JITTER") && !strcmp(getenv("RX_VK_FSR_JITTER"), "flip"));
         if (flip) jitter_px[0] = -jitter_px[0], jitter_px[1] = -jitter_px[1];
+        // (RX_VK_DLSS_JITTER_LOG=1: how well the frames cover a pixel. The game takes its jitter from the frames shown
+        // (host/rx_backend.c presents): a frame that got the same offset as the one before, or a sequence that skips, covers
+        // the pixel with fewer points and the picture is softer. Every 600 frames: how many repeated the one before, and how
+        // many distinct offsets the last ones (as many as the sequence's length) had)
+        static const bool jlog = env_switch("RX_VK_DLSS_JITTER_LOG") > 0;
+        if (jlog) {
+            static float prev[2] = {1e9f, 1e9f};
+            static uint64_t frames = 0, repeats = 0, zero = 0;
+            static std::vector<std::pair<float, float>> ring;
+            const uint32_t phases = s.jitter_phases.load(std::memory_order_relaxed);
+            frames++;
+            if (jitter_px[0] == prev[0] && jitter_px[1] == prev[1]) repeats++;
+            if (jitter_px[0] == 0.0f && jitter_px[1] == 0.0f) zero++;
+            prev[0] = jitter_px[0], prev[1] = jitter_px[1];
+            ring.push_back({jitter_px[0], jitter_px[1]});
+            if (phases && ring.size() > phases) ring.erase(ring.begin(), ring.end() - phases);
+            if (frames % 600 == 0) {
+                auto v = ring;
+                std::sort(v.begin(), v.end());
+                const size_t distinct = std::unique(v.begin(), v.end()) - v.begin();
+                logf("vk: %s jitter: %llu frames, %llu the same as the frame before, %llu none; the last %zu: %zu distinct "
+                     "(sequence %u); now %.3f %.3f px", backend_name(mode), (unsigned long long)frames,
+                     (unsigned long long)repeats, (unsigned long long)zero, ring.size(), distinct, phases, jitter_px[0],
+                     jitter_px[1]);
+                frames = repeats = zero = 0;
+            }
+        }
+    }
+    if (fsr) {
         // (FFX takes its inputs in its compute-read state, SHADER_READ_ONLY_OPTIMAL, and leaves them so: they go back to
         // GENERAL after it, for the next frame's prep pass and actor motion. The output stays in GENERAL)
         const Image* inputs[3] = {&s.color, &s.depth, &s.motion};
@@ -1778,7 +1825,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         f.fov_y = cam.fov_y > 0 ? cam.fov_y : 0.8f;
         f.meters = kFsrMeters;
         static const bool linear = env_switch("RX_VK_FSR_SRGB") == 0;
-        f.perceptual = !linear;   // (dlss_prep.comp's colour is the network's input: the square root of the tonemapped colour)
+        f.perceptual = !linear && !fsr_linear;   // (dlss_prep.comp's colour is the network's input: the square root of the tonemapped colour)
         const uint32_t r = fsr_dispatch(s.fsr, cmd, f);
         note_work();   // (FFX's own commands, which vk_work.h does not see)
         layouts(cmd, inputs, 3, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
@@ -1809,7 +1856,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
 #endif
     }
     full_barrier(cmd);
-    out_pass(cmd, s, s.output.view, !native, out_view, ow, oh);
+    out_pass(cmd, s, s.output.view, !native, out_view, ow, oh, fsr_linear);
     s.last_frame = now;
     s.last_jitter[0] = cam.jitter[0], s.last_jitter[1] = cam.jitter[1];
     // (for the status line, dlss_status: the jitter DLSS (or FSR) was given, in render pixels)

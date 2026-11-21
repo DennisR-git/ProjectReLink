@@ -94,7 +94,15 @@ sealed class Settings
                VSync = 0,   // (the game's V-Sync row, saved as v-sync: 0 off, 1 on, FIFO)
                GameSpeed = 0, Handheld = 0, Ultrawide = 0, FpsCounter = 0,
                Upscaler = 0,   // (the game's Upscaler row, saved as dlss: 0 the game's own, 1 NVIDIA DLSS, 2 NVIDIA DLAA, 3 AMD FSR, 4 AMD FSR native AA, 5 none: the 3D at full size, as drawn)
-               FsrVersion = 0;   // (the game's FSR version row: 0 Auto, FSR 4 where the GPU runs it; 1 FSR 3.1)
+               FsrVersion = 0,   // (the game's FSR version row: 0 Auto, FSR 4 where the GPU runs it; 1 FSR 3.1)
+               UpSharpness = 50;   // (relink, 0.7.9.3: the game's Sharpness row while DLSS, DLAA or FSR draws, saved as upscaler_sharpness)
+    /// The Sharpness the game uses with the chosen Upscaler: DLSS's, DLAA's and FSR's own, else the game's own upscaler's (and None's)
+    public bool UpSharpened => Upscaler is 1 or 2 or 3 or 4;
+    public int ShownSharpness
+    {
+        get => UpSharpened ? UpSharpness : Sharpness;
+        set { if (UpSharpened) UpSharpness = value; else Sharpness = value; }
+    }
     // the launcher's
     public bool Display60 = true, Audio = true, InvertY = false;
     /// The game built with NVIDIA DLSS: NVIDIA's DLSS SDK fetched from NVIDIA at each build, its license accepted by ticking it
@@ -186,6 +194,9 @@ sealed class Settings
         Resolution = Int(g, "resolution", 1, 0, 6);
         Upscaling = Int(g, "upscaling", 0, 0, 2);
         Sharpness = Int(g, "sharpness", 0, 0, 100);
+        // (relink, 0.7.9.3: the game's rule, vk_menu.cpp menu_init: DLSS's, DLAA's and FSR's own Sharpness, 50 by default; a
+        // file from before takes the one row's value where it was set)
+        UpSharpness = g.ContainsKey("upscaler_sharpness") ? Int(g, "upscaler_sharpness", 50, 0, 100) : Sharpness > 0 ? Sharpness : 50;
         GameSpeed = Int(g, "game_speed", 0, 0, 1);
         Handheld = Int(g, "handheld_profile", 0, 0, 1);
         Ultrawide = Int(g, "ultrawide", 0, 0, 1);
@@ -213,7 +224,7 @@ sealed class Settings
     static readonly HashSet<string> Known = new(StringComparer.OrdinalIgnoreCase)
     {
         "fullscreen", "frame_generation", "frame_pacing", "v-sync", "frame_rate", "resolution", "upscaling", "sharpness", "game_speed",
-        "handheld_profile", "ultrawide", "fps_counter", "dlss", "pacing_rev", "fsr_version", "menu_look",
+        "handheld_profile", "ultrawide", "fps_counter", "dlss", "pacing_rev", "fsr_version", "menu_look", "upscaler_sharpness",
     };
 
     public void Save()
@@ -241,6 +252,7 @@ sealed class Settings
         Row("resolution", Resolution);
         Row("upscaling", Upscaling);
         Row("sharpness", Sharpness);
+        Row("upscaler_sharpness", UpSharpness);
         Row("game_speed", GameSpeed);
         Row("handheld_profile", Handheld);
         Row("ultrawide", Ultrawide);

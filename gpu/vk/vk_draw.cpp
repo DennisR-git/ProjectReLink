@@ -2278,6 +2278,10 @@ VkSampler sampler_make(int id, bool compare);
 // (relink) set by sampler_make when its sampler could not be made and a stand-in is returned: not kept anywhere, asked for again
 // at the next use (RX_VK_SAMPLER_RETRY=0: a failure is kept as it was)
 thread_local bool sampler_stand_in = false;
+// (relink, 0.7.9.3) whether the draw being recorded draws the 3D scene (its B10G11R11 colour with a depth, at least 640 wide):
+// the upscaler's mip bias for those alone with RX_VK_UPSCALE_LOD_SCOPE=scene. A sampler's bias adds to an explicit level too
+// (Vulkan), so the post passes' reads of their own mip chains (bloom) and the HUD's were biased as well
+thread_local bool lod_scene_draw = false;
 // (each texture of each draw found its sampler through reg_mu, a copy of the registration, a hash of it and a map lookup:
 // ~48000 times a frame at 3000 draws. Now a thread's table by id and compare, good while no sampler registration's contents
 // changed (sampler_registrations_generation). RX_VK_SAMPLER_CACHE=0: off)
@@ -2287,7 +2291,9 @@ VkSampler sampler_for(int id, bool compare) {
     struct Entry { uint64_t gen; float bias; VkSampler s; };
     static thread_local Entry table[2][4096];   // (gen 0: never filled; the generation starts at 1)
     const uint64_t gen = sampler_registrations_generation();   // (read first: a registration after it makes the next call miss)
-    const float bias = compare ? 0.0f : upscaler_lod_bias();   // (relink: the upscaler's mip bias changes the sampler too)
+    static const bool scene_only = getenv("RX_VK_UPSCALE_LOD_SCOPE") && !strcmp(getenv("RX_VK_UPSCALE_LOD_SCOPE"), "scene");
+    // (relink: the upscaler's mip bias changes the sampler too)
+    const float bias = compare || (scene_only && !lod_scene_draw) ? 0.0f : upscaler_lod_bias();
     Entry& e = table[compare ? 1 : 0][id];
     if (e.gen == gen && e.bias == bias) return e.s;
     const VkSampler made = sampler_make(id, compare);
@@ -2303,7 +2309,8 @@ VkSampler sampler_make(int id, bool compare) {
     // render targets the passes read, the HUD's flat textures): the bias changes nothing there but the key
     const bool mipmapped = p.minf == NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST || p.minf == NVN_MIN_FILTER_NEAREST_MIPMAP_LINEAR ||
                            p.minf == NVN_MIN_FILTER_LINEAR_MIPMAP_NEAREST || p.minf == NVN_MIN_FILTER_LINEAR_MIPMAP_LINEAR;
-    if (!compare && mipmapped) p.lod_bias += upscaler_lod_bias();
+    static const bool scene_only = getenv("RX_VK_UPSCALE_LOD_SCOPE") && !strcmp(getenv("RX_VK_UPSCALE_LOD_SCOPE"), "scene");
+    if (!compare && mipmapped && (!scene_only || lod_scene_draw)) p.lod_bias += upscaler_lod_bias();
     uint64_t key = mix(compare ? 0xC0 : 0xAB, aniso_override());
     const uint8_t* b = reinterpret_cast<const uint8_t*>(&p);
     for (size_t i = 0; i < sizeof p; i += 8) {
@@ -6610,6 +6617,9 @@ static void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs&
     n += snprintf(line + n, sizeof line - n, "] d%d %s n%d i%d bv%d inst%d ib%llx g%d,%d,%d ind%llx", (int)at.depth_format,
                   d.indexed ? "idx" : "arr", d.count, d.first, d.base_vertex, d.instances, (unsigned long long)d.ibuf,
                   d.groups[0], d.groups[1], d.groups[2], (unsigned long long)d.indirect);
+    // (relink, 0.7.9.3: what a mask of the see-through draws needs: blending, depth test and write, the first target's id)
+    n += snprintf(line + n, sizeof line - n, " bl%x dt%d dw%d t%d", (unsigned)s.color.blend_en, (int)s.ds.dt, (int)s.ds.dw,
+                  at.n && at.color[0] ? (int)at.color[0]->id : -1);
     for (int v = 0; v < 4 && n < 1800; v++)
         if (s.vbuf[v].address) n += snprintf(line + n, sizeof line - n, " vb%d=%llx/%llu/s%u", v, (unsigned long long)s.vbuf[v].address,
                                              (unsigned long long)s.vbuf[v].size, s.vstream[v].stride);
@@ -6950,6 +6960,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     }
     const Targets at = bare_targets(s, targets(s));
     if (!at.width || !at.height) SKIP_HERE();
+    lod_scene_draw = at.n && at.color[0] && at.depth && at.width >= 640 && at.color_format[0] == VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     // (relink) the scene's camera and depth for NVIDIA DLSS (vk_dlss.cpp): the vertex stage's uniform buffer 3 (NVN's binding 0)
     if (at.n && at.color[0] && at.depth)
         dlss_note_scene_draw(at.color[0], at.width, at.height, at.depth, s.ubo[0][0].addr, s.ubo[0][0].size);
@@ -9360,6 +9371,7 @@ void eager_compute_request(const nvn_prog* p) {
 void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t z, uint64_t indirect) {
     PROF(PROF_DISPATCH);
     handle_memo_next();
+    lod_scene_draw = false;   // (relink: a compute pass is no draw of the scene: sampler_for)
     DispatchClock dclock;
     s.grid[0] = indirect ? 1 : x, s.grid[1] = indirect ? 1 : y, s.grid[2] = indirect ? 1 : z;
     if (indirect) {   // (the program may read its grid from c0: the counts as the GPU will see them, best effort)

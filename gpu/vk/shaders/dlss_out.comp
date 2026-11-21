@@ -13,11 +13,12 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D src;
 layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst;
-layout(push_constant) uniform P { ivec2 size; float sharp; float over; } pc;
+// pc.linear 1: the picture given is linear colour (FSR 3.1's, given linear colour): its square root taken first
+layout(push_constant) uniform P { ivec2 size; float sharp; float over; int linear; } pc;
 vec3 tap(ivec2 g, bool same) {
     const ivec2 q = clamp(g, ivec2(0), pc.size - 1);
     const vec3 c = same ? texelFetch(src, q, 0).rgb : textureLod(src, (vec2(q) + 0.5) / vec2(pc.size), 0.0).rgb;
-    return max(c, vec3(0.0));
+    return pc.linear != 0 ? sqrt(max(c, vec3(0.0))) : max(c, vec3(0.0));
 }
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
