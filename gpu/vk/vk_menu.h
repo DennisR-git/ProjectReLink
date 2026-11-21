@@ -35,7 +35,7 @@ struct Options {
     // (relink: 1 by default, the 3D at the picture's size. Auto ran at 1536 x 864 and below for a 2048 x 1152 picture)
     int resolution = 1;   // the 3D's (Render resolution): 0 Auto (the game's dynamic resolution), else a share of the output,
                           // 1..6 = 100%, 75%, 67%, 50%, 58%, 33% (upscaler_rows.h; nx2/oot_patches.py)
-    int output_res = 0;   // the game's whole frame, docked: 0 its 2048x1152, 1 2560x1440, 2 3840x2160, 3 1920x1080; read once, at the start (host/nn_applet.c)
+    int output_res = 4;   // the game's whole frame, docked: 0 its 2048x1152, 1 2560x1440, 2 3840x2160, 3 1920x1080, 4 Auto (the default: the largest that fits the screen, up to 2560x1440); read once, at the start (host/nn_applet.c)
     int upscale = 0;      // to the window (Window scaling filter, saved as upscaling): 0 off (the plain copy), 1 Catmull-Rom, 2 Lanczos
     int reflex = 0;       // NVIDIA Reflex: 0 off, 1 on, 2 on + boost (vk_reflex.cpp; NVIDIA GPUs with VK_NV_low_latency2)
     int dlss = 0;         // the Upscaler: 0 the game's own network, 1 NVIDIA DLSS, 2 NVIDIA DLAA (vk_dlss.cpp; a build with NVIDIA's

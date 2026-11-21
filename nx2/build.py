@@ -924,8 +924,15 @@ def main():
     # so it is in their keys alone and the other chunks' objects stay when it changes
     hot_inc = os.path.join(gen, "a64_hot_fp.inc")
     hot_deps = deps + (open(hot_inc, "rb").read() if os.path.exists(hot_inc) else b"")
+    # (relink, 20/11) the cold game code (code_*.c outside the hot pieces, 68 % of a full build's CPU) with LLVM's fast
+    # instruction selector and no machine scheduler: 13-15 % less time on each part (three parts measured alone, 18.6 -> 17.0,
+    # 19.7 -> 17.2, 12.2 -> 10.4 s), the exe 42 MB larger (521 against 479). The cold code is ~15 % of the lifted code's running
+    # time at the Market (hot list: 85 %): frame rate unchanged within the bench's noise (Lost Woods 88.1 / 88.8 against
+    # 88.0 / 88.7; Market medians ~86 against ~85 over 4 runs a side). RX_COLD_FAST=0: as before
+    cold_fl = fl + (["-mllvm", "-fast-isel", "-mllvm", "-enable-misched=false"] if os.environ.get("RX_COLD_FAST") != "0" else [])
     jobs = [(cc, s, os.path.join(obj_dir, os.path.basename(s)[:-2] + ".o"),
-             giant_flags(s, hot_fl if os.path.basename(s).startswith("code_hot") else fl),
+             giant_flags(s, hot_fl if os.path.basename(s).startswith("code_hot")
+                         else cold_fl if os.path.basename(s).startswith("code_") else fl),
              shim_deps if os.path.dirname(s) == NX2_RT else hot_deps if os.path.basename(s).startswith("code_hot") else deps)
             for s in srcs]
     # (issue 624) what the game code's object keys are made of, as short fingerprints: two builds' logs side by side say which part

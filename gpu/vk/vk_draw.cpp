@@ -6928,6 +6928,10 @@ void tex_of_note(const NvnState& s, const Program& p, const Targets* at, const N
 }
 
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+    // (relink, diagnostic, the frame's slack map) RX_VK_SKIP_ALL_DRAWS=1: every draw left out before any work (the picture is
+    // wrong): what the frame rate would be with a replay that costs nothing for its draws
+    static const bool skip_all = getenv("RX_VK_SKIP_ALL_DRAWS") && atoi(getenv("RX_VK_SKIP_ALL_DRAWS")) != 0;
+    if (skip_all) return;
     FineScope fine_prep(FT_PREP);
     FineScope fine_targets(FT_TARGETS);
     Pass& ps = pass();   // One TLS accessor for this recording thread's pass state.
