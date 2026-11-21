@@ -81,6 +81,7 @@
 
 #include "shaders/dlss_actor_frag_spv.h"
 #include "shaders/dlss_actor_vert_spv.h"
+#include "shaders/dlss_mask_comp_spv.h"
 #include "shaders/dlss_out_comp_spv.h"
 #include "shaders/dlss_prep_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -205,6 +206,18 @@ struct State {
     VkPipelineLayout prep_layout = VK_NULL_HANDLE, out_layout = VK_NULL_HANDLE;
     VkPipeline prep = VK_NULL_HANDLE, out = VK_NULL_HANDLE;
     VkSampler point = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
+    // (relink, 0.7.9.3) the see-through mask (dlss_mask.comp): the solid picture, the mask, the GPU's flags; its pipeline
+    Image opaque, mask, mask_flags, mask_dummy;
+    Image delta[2];   // (what the blended draws added, this frame's and the frame before's: by the frame's parity)
+    VkDescriptorSetLayout mask_set = VK_NULL_HANDLE;
+    VkPipelineLayout mask_layout = VK_NULL_HANDLE;
+    VkPipeline mask_pipe = VK_NULL_HANDLE;
+    bool mask_failed = false;
+    uint64_t mask_frame = 0;          // (the last frame a piece took the solid picture: the upscale's mask is this frame's)
+    // (the image the upscale was last given as the scene: other targets of its size and format (the characters' skin, drawn
+    // apart) are not it)
+    std::atomic<VkImage> scene_image{VK_NULL_HANDLE};
+    uint64_t mask_snaps = 0, mask_frames = 0, mask_given = 0, mask_ends = 0, mask_logged = 0;   // (for the status line: solid pictures taken, frames with one)
     Camera cam;               // (this frame's, since the last upscale)
     std::atomic<uint64_t> last_frame{0};   // (the frame DLSS last drew: read on the game's thread too)
     float last_jitter[2]{};   // (its camera's jitter: the frame before's, for the next one)
@@ -214,6 +227,9 @@ struct State {
     std::atomic<uint32_t> jitter_phases{8};           // (its sequence's length, for DLSS's scale: dlss_jitter_phases)
     std::unordered_map<VkImage, VkImageView> depth_views;
     uint64_t depth_views_gen = 0;
+    // (relink, 0.7.9.3: the scene colour's plain 2D views, for the see-through mask: the pass's attachment view reads nothing)
+    std::unordered_map<VkImage, VkImageView> color_views;
+    uint64_t color_views_gen = 0;
     const char* reason = nullptr;
     int reason_repeats = 0;
     // (actor motion: the skinned draws into the scene since the last upscale; the poses DLSS last drew, by draw: the
@@ -639,6 +655,166 @@ bool make_pipelines() {
     return true;
 }
 
+}  // namespace
+
+// ---- (relink, 0.7.9.3) the see-through mask (shaders/dlss_mask.comp) ----
+// DLSS and FSR were told nothing of the scene's blended draws (fire, smoke, particles, water, glass): they took this frame's
+// colour there as the surface under them, with that surface's motion, and the history trailed them. The game draws them after
+// its solid draws (a traced Market frame: ~1500 solid ones, then the blended ones mixed with some that write no depth): the
+// solid picture is taken before the first blended draw into the scene (the image the upscale is given, not the characters'
+// skin drawn apart at the same size), what the blended draws added is taken at the end of each piece of the frame that drew
+// them (the GPU keeps the first picture and the last difference: dlss_mask.comp), and at the upscale the mask is where that
+// changed since the frame before, followed by the motion: Navi, flames, sparks, flowing water; not fog or haze over still
+// houses, which the history holds well (a mask of everything they add covered the Market's far castle). DLSS gets it as its
+// bias towards the current colour, FSR as its reactive mask. RX_VK_DLSS_MASK=0: off (on by default: no frame
+// rate cost measured at the Market, 83.6 / 83.8 fps with it, 83.8 without); RX_VK_DLSS_MASK_LO / _HI: the change (as the eye weighs it, 0 to 1) from which the mask starts and where it is
+// full (0.04, 0.2); _MOST: its top (0.9); RX_VK_DLSS_DEBUG=mask: the mask shown in the picture (magenta)
+namespace {
+thread_local uint64_t tl_mask_frame = 0;   // (the frame this recording thread took the solid picture in)
+bool mask_on() {
+    static const bool on = env_switch("RX_VK_DLSS_MASK") != 0;
+    return on;
+}
+float env_float(const char* name, float fallback) {
+    const char* e = getenv(name);
+    return e && *e ? (float)atof(e) : fallback;
+}
+bool make_mask_pipeline(State& s) {
+    if (s.mask_pipe) return true;
+    if (s.mask_failed || !dev.push_descriptor || !vkCmdPushDescriptorSetKHR || !make_pipelines()) return false;
+    const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    const VkDescriptorType types[6] = {S, I, I, I, I, I};
+    if (make_pipeline(DLSS_MASK_COMP_SPV, sizeof DLSS_MASK_COMP_SPV, types, 6, 32, s.mask_set, s.mask_layout, s.mask_pipe))
+        return true;
+    s.mask_failed = true;
+    logf("vk: the upscalers' see-through mask: its shader was not made: none");
+    return false;
+}
+/// A plain 2D view of a colour texture's first level and layer, for sampling (made once per image; under s.mu)
+VkImageView scene_color_view(State& s, Texture* t) {
+    const uint64_t gen = texture_destroy_generation();
+    if (gen != s.color_views_gen) {   // (a texture was destroyed: its image's view may be stale)
+        auto old = std::move(s.color_views);
+        s.color_views.clear();
+        later([old] {
+            for (const auto& [image, view] : old) vkDestroyImageView(dev.device, view, nullptr);
+        });
+        s.color_views_gen = gen;
+    }
+    if (auto it = s.color_views.find(t->image); it != s.color_views.end()) return it->second;
+    VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vc.image = t->image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = t->format;
+    vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageView v = VK_NULL_HANDLE;
+    if (vkCreateImageView(dev.device, &vc, nullptr, &v) != VK_SUCCESS) v = VK_NULL_HANDLE;
+    s.color_views[t->image] = v;
+    static std::atomic<int> told{0};
+    if (told++ < 2) logf("vk: see-through mask: the scene's colour %ux%u, format %d, %u levels, %u layers: its view %s", t->width,
+                         t->height, (int)t->format, t->levels, t->layers, v ? "made" : "NOT made");
+    return v;
+}
+/// The flags image (4 x 1), made and cleared once; and a 1 x 1 stand-in for the motion where a step reads none
+bool make_mask_flags(VkCommandBuffer cmd, State& s) {
+    if (!s.mask_dummy.image && !make_image(cmd, s.mask_dummy, VK_FORMAT_R16G16_SFLOAT, 1, 1)) return false;
+    if (s.mask_flags.image) return true;
+    if (!make_image(cmd, s.mask_flags, VK_FORMAT_R32_UINT, 4, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return false;
+    VkClearColorValue v{};
+    v.uint32[0] = v.uint32[1] = v.uint32[2] = v.uint32[3] = 0xffffffffu;
+    const VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    full_barrier(cmd);
+    vkCmdClearColorImage(cmd, s.mask_flags.image, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &r);
+    full_barrier(cmd);
+    return true;
+}
+/// One step of dlss_mask.comp (its modes there): scene, the sampled view (the scene's colour, or the frame before's difference);
+/// opaque, delta and motion its images (none: the solid picture, this frame's difference, the stand-in)
+void mask_pass(VkCommandBuffer cmd, State& s, int mode, int which, VkImageView scene, VkImageView opaque, uint32_t w, uint32_t h,
+               VkImageView delta = VK_NULL_HANDLE, VkImageView motion = VK_NULL_HANDLE) {
+    static const float lo = env_float("RX_VK_DLSS_MASK_LO", 0.04f), hi = env_float("RX_VK_DLSS_MASK_HI", 0.2f),
+                       most = env_float("RX_VK_DLSS_MASK_MOST", 0.9f);
+    const struct {
+        int32_t size[2];
+        uint32_t frame;
+        int32_t mode, which;
+        float lo, hi, most;
+    } pc{{(int32_t)w, (int32_t)h}, (uint32_t)texture_frame_no(), mode, which, lo, hi, most};
+    const VkImageView dv = delta ? delta : s.delta[texture_frame_no() & 1].view;
+    const VkDescriptorImageInfo info[6] = {{s.linear, scene ? scene : s.opaque.view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, opaque ? opaque : s.opaque.view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, s.mask.view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, s.mask_flags.view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, dv, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, motion ? motion : s.mask_dummy.view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[6]{};
+    for (uint32_t i = 0; i < 6; i++) {
+        wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wr[i].dstBinding = i, wr[i].descriptorCount = 1, wr[i].pImageInfo = &info[i];
+        wr[i].descriptorType = i == 0 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.mask_pipe);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.mask_layout, 0, 6, wr);
+    vkCmdPushConstants(cmd, s.mask_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    if (mode == 3) vkCmdDispatch(cmd, 1, 1, 1);
+    else vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+}
+/// The scene's mask is wanted now: DLSS or FSR drew lately, and this target is the scene's size
+bool mask_wanted(State& s, Texture* t, uint32_t w, uint32_t h) {
+    if (!mask_on() || !t || t->image != s.scene_image.load(std::memory_order_relaxed)) return false;
+    const int mode = dlss_mode();
+    if (!mode || is_plain(mode)) return false;
+    const uint64_t last = s.last_frame.load(std::memory_order_relaxed);
+    if (!last || texture_frame_no() - last > 30) return false;
+    std::lock_guard lk(s.mu);
+    return s.cam.width == w && s.cam.height == h;
+}
+}  // namespace
+
+void dlss_scene_blended(VkCommandBuffer cmd, Texture* color0, VkImageView view, uint32_t w, uint32_t h) {
+    const uint64_t now = texture_frame_no();
+    if (tl_mask_frame == now || !color0 || !view) return;
+    State& s = st();
+    if (!mask_wanted(s, color0, w, h)) return;
+    end_pass(cmd);   // (vk_draw.cpp's: the draw opens it again)
+    std::lock_guard lk(s.mu);
+    if (!make_mask_pipeline(s)) return;
+    if (!make_image(cmd, s.opaque, VK_FORMAT_R16G16B16A16_SFLOAT, w, h) || !make_image(cmd, s.mask, VK_FORMAT_R32_SFLOAT, w, h) ||
+        !make_image(cmd, s.delta[0], VK_FORMAT_R16G16B16A16_SFLOAT, w, h) ||
+        !make_image(cmd, s.delta[1], VK_FORMAT_R16G16B16A16_SFLOAT, w, h) || !make_mask_flags(cmd, s))
+        return;
+    const VkImageView sv = scene_color_view(s, color0);
+    if (!sv || color0->width != w || color0->height != h) return;
+    tl_mask_frame = now;
+    full_barrier(cmd);   // (the solid draws, written)
+    mask_pass(cmd, s, 0, 0, sv, s.opaque.view, w, h);
+    full_barrier(cmd);
+    mask_pass(cmd, s, 3, 0, VK_NULL_HANDLE, s.opaque.view, w, h);
+    full_barrier(cmd);
+    descriptors_disturbed();
+    if (s.mask_frame != now) s.mask_frames++;
+    s.mask_frame = now, s.mask_snaps++;
+}
+
+void dlss_scene_pass_end(VkCommandBuffer cmd, Texture* color0, VkImageView view, uint32_t w, uint32_t h) {
+    if (tl_mask_frame != texture_frame_no() || !color0 || !view) return;   // (this thread took no solid picture this frame)
+    State& s = st();
+    if (color0->image != s.scene_image.load(std::memory_order_relaxed)) return;
+    std::lock_guard lk(s.mu);
+    if (!s.mask_pipe || s.mask.width != w || s.mask.height != h || !s.mask_flags.image) return;
+    const VkImageView sv = scene_color_view(s, color0);
+    if (!sv || color0->width != w || color0->height != h) return;
+    full_barrier(cmd);   // (the blended draws, written)
+    const uint64_t now = texture_frame_no();
+    if (s.delta[now & 1].width != w || s.delta[now & 1].height != h) return;
+    mask_pass(cmd, s, 1, 0, sv, s.opaque.view, w, h, s.delta[now & 1].view);
+    full_barrier(cmd);
+    mask_pass(cmd, s, 3, 1, VK_NULL_HANDLE, s.opaque.view, w, h);
+    mask_pass(cmd, s, 3, 2 + (int)(now & 1), VK_NULL_HANDLE, s.opaque.view, w, h);
+    full_barrier(cmd);
+    descriptors_disturbed();
+    s.mask_ends++;
+}
+
+namespace {
 /// A view of a depth texture's depth alone, for sampling (made once per image)
 VkImageView depth_view(Texture* t) {
     State& s = st();
@@ -1394,7 +1570,14 @@ void dlss_idle() {
              "the next upscale with it makes them again", name, (unsigned long long)idle, (unsigned long long)s.asked,
              (unsigned long long)now, !strcmp(name, "AMD FSR") ? "upscaler" : "feature");
     }
-    for (Image* im : {&s.color, &s.depth, &s.motion, &s.output}) drop_image(*im);
+    for (Image* im : {&s.color, &s.depth, &s.motion, &s.output, &s.opaque, &s.mask, &s.delta[0], &s.delta[1]}) drop_image(*im);
+    {   // (relink, 0.7.9.3: the scene colour views the mask made)
+        auto old = std::move(s.color_views);
+        s.color_views.clear();
+        later([old] {
+            for (const auto& [image, view] : old) vkDestroyImageView(dev.device, view, nullptr);
+        });
+    }
     for (auto& f : s.fg_slots) drop_image(f.depth), drop_image(f.motion), f.used = true;
 #ifdef RELINK_NGX
     if (s.fg_feature) {   // (DLSS Frame Generation's, with the inputs it takes)
@@ -1621,6 +1804,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     }
     const Camera cam = s.cam;
     s.cam.valid = false;   // (each frame's own camera)
+    if (in) s.scene_image.store(in->image, std::memory_order_relaxed);   // (relink, 0.7.9.3: the see-through mask's target)
     struct SkinsDone {     // (the skinned draws, each frame's own too: actor_motion takes them, or they go here)
         State& s;
         ~SkinsDone() { s.skins.clear(); }
@@ -1719,6 +1903,19 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0) | (fsr_linear ? 8 : 0);
 
     full_barrier(cmd);   // (the scene's colour and depth, written before)
+    // (relink, 0.7.9.3: this frame's see-through mask, when the scene's pieces made one: dlss_mask.comp mode 2 clears one of
+    // an older frame, so a frame without blended draws gives none)
+    static const bool show_mask = getenv("RX_VK_DLSS_DEBUG") && !strcmp(getenv("RX_VK_DLSS_DEBUG"), "mask");
+    const bool use_mask = mask_on() && s.mask_pipe && s.mask.image && s.mask.width == rw && s.mask.height == rh &&
+                          s.delta[0].width == rw && s.delta[0].height == rh && s.delta[1].width == rw &&
+                          s.delta[1].height == rh && s.mask_flags.image && now - s.mask_frame <= 1;
+    if (use_mask) s.mask_given++;
+    if (mask_on() && ++s.mask_logged % 600 == 0) {
+        logf("vk: see-through mask: of the last 600 upscales %llu given it; %llu frames took the solid picture (%llu times), %llu "
+             "masks made", (unsigned long long)s.mask_given, (unsigned long long)s.mask_frames, (unsigned long long)s.mask_snaps,
+             (unsigned long long)s.mask_ends);
+        s.mask_frames = s.mask_snaps = s.mask_given = s.mask_ends = 0;
+    }
     {
         const VkDescriptorImageInfo info[5] = {{s.point, in_view, VK_IMAGE_LAYOUT_GENERAL},
                                                {s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
@@ -1740,6 +1937,19 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     // (what moves by itself: the skinned draws drawn again over the camera's motion, with their own)
     const int actors = actor_motion(cmd, cam, previous, rw, rh, dview, motion);
     if (actors) full_barrier(cmd);
+    if (use_mask) {   // (the mask: this frame's difference against the frame before's, where the motion says it was)
+        mask_pass(cmd, s, 6, 0, s.delta[(now - 1) & 1].view, s.opaque.view, rw, rh, s.delta[now & 1].view, s.motion.view);
+        full_barrier(cmd);
+    }
+    if (show_mask && use_mask) {   // (RX_VK_DLSS_DEBUG=mask: the mask over the colour the upscaler is given)
+        mask_pass(cmd, s, 4, 0, VK_NULL_HANDLE, s.color.view, rw, rh);
+        full_barrier(cmd);
+    }
+    static const bool show_opaque = getenv("RX_VK_DLSS_DEBUG") && !strcmp(getenv("RX_VK_DLSS_DEBUG"), "opaque");
+    if (show_opaque && use_mask) {   // (RX_VK_DLSS_DEBUG=opaque: the solid picture taken, instead of the colour)
+        mask_pass(cmd, s, 5, 0, s.opaque.view, s.color.view, rw, rh);
+        full_barrier(cmd);
+    }
     if (show_motion && actors) {   // (RX_VK_DLSS_DEBUG=motion: the motion as it is now, the actors' in it)
         pc.flags = 4;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.prep);
@@ -1802,13 +2012,15 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     if (fsr) {
         // (FFX takes its inputs in its compute-read state, SHADER_READ_ONLY_OPTIMAL, and leaves them so: they go back to
         // GENERAL after it, for the next frame's prep pass and actor motion. The output stays in GENERAL)
-        const Image* inputs[3] = {&s.color, &s.depth, &s.motion};
-        layouts(cmd, inputs, 3, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        const Image* inputs[4] = {&s.color, &s.depth, &s.motion, &s.mask};
+        const int n_inputs = use_mask ? 4 : 3;
+        layouts(cmd, inputs, n_inputs, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         FsrFrame f;
         f.color = {s.color.image, s.color.format, s.color.width, s.color.height};
         f.depth = {s.depth.image, s.depth.format, s.depth.width, s.depth.height};
         f.motion = {s.motion.image, s.motion.format, s.motion.width, s.motion.height};
         f.output = {s.output.image, s.output.format, s.output.width, s.output.height};
+        if (use_mask) f.reactive = {s.mask.image, s.mask.format, s.mask.width, s.mask.height};
         f.jitter[0] = jitter_px[0], f.jitter[1] = jitter_px[1];
         // (dlss_prep.comp's motion is where the pixel was in the frame before minus where it is, in render pixels, without
         // the jitter: FFX's convention with a scale of 1, which it divides by the render size itself)
@@ -1828,7 +2040,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         f.perceptual = !linear && !fsr_linear;   // (dlss_prep.comp's colour is the network's input: the square root of the tonemapped colour)
         const uint32_t r = fsr_dispatch(s.fsr, cmd, f);
         note_work();   // (FFX's own commands, which vk_work.h does not see)
-        layouts(cmd, inputs, 3, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+        layouts(cmd, inputs, n_inputs, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
         if (r) {
             logf("vk: AMD FSR: its dispatch failed (FFX's code %u): the game's upscale from now on", r);
             s.fsr_failed = true;
@@ -1843,6 +2055,8 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         ep.Feature.pInColor = &color, ep.Feature.pInOutput = &output;
         ep.pInDepth = &depth, ep.pInMotionVectors = &mv;
         ep.InJitterOffsetX = jitter_px[0], ep.InJitterOffsetY = jitter_px[1];
+        NVSDK_NGX_Resource_VK bias = use_mask ? resource(s.mask, false) : NVSDK_NGX_Resource_VK{};
+        if (use_mask) ep.pInBiasCurrentColorMask = &bias, ep.InBiasCurrentColorSubrectBase = {0, 0};   // (relink: the see-through mask)
         ep.InRenderSubrectDimensions = {rw, rh};
         ep.InReset = reset ? 1 : 0;
         ep.InMVScaleX = ep.InMVScaleY = 1.0f;

@@ -5310,6 +5310,9 @@ void end_pass(VkCommandBuffer cmd) {
         full_barrier(cmd, "barrier (stand-in out)");
         ps.stand_in = 0;
     }
+    // (relink, 0.7.9.3: the upscalers' see-through mask from what the pass's blended draws changed: vk_dlss.cpp)
+    if (ps.n && ps.tex[0] && ps.depth_tex && ps.format0 == VK_FORMAT_B10G11R11_UFLOAT_PACK32)
+        dlss_scene_pass_end(cmd, ps.tex[0], ps.color[0], ps.width, ps.height);
     if (dump_on() && !dump_mesh_indirect().empty()) {
         for (const auto& [key, addr] : dump_mesh_indirect()) {
             const BufferRef r = gpu_buffer_bind(addr, 16, false);
@@ -7437,6 +7440,8 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (peek_prog(p.key)) peek_draw(cmd, p.key);   // (relink: RX_VK_PEEK_PROG)
     if (p.fallback && d.mesh && !fallback_record(cmd, p, d)) SKIP_HERE();
     fine_prepass.finish();
+    // (relink, 0.7.9.3: the solid picture before the scene's first blended draw, for the upscalers' see-through mask)
+    if (lod_scene_draw && (s.color.blend_en & 1)) dlss_scene_blended(cmd, at.color[0], at.color_view[0], at.width, at.height);
     {
         FINE_SCOPE(FT_HAZARD);
         begin_pass(cmd, at);

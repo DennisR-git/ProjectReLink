@@ -71,6 +71,7 @@ struct FsrImage {
 };
 struct FsrFrame {
     FsrImage color, depth, motion, output;
+    FsrImage reactive;          // (relink, 0.7.9.3: the see-through mask, vk_dlss.cpp; none: image VK_NULL_HANDLE)
     float jitter[2]{};          // (the camera's sub-pixel offset, in render pixels: x right, y down)
     float motion_scale[2]{};    // (what the motion vectors are multiplied by to be in render pixels)
     uint32_t render_w = 0, render_h = 0, out_w = 0, out_h = 0;

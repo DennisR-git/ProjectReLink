@@ -54,6 +54,11 @@ void dlss_note_skinned_draw(const DlssSkin& k);
 /// (0.7.9.3) A rigid draw into a scene-sized target: no joints, the object's buffer (k.object) starting with its 3 x 4 world
 /// matrix. Where that matrix moved since the frame before, the draw is drawn again with both (vk_dlss.cpp actor_motion)
 void dlss_note_rigid_draw(const DlssSkin& k);
+/// (relink, 0.7.9.3) The see-through mask (vk_dlss.cpp; RX_VK_DLSS_MASK=0: none): vk_draw.cpp's draw before a blended draw into a
+/// scene-like target (B10G11R11 with a depth: color0, its view and size), outside a pass (it ends the open one); and end_pass
+/// as a pass into such a target ends
+void dlss_scene_blended(VkCommandBuffer cmd, Texture* color0, VkImageView view, uint32_t w, uint32_t h);
+void dlss_scene_pass_end(VkCommandBuffer cmd, Texture* color0, VkImageView view, uint32_t w, uint32_t h);
 
 /// A gameplay upscale's dispatch (program `key`; vk_draw.cpp's dlss_stand_in finds them: the 4/3 network fd029a317a9a4b94 at
 /// the game's usual 3/4, the same-size pass 9dc98871eb7fc101 at full size, and one network of its own for each other share): its input as it samples it (in, in_view) and its output's storage

@@ -393,7 +393,9 @@ uint32_t fsr_dispatch(FsrContext* c, VkCommandBuffer cmd, const FsrFrame& f) {
     d.depth = resource(f.depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     d.motionVectors = resource(f.motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     d.output = resource(f.output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
-    // (no exposure, reactive or transparency mask: empty resources)
+    // (no exposure or transparency mask: empty resources. relink, 0.7.9.3: the reactive mask where vk_dlss.cpp made one, the
+    // scene's blended draws: FFX's guide asks for it for particles and alpha-blended things)
+    if (f.reactive.image) d.reactive = resource(f.reactive, FFX_API_RESOURCE_STATE_COMPUTE_READ);
     d.jitterOffset = {f.jitter[0], f.jitter[1]};
     d.motionVectorScale = {f.motion_scale[0], f.motion_scale[1]};
     d.renderSize = {f.render_w, f.render_h};
