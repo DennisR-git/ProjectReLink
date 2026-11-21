@@ -281,6 +281,7 @@ struct State {
     NVSDK_NGX_Parameter* fg_params = nullptr;
 #endif
     uint32_t fg_w = 0, fg_h = 0;
+    uint64_t fg_eval_frame = 0;   // (the frame whose inputs it was last given)
     uint64_t fg_made = 0, fg_frames = 0, fg_status_frames = 0, fg_last = 0, fg_missed = 0, fg_status_missed = 0;
     // (each upscale's inputs for it, two frames of them in turn: the depth and motion as DLSS was given them, the camera.
     // The frame generator runs in the present's recording; the next frame's upscale may be recorded first)
@@ -767,15 +768,16 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
     s.rigid_same_before.clear();
     const auto& rigid_old = s.rigid_old;
     const bool rigid_history = history && s.rigid_frame == s.last_frame && s.rigid_frame;
-    const auto same_key = [](const State::Rigid& r) {
-        uint64_t h = r.model;
+    const auto key_of = [](uint64_t model, const float* m) {
+        uint64_t h = model;
         for (int i = 0; i < 12; i++) {
             uint32_t w;
-            std::memcpy(&w, &r.m[i], 4);
+            std::memcpy(&w, &m[i], 4);
             h = (h ^ w) * 0x100000001b3ull;
         }
         return h;
     };
+    const auto same_key = [&](const State::Rigid& r) { return key_of(r.model, r.m); };
     for (const auto& r : rigids)
         if (r.k.depth == cam.depth) {
             auto& v = s.rigid_before[r.model];
@@ -868,6 +870,9 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
             if (i < 0) continue;
             was = it->second.data() + (size_t)i * 12;
             if (dlss_actor::same_3x4(r.m, was)) continue;
+            // (a matrix of the frame before that a draw of this frame still holds is that object, still in place: not this
+            // one's. A copy of a repeated model newly in view (a fence post, a step) would otherwise take its neighbour's)
+            if (s.rigid_same_before.count(key_of(r.model, was))) continue;
         }
         s.rigid_models[r.model] = texture_frame_no();
         if (at + 128 > kPoseBytes) break;
@@ -1182,8 +1187,12 @@ void dlss_device_extensions(std::vector<const char*>& want, const std::vector<Vk
     // dlss_probe or at the first upscale: a GTX has them too)
     if (!both) g_why = DLSS_NEEDS_RTX;
     // (relink, 0.7.9.3) What NGX asks of the device for DLSS Frame Generation, before the device is made (its guide: NGX's
-    // feature requirements), on an NVIDIA device only: each one the device has is turned on, and said with what is missing
-    if (both && dev.physical && dev.instance && dev.props.vendorID == 0x10DE && env_switch("RX_VK_DLSSG") != 0) {
+    // feature requirements), on an NVIDIA device only: each one the device has is turned on, and said with what is missing.
+    // Only when the Frame generator row asks for it (the options are read before the device is made): the question took
+    // 1.7 s of the start on the bench's 3060 Ti (21/11). What it asked there (VK_NVX_binary_import, VK_NVX_image_view_handle,
+    // VK_KHR_buffer_device_address, VK_KHR_push_descriptor) the device has on anyway, so the row chosen in play needs no
+    // restart where NGX asks no more than that (an RTX 40's answer: not seen)
+    if (both && dev.physical && dev.instance && dev.props.vendorID == 0x10DE && dlssg_asked()) {
         const std::vector<fs::path> dirs = ngx_dirs();
         std::vector<std::wstring> wdirs;
         for (const auto& d : dirs) wdirs.push_back(wide(d));
@@ -1199,6 +1208,7 @@ void dlss_device_extensions(std::vector<const char*>& want, const std::vector<Vk
         d.Identifier.v.ProjectDesc = {kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0"};
         d.ApplicationDataPath = wdata.c_str();
         d.FeatureInfo = &common;
+        const auto t0 = std::chrono::steady_clock::now();
         uint32_t count = 0;
         VkExtensionProperties* props = nullptr;
         const NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(dev.instance, dev.physical, &d, &count, &props);
@@ -1218,8 +1228,9 @@ void dlss_device_extensions(std::vector<const char*>& want, const std::vector<Vk
         }
         NVSDK_NGX_FeatureRequirement req{};
         const NVSDK_NGX_Result q = NVSDK_NGX_VULKAN_GetFeatureRequirements(dev.instance, dev.physical, &d, &req);
-        logf("vk: NVIDIA DLSS Frame Generation's device extensions (%#x): %u asked%s%s%s%s; its requirements (%#x): %s "
-             "(flags %#x, architecture %#x or later)", (unsigned)r, count, added.empty() ? "" : ", on: ", added.c_str(),
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        logf("vk: NVIDIA DLSS Frame Generation's device extensions (%#x, asked in %.1f ms): %u asked%s%s%s%s; its requirements (%#x): %s "
+             "(flags %#x, architecture %#x or later)", (unsigned)r, ms, count, added.empty() ? "" : ", on: ", added.c_str(),
              missing.empty() ? "" : ", not on this device: ", missing.c_str(), (unsigned)q,
              NVSDK_NGX_SUCCEED(q) && req.FeatureSupported == 0 ? "supported" : "not supported here", (unsigned)req.FeatureSupported,
              req.MinHWArchitecture);
@@ -1916,7 +1927,10 @@ int dlssg_generate(VkCommandBuffer cmd, VkImage back, VkImageView back_view, con
     static const bool ours = getenv("RX_VK_DLSSG_MATRIX") && !strcmp(getenv("RX_VK_DLSSG_MATRIX"), "plain");
     dlss_math::FgCamera cam{};
     const bool camera = dlss_math::fg_camera(f->vp, f->before, f->proj, ours, &cam);
-    const bool cut = f->reset || reset || !camera;
+    // (NGX blends this picture with the last it was given: a frame without its inputs in between (ReLink's made) leaves that
+    // one two frames old, so the history is reset then too)
+    const bool cut = f->reset || reset || !camera || s.fg_eval_frame + 1 != f->frame;
+    s.fg_eval_frame = f->frame;
     const int frames = std::min(n, dlssg_max_frames());
     static const bool trace = env_switch("RX_VK_DLSSG_LOG") > 0;
     static uint64_t traced = 0;   // (the first 4, then one every 600: a later one is the play's camera, not the title's)
