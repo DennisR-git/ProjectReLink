@@ -518,11 +518,11 @@ void apply_preset(int p) {
 }
 
 MENU_HINTS(hn_preset, 0, "Each row as you set it. Changing most rows yourself comes back to Custom.",
-           "Resolution 50% (with DLSS its nearest mode), Lanczos, Sharpness 50%, 2x frames, Handheld profile.",
-           "Resolution 75% (with DLSS its nearest mode), Lanczos, Sharpness 35%, 2x frames, Handheld profile.",
-           "Resolution 100% (with DLSS its nearest mode), Catmull-Rom, Sharpness 25%, 2x frames.",
-           "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 30%, 2x frames.",
-           "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 40%, 3x frames.")
+           "Resolution 50% (with DLSS its nearest mode), Lanczos, Sharpness 50% (the game's own upscaler), 2x frames, Handheld profile.",
+           "Resolution 75% (with DLSS its nearest mode), Lanczos, Sharpness 35% (the game's own upscaler), 2x frames, Handheld profile.",
+           "Resolution 100% (with DLSS its nearest mode), Catmull-Rom, Sharpness 25% (the game's own upscaler), 2x frames.",
+           "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 30% (the game's own upscaler), 2x frames.",
+           "Resolution 100% (with DLSS its nearest mode), Lanczos, Sharpness 40% (the game's own upscaler), 3x frames.")
 MENU_HINTS(hn_gpu, 0, "The best dedicated GPU.")
 /// Frame generation: how many frames are made for each of the game's
 const char* hn_framegen(int v, int variant) {

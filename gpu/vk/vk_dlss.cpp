@@ -714,10 +714,12 @@ VkImageView scene_color_view(State& s, Texture* t) {
     return v;
 }
 /// The flags image (4 x 1), made and cleared once; and a 1 x 1 stand-in for the motion where a step reads none
-bool make_mask_flags(VkCommandBuffer cmd, State& s) {
+bool make_mask_flags(VkCommandBuffer cmd, State& s, bool clear) {
     if (!s.mask_dummy.image && !make_image(cmd, s.mask_dummy, VK_FORMAT_R16G16_SFLOAT, 1, 1)) return false;
-    if (s.mask_flags.image) return true;
-    if (!make_image(cmd, s.mask_flags, VK_FORMAT_R32_UINT, 4, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return false;
+    if (s.mask_flags.image && !clear) return true;
+    // (cleared too when the images were made again at another size, the 3D's (Render resolution Auto): what the flags say of
+    // the frame before is then of images that are gone)
+    if (!s.mask_flags.image && !make_image(cmd, s.mask_flags, VK_FORMAT_R32_UINT, 4, 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT)) return false;
     VkClearColorValue v{};
     v.uint32[0] = v.uint32[1] = v.uint32[2] = v.uint32[3] = 0xffffffffu;
     const VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -777,9 +779,10 @@ void dlss_scene_blended(VkCommandBuffer cmd, Texture* color0, VkImageView view, 
     end_pass(cmd);   // (vk_draw.cpp's: the draw opens it again)
     std::lock_guard lk(s.mu);
     if (!make_mask_pipeline(s)) return;
+    const bool resized = s.delta[0].width != w || s.delta[0].height != h;
     if (!make_image(cmd, s.opaque, VK_FORMAT_R16G16B16A16_SFLOAT, w, h) || !make_image(cmd, s.mask, VK_FORMAT_R32_SFLOAT, w, h) ||
         !make_image(cmd, s.delta[0], VK_FORMAT_R16G16B16A16_SFLOAT, w, h) ||
-        !make_image(cmd, s.delta[1], VK_FORMAT_R16G16B16A16_SFLOAT, w, h) || !make_mask_flags(cmd, s))
+        !make_image(cmd, s.delta[1], VK_FORMAT_R16G16B16A16_SFLOAT, w, h) || !make_mask_flags(cmd, s, resized))
         return;
     const VkImageView sv = scene_color_view(s, color0);
     if (!sv || color0->width != w || color0->height != h) return;
@@ -1511,8 +1514,8 @@ int dlss_status(char* b, size_t n) {
     // (its own video memory: the images and buffers it made here, and what NGX says its feature holds (FFX its upscaler),
     // when it says)
     uint64_t own = 0;
-    for (const Image* im : {&s.color, &s.depth, &s.motion, &s.output})
-        if (im->image) own += allocation_size(im->memory);
+    for (const Image* im : {&s.color, &s.depth, &s.motion, &s.output, &s.opaque, &s.mask, &s.delta[0], &s.delta[1]})
+        if (im->image) own += allocation_size(im->memory);   // (relink, 0.7.9.3: the see-through mask's too)
     for (const auto& pb : s.pose_buffers)
         if (pb.buffer) own += allocation_size(pb.memory);
     for (const auto& u : s.uploads)
