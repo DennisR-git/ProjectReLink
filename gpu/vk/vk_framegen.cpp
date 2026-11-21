@@ -604,9 +604,10 @@ bool framegen_on() {
     return (framegen_wanted(opts.framegen, allow) || (allow && pace_only())) && !dev.offscreen && !fg.failed;
 }
 
-VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh) {
+VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint32_t sw, uint32_t sh, const int crop[4], uint32_t dw, uint32_t dh,
+                       bool force) {
     const int sharpness = upscaler_sharpens() ? 0 : opts.sharpness;   // (relink: done on the 3D, under the HUD: vk_dlss.cpp)
-    if (!opts.upscale && !sharpness) return VK_NULL_HANDLE;
+    if (!opts.upscale && !sharpness && !force) return VK_NULL_HANDLE;
     if (!src || !image || !sw || !sh || !dw || !dh) return VK_NULL_HANDLE;
     if (crop && crop[2] > 0 && crop[3] > 0 &&
         (crop[0] < 0 || crop[1] < 0 || (uint32_t)crop[0] >= sw || (uint32_t)crop[1] >= sh)) return VK_NULL_HANDLE;
