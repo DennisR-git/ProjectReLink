@@ -59,6 +59,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "dlss_actor.h"
 #include "dlss_math.h"
@@ -73,6 +74,7 @@
 #include "nvsdk_ngx_vk.h"
 #include "nvsdk_ngx_helpers.h"
 #include "nvsdk_ngx_helpers_vk.h"
+#include "nvsdk_ngx_helpers_dlssg_vk.h"   // (relink, 0.7.9.3: DLSS Frame Generation)
 #endif
 
 #include "shaders/dlss_actor_frag_spv.h"
@@ -155,6 +157,7 @@ struct Image {
 
 struct Camera {
     float current[16]{};      // (its view-projection)
+    float proj[16]{};         // (relink, 0.7.9.3: its projection, the jitter in it; for DLSS Frame Generation's camera)
     float jitter[2]{};        // (the projection's offset of the picture's centre, in clip space: nx2/oot_jitter.py)
     // (relink, for FSR: the near and far planes in the camera's units, read from its projection (far infinite: none), and its
     // vertical field of view in radians)
@@ -242,7 +245,21 @@ struct State {
     int upload_at = 0;
     uint64_t actor_draws = 0, actor_frames = 0, actor_skipped = 0;
     uint64_t actor_one = 0, status_one = 0;   // (the rigidly skinned draws among actor_draws, and at the last status line)
+    // (relink, 0.7.9.3: rigid objects, dlss_note_rigid_draw) This frame's rigid draws into the scene with their world matrix;
+    // the frame before's matrices by model (12 floats each), with the frame they were taken in
+    struct Rigid {
+        DlssSkin k;
+        uint64_t model = 0;
+        float m[12];
+    };
+    std::vector<Rigid> rigids;
+    std::unordered_map<uint64_t, std::vector<float>> rigid_before, rigid_old;   // (kept, their vectors emptied: no allocation a frame)
+    std::unordered_set<uint64_t> rigid_same_before, rigid_same_old;            // (model and matrix hashed: an unchanged one found at once)
+    uint64_t rigid_frame = 0;
+    std::unordered_map<uint64_t, uint64_t> rigid_models;   // (a model's last frame with a rigid draw that moved)
+    uint64_t rigid_seen = 0, rigid_moved = 0, status_rigid_seen = 0, status_rigid_moved = 0;
     int64_t actor_ns = 0;       // (the CPU's time in it, since the last status line)
+    int64_t rigid_ns = 0;       // (of it, noting the rigid draws: dlss_note_rigid_draw)
     uint64_t status_draws = 0, status_frames = 0;   // (actor_draws and _frames at the last status line: dlss_status)
     uint64_t status_drawn = 0, status_passed = 0;   // (since the last status line: frames DLSS drew, and frames a network
                                                     // of the upscale's shape ran without it (its scene not this frame's))
@@ -252,6 +269,31 @@ struct State {
     std::vector<Dead> dead;   // (what work in flight may still use: freed a few frames on)
     uint64_t asked = 0;       // (the frame an upscale last asked for DLSS: dlss_idle)
     std::atomic<bool> holding{false};   // (a feature, images or frees still to do: dlss_idle has something to let go)
+    // (relink, 0.7.9.3) NVIDIA DLSS Frame Generation (dlssg_generate). What NGX said of it (-1 not asked yet, 0 not here, 1
+    // here), the most frames it makes between two of the game's, and why not when it is not here (for the menu)
+    std::atomic<int> fg_available{-1};
+    std::atomic<int> fg_max{1};
+    std::atomic<int> fg_why{0};
+    bool fg_failed = false;
+    uint64_t fg_refused = 0;   // (the size a creation failed for: not tried again each frame)
+#ifdef RELINK_NGX
+    NVSDK_NGX_Handle* fg_feature = nullptr;
+    NVSDK_NGX_Parameter* fg_params = nullptr;
+#endif
+    uint32_t fg_w = 0, fg_h = 0;
+    uint64_t fg_made = 0, fg_frames = 0, fg_status_frames = 0, fg_last = 0, fg_missed = 0, fg_status_missed = 0;
+    // (each upscale's inputs for it, two frames of them in turn: the depth and motion as DLSS was given them, the camera.
+    // The frame generator runs in the present's recording; the next frame's upscale may be recorded first)
+    struct FgSlot {
+        Image depth, motion;
+        uint64_t frame = 0;
+        uint32_t rw = 0, rh = 0;
+        float vp[16], before[16], proj[16];   // (no jitter in any)
+        float jitter[2];                      // (in clip space, y up: the game's)
+        float near_z = 0, far_z = 0, fov_y = 0;
+        bool reset = true, used = true;
+    } fg_slots[2];
+    int fg_next = 0;
 };
 State& st() {
     static State s;
@@ -416,17 +458,47 @@ std::wstring wide(const fs::path& p) {
 #ifdef _WIN32
 constexpr const char* kRuntime = "nvngx_dlss.dll";   // (DLSS's runtime, as scripts/ngx_sdk.py fetches it)
 constexpr const fs::path::value_type* kRuntimeName = L"nvngx_dlss.dll";
+constexpr const fs::path::value_type* kFgRuntimeName = L"nvngx_dlssg.dll";   // (DLSS Frame Generation's, Windows only)
 #else
+constexpr const fs::path::value_type* kFgRuntimeName = "libnvidia-ngx-dlssg.so";
 constexpr const char* kRuntime = "libnvidia-ngx-dlss.so";
 constexpr const fs::path::value_type* kRuntimeName = "libnvidia-ngx-dlss.so";
 #endif
 
-/// NGX on this device, once: false when DLSS cannot run here (the reason logged)
-bool ngx_init() {
+/// (relink, 0.7.9.3) What NGX says of DLSS Frame Generation on this device, once, from its capabilities: s.fg_available,
+/// fg_max (made frames between two of the game's: 1 on the RTX 40 series, up to 3 on the RTX 50), fg_why, logged
+void fg_caps(NVSDK_NGX_Parameter* caps, const std::vector<fs::path>& dirs) {
     State& s = st();
-    if (s.ngx_tried) return s.ngx_ok;
-    s.ngx_tried = true;
-    // where DLSS's runtime (kRuntime) is looked for (NGX takes the newest it finds), and its own files go
+    int available = 0, needs_driver = 0, init = 0;
+    unsigned major = 0, minor = 0, most = 0;
+    NVSDK_NGX_Parameter_GetI(caps, NVSDK_NGX_Parameter_FrameGeneration_Available, &available);
+    NVSDK_NGX_Parameter_GetI(caps, NVSDK_NGX_Parameter_FrameGeneration_NeedsUpdatedDriver, &needs_driver);
+    NVSDK_NGX_Parameter_GetI(caps, NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult, &init);
+    NVSDK_NGX_Parameter_GetUI(caps, NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMajor, &major);
+    NVSDK_NGX_Parameter_GetUI(caps, NVSDK_NGX_Parameter_FrameGeneration_MinDriverVersionMinor, &minor);
+    NVSDK_NGX_Parameter_GetUI(caps, NVSDK_NGX_DLSSG_Parameter_MultiFrameCountMax, &most);
+    bool runtime = false;
+    std::error_code ec;
+    for (const auto& d : dirs)
+        for (const auto& f : fs::directory_iterator(d, ec)) runtime |= f.path().filename().native().rfind(kFgRuntimeName, 0) == 0;
+    s.fg_max = (int)std::clamp(most, 1u, 7u);
+    s.fg_why = available ? DLSSG_OK : needs_driver ? DLSSG_NEEDS_DRIVER : !runtime ? DLSSG_NO_RUNTIME : DLSSG_NEEDS_RTX40;
+    s.fg_available = available ? 1 : 0;
+    if (available)
+        logf("vk: NVIDIA DLSS Frame Generation: available, up to %u made frames between two of the game's", std::max(most, 1u));
+    else if (needs_driver)
+        logf("vk: NVIDIA DLSS Frame Generation: needs NVIDIA's driver %u.%u or newer", major, minor);
+    else
+        logf("vk: NVIDIA DLSS Frame Generation: not available here (%#x)%s", (unsigned)init,
+             runtime ? ": it needs an RTX 40 series GPU or later" : ": no " "nvngx_dlssg.dll beside DLSS's runtime");
+}
+
+/// NGX on this device, once: false when DLSS cannot run here (the reason logged)
+// (a project id of ReLink's own: NGX wants one with the custom engine type, any GUID)
+constexpr const char* kProjectId = "7b2f5d0c-6a1e-4c39-9f84-3d5e2a1b0c96";
+
+/// Where DLSS's runtime (kRuntime) is looked for (NGX takes the newest it finds); its Frame Generation's (kFgRuntimeName) too
+std::vector<fs::path> ngx_dirs() {
     std::vector<fs::path> dirs;
 #ifdef _WIN32
     if (fs::path e = env_path(L"RX_VK_DLSS_DIR"); !e.empty()) dirs.push_back(e);
@@ -438,6 +510,15 @@ bool ngx_init() {
     if (fs::path x = env_path("XDG_DATA_HOME"); !x.empty()) dirs.push_back(x / "relink" / "ngx");
     else if (fs::path h = env_path("HOME"); !h.empty()) dirs.push_back(h / ".local" / "share" / "relink" / "ngx");
 #endif
+    return dirs;
+}
+
+bool ngx_init() {
+    State& s = st();
+    if (s.ngx_tried) return s.ngx_ok;
+    s.ngx_tried = true;
+    // where DLSS's runtime (kRuntime) is looked for (NGX takes the newest it finds), and its own files go
+    const std::vector<fs::path> dirs = ngx_dirs();
     std::vector<std::wstring> wdirs;
     for (const auto& d : dirs) wdirs.push_back(wide(d));
     std::vector<const wchar_t*> paths;
@@ -455,7 +536,7 @@ bool ngx_init() {
     // (NGX also writes its own log files into the data folder; with RX_VK_DLSS_LOG=1 its lines go to ours instead)
     info.LoggingInfo.DisableOtherLoggingSinks = verbose;
     // (a project id of ReLink's own: NGX wants one with the custom engine type, any GUID)
-    NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID("7b2f5d0c-6a1e-4c39-9f84-3d5e2a1b0c96", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+    NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_Init_with_ProjectID(kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM,
                                                               "1.0", wdata.c_str(), dev.instance, dev.physical, dev.device,
                                                               instance_proc(), vkGetDeviceProcAddr, &info);
     if (NVSDK_NGX_FAILED(r)) {
@@ -470,6 +551,7 @@ bool ngx_init() {
     }
     // (NGX's C functions, not NVSDK_NGX_Parameter's virtual ones: its object comes from NVIDIA's MSVC-built library, whose
     // vtable order is not the Itanium ABI's that llvm-mingw calls with. The overloads only lined up by luck)
+    fg_caps(s.caps, dirs);
     int available = 0, needs_driver = 0;
     unsigned major = 0, minor = 0;
     NVSDK_NGX_Parameter_GetI(s.caps, NVSDK_NGX_Parameter_SuperSampling_Available, &available);
@@ -675,8 +757,34 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
     s.skins.clear();
     std::unordered_map<uint64_t, State::Pose> old = std::move(s.poses);
     s.poses.clear();
+    std::vector<State::Rigid> rigids;
+    rigids.swap(s.rigids);
+    // (the rigid draws' matrices of this frame become the frame before's for the next, whatever is drawn below)
+    std::swap(s.rigid_old, s.rigid_before);
+    std::swap(s.rigid_same_old, s.rigid_same_before);
+    if (s.rigid_before.size() > 4096) s.rigid_before.clear();   // (models no longer drawn: let go now and then)
+    for (auto& [model, v] : s.rigid_before) v.clear();
+    s.rigid_same_before.clear();
+    const auto& rigid_old = s.rigid_old;
+    const bool rigid_history = history && s.rigid_frame == s.last_frame && s.rigid_frame;
+    const auto same_key = [](const State::Rigid& r) {
+        uint64_t h = r.model;
+        for (int i = 0; i < 12; i++) {
+            uint32_t w;
+            std::memcpy(&w, &r.m[i], 4);
+            h = (h ^ w) * 0x100000001b3ull;
+        }
+        return h;
+    };
+    for (const auto& r : rigids)
+        if (r.k.depth == cam.depth) {
+            auto& v = s.rigid_before[r.model];
+            v.insert(v.end(), r.m, r.m + 12);
+            s.rigid_same_before.insert(same_key(r));
+        }
+    s.rigid_frame = texture_frame_no();
     static const bool off = env_switch("RX_VK_DLSS_ACTORS") == 0;
-    if (off || skins.empty() || !make_actor_pipeline()) return 0;
+    if (off || (skins.empty() && rigids.empty()) || !make_actor_pipeline()) return 0;
     for (auto& b : s.pose_buffers)
         if (!b.buffer) {
             if (!create_device_buffer(kPoseBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
@@ -737,6 +845,59 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
         a.tolerance = tolerance;
         draws.push_back(a);
         counts.push_back((uint32_t)k.k.count);
+    }
+    // (relink, 0.7.9.3) The rigid objects that moved since the frame before: each matched with the frame before's matrix of the
+    // same model nearest it (a model drawn many times, pots or crates, comes in another order each frame, so the n-th draw is
+    // not the same object: 19/11's object trace), within RX_VK_DLSS_RIGID_REACH units (default 48: a thrown pot or a rolling
+    // boulder moves a few units a frame, the same model's next copy is further). An unchanged matrix needs no draw: the camera's
+    // motion is already right there. Both matrices go into this frame's pose buffer (origin none, then the 3 x 4 matrix)
+    static const float reach = getenv("RX_VK_DLSS_RIGID_REACH") ? (float)atof(getenv("RX_VK_DLSS_RIGID_REACH")) : 48.0f;
+    // (RX_VK_DLSS_RIGID_ALL=1, a test of the transform: every rigid draw drawn again, the still ones with their own matrix as the
+    // frame before's. A draw writes only where its depth is the scene's, so with RX_VK_DLSS_ACTOR_MARK=3 the motion view shows
+    // which pixels the rigid draws were found to cover: the scenery's shapes when world = matrix x position is right)
+    static const bool all = env_switch("RX_VK_DLSS_RIGID_ALL") > 0;
+    for (const auto& r : rigids) {
+        if (r.k.depth != cam.depth || !rigid_history) continue;
+        s.rigid_seen++;
+        const float* was = r.m;
+        if (!all) {
+            if (s.rigid_same_old.count(same_key(r))) continue;   // (the same matrix as one of the model's the frame before: still)
+            const auto it = rigid_old.find(r.model);
+            if (it == rigid_old.end()) continue;
+            const int i = dlss_actor::nearest(r.m, it->second.data(), it->second.size() / 12, reach);
+            if (i < 0) continue;
+            was = it->second.data() + (size_t)i * 12;
+            if (dlss_actor::same_3x4(r.m, was)) continue;
+        }
+        s.rigid_models[r.model] = texture_frame_no();
+        if (at + 128 > kPoseBytes) break;
+        const uint64_t va = device_address(gpu_buffer_bind(r.k.vbuf, r.k.vsize, false));
+        const uint64_t ia = device_address(gpu_buffer_bind(r.k.ibuf, (uint64_t)r.k.count << r.k.itype, false));
+        if (!va || !ia || va % 4 || r.k.count <= 0 || r.k.itype < 0 || r.k.itype > 2) {
+            s.actor_skipped++;
+            continue;
+        }
+        float pose[32] = {};   // (this frame's: origin 0, matrix; the frame before's: the same at +64 bytes)
+        std::memcpy(pose + 4, r.m, 48);
+        std::memcpy(pose + 20, was, 48);
+        vkCmdUpdateBuffer(cmd, here.buffer, at, sizeof pose, pose);
+        ActorPush a{};
+        a.vertices = va, a.count = (uint32_t)std::min<uint64_t>(r.k.vsize / r.k.stride, UINT32_MAX);
+        dlss_actor::index_start(ia, r.k.itype, &a.indices, &a.first);
+        a.origins[0] = here.address + at, a.origins[1] = here.address + at + 64;
+        a.bones[0] = a.origins[0] + 16, a.bones[1] = a.origins[1] + 16;
+        a.nbones = 1;
+        a.itype = (uint32_t)r.k.itype, a.base_vertex = r.k.base_vertex;
+        a.stride = r.k.stride / 4, a.pos = r.k.pos, a.sets = 1;
+        a.formats = r.k.formats | dlss_actor::kRigid;
+        // (RX_VK_DLSS_ACTOR_MARK=3: the rigid draws only marked)
+        static const int mark = env_switch("RX_VK_DLSS_ACTOR_MARK");
+        if (mark == 1 || mark == 3) a.formats |= dlss_actor::kMark;
+        a.tolerance = tolerance;
+        at += 128;
+        s.rigid_moved++;
+        draws.push_back(a);
+        counts.push_back((uint32_t)r.k.count);
     }
     s.pose_at ^= 1;
     if (draws.empty()) return 0;
@@ -1020,6 +1181,49 @@ void dlss_device_extensions(std::vector<const char*>& want, const std::vector<Vk
     // (NVIDIA's own extensions: without them this is not an NVIDIA GPU, or not one NGX runs on. With them, NGX says, in
     // dlss_probe or at the first upscale: a GTX has them too)
     if (!both) g_why = DLSS_NEEDS_RTX;
+    // (relink, 0.7.9.3) What NGX asks of the device for DLSS Frame Generation, before the device is made (its guide: NGX's
+    // feature requirements), on an NVIDIA device only: each one the device has is turned on, and said with what is missing
+    if (both && dev.physical && dev.instance && dev.props.vendorID == 0x10DE && env_switch("RX_VK_DLSSG") != 0) {
+        const std::vector<fs::path> dirs = ngx_dirs();
+        std::vector<std::wstring> wdirs;
+        for (const auto& d : dirs) wdirs.push_back(wide(d));
+        std::vector<const wchar_t*> paths;
+        for (const auto& d : wdirs) paths.push_back(d.c_str());
+        NVSDK_NGX_FeatureCommonInfo common{};
+        common.PathListInfo.Path = paths.data(), common.PathListInfo.Length = (unsigned)paths.size();
+        const std::wstring wdata = wide(game_dir() / "ngx");
+        NVSDK_NGX_FeatureDiscoveryInfo d{};
+        d.SDKVersion = NVSDK_NGX_Version_API;
+        d.FeatureID = NVSDK_NGX_Feature_FrameGeneration;
+        d.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
+        d.Identifier.v.ProjectDesc = {kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0"};
+        d.ApplicationDataPath = wdata.c_str();
+        d.FeatureInfo = &common;
+        uint32_t count = 0;
+        VkExtensionProperties* props = nullptr;
+        const NVSDK_NGX_Result r = NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(dev.instance, dev.physical, &d, &count, &props);
+        std::string added, missing;
+        for (uint32_t i = 0; NVSDK_NGX_SUCCEED(r) && props && i < count; i++) {
+            const char* name = props[i].extensionName;
+            bool have = false, listed = false;
+            for (const auto& e : all) have |= !strcmp(e.extensionName, name);
+            for (const char* w : want) listed |= !strcmp(w, name);
+            if (have && !listed) {
+                // (the name kept: NGX's array is its own, and the list is read when the device is made)
+                static std::vector<std::string> kept;
+                kept.reserve(32);
+                if (kept.size() < 32) kept.push_back(name), want.push_back(kept.back().c_str());
+            }
+            (have ? added : missing) += (have ? (added.empty() ? "" : ", ") : (missing.empty() ? "" : ", ")) + std::string(name);
+        }
+        NVSDK_NGX_FeatureRequirement req{};
+        const NVSDK_NGX_Result q = NVSDK_NGX_VULKAN_GetFeatureRequirements(dev.instance, dev.physical, &d, &req);
+        logf("vk: NVIDIA DLSS Frame Generation's device extensions (%#x): %u asked%s%s%s%s; its requirements (%#x): %s "
+             "(flags %#x, architecture %#x or later)", (unsigned)r, count, added.empty() ? "" : ", on: ", added.c_str(),
+             missing.empty() ? "" : ", not on this device: ", missing.c_str(), (unsigned)q,
+             NVSDK_NGX_SUCCEED(q) && req.FeatureSupported == 0 ? "supported" : "not supported here", (unsigned)req.FeatureSupported,
+             req.MinHWArchitecture);
+    }
 #else
     (void)want, (void)all;   // (FSR needs no extension of its own: vk_fsr.cpp)
 #endif
@@ -1049,6 +1253,7 @@ void dlss_note_scene_draw(const Texture* color0, uint32_t width, uint32_t height
         return;
     Camera& k = s.cam;
     std::memcpy(k.current, c + 0x30 / 4, sizeof k.current);
+    std::memcpy(k.proj, c + 0x70 / 4, sizeof k.proj);
     // (the offset sead's projection gave the frustum, in its third column: 2 * offset, which moves the picture by -that)
     k.jitter[0] = -c[0x78 / 4], k.jitter[1] = -c[0x88 / 4];
     // (relink, for FSR) the camera's planes and field of view, from the projection (rows at 0x70, 0x80, 0x90). Its depth is
@@ -1139,14 +1344,16 @@ int dlss_status(char* b, size_t n) {
     if (s.status_passed) snprintf(passed, sizeof passed, ", %llu left to the game's network", (unsigned long long)s.status_passed);
     static const char* const names[upscaler_rows::kUpscalers] = {"", "DLSS", "DLAA", "FSR", "FSR native AA", "none"};
     snprintf(b, n, "; %s: %llu frames drawn%s, %llu %s made, jitter %+.3f %+.3f px%s, actor motion %llu draws in %llu "
-             "frames (%.3f ms CPU a frame, %llu of the draws rigidly skinned), its images %llu MB%s",
+             "frames (%.3f ms CPU a frame, %.3f of it noting rigid draws, %llu of the draws rigidly skinned, %llu rigid objects moved of %llu seen), its images %llu MB%s",
              names[mode], (unsigned long long)s.status_drawn, passed,
              (unsigned long long)(is_fsr(mode) ? s.fsr_made : s.features_made), is_fsr(mode) ? "upscalers" : "features",
              s.status_jitter[0], s.status_jitter[1], s.status_motion ? "" : " (no motion)",
-             (unsigned long long)draws, (unsigned long long)frames, frames ? s.actor_ns / 1e6 / (double)frames : 0.0,
-             (unsigned long long)(s.actor_one - s.status_one), (unsigned long long)(own >> 20), feature);
+             (unsigned long long)draws, (unsigned long long)frames, frames ? s.actor_ns / 1e6 / (double)frames : 0.0, frames ? s.rigid_ns / 1e6 / (double)frames : 0.0,
+             (unsigned long long)(s.actor_one - s.status_one), (unsigned long long)(s.rigid_moved - s.status_rigid_moved),
+             (unsigned long long)(s.rigid_seen - s.status_rigid_seen), (unsigned long long)(own >> 20), feature);
     s.status_one = s.actor_one;
-    s.status_draws = s.actor_draws, s.status_frames = s.actor_frames, s.actor_ns = 0, s.status_drawn = s.status_passed = 0;
+    s.status_rigid_moved = s.rigid_moved, s.status_rigid_seen = s.rigid_seen;
+    s.status_draws = s.actor_draws, s.status_frames = s.actor_frames, s.actor_ns = 0, s.rigid_ns = 0, s.status_drawn = s.status_passed = 0;
     return mode;
 }
 
@@ -1175,6 +1382,15 @@ void dlss_idle() {
              (unsigned long long)now, !strcmp(name, "AMD FSR") ? "upscaler" : "feature");
     }
     for (Image* im : {&s.color, &s.depth, &s.motion, &s.output}) drop_image(*im);
+    for (auto& f : s.fg_slots) drop_image(f.depth), drop_image(f.motion), f.used = true;
+#ifdef RELINK_NGX
+    if (s.fg_feature) {   // (DLSS Frame Generation's, with the inputs it takes)
+        NVSDK_NGX_Handle* old = s.fg_feature;
+        later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });
+        s.fg_feature = nullptr, s.fg_w = s.fg_h = 0;
+        logf("vk: NVIDIA DLSS Frame Generation: let go with the upscaler's images");
+    }
+#endif
     for (auto& pb : s.pose_buffers)   // (the actor motion's poses and cameras)
         if (pb.buffer) {
             const State::PoseBuffer gone = pb;
@@ -1267,7 +1483,51 @@ void dlss_note_skinned_draw(const DlssSkin& k) {
     s.skins.push_back(std::move(d));
 }
 
+void dlss_note_rigid_draw(const DlssSkin& k) {
+    static const bool off = env_switch("RX_VK_DLSS_ACTORS") == 0 || env_switch("RX_VK_DLSS_RIGID") == 0;
+    if (off || !dlss_wanted() || is_plain(dlss_mode()) || !k.depth || !k.object || k.object_size < 48 || k.count <= 0 ||
+        !k.stride)
+        return;
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    struct Timed {
+        State& s;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~Timed() { const int64_t d = (std::chrono::steady_clock::now() - t0).count(); s.actor_ns += d, s.rigid_ns += d; }
+    } timed{s};
+    if (s.rigids.size() >= 8192) s.rigids.clear();   // (no upscale for a while: what was kept is stale)
+    // (relink) Reading every rigid draw's matrix every frame cost 0.3 to 0.8 ms of the render thread in Kakariko (650 draws a
+    // frame, 30 of them moving). A program none of whose draws moved in the last 600 frames (the scenery's) is read two frames
+    // in eight only, a pair, enough to see one start moving; a model seen moving is read every frame.
+    // RX_VK_DLSS_RIGID_EVERY=1: every draw every frame
+    static const bool every = env_switch("RX_VK_DLSS_RIGID_EVERY") > 0;
+    const uint64_t frame = texture_frame_no();
+    const uint64_t model = dlss_actor::key(k.vbuf, k.ibuf, k.count, k.base_vertex, k.program, 0);
+    if (!every && (frame & 7) > 1) {   // (by model: a program is shared by most of the scenery, one moving draw kept all of it read)
+        const auto it = s.rigid_models.find(model);
+        if (it == s.rigid_models.end() || frame - it->second > 600) return;
+    }
+    if (s.rigid_models.size() > 4096) s.rigid_models.clear();
+    State::Rigid r;
+    // (the matrix as the GPU will read it: the object buffer's first 48 bytes as submitted, and its words at 0x40: zero for a
+    // model drawn by its world matrix alone (19/11's trace, 91 % of them); the others (20, 110, 0 and the like, with matrices
+    // that are not a world transform: effects, billboards, the torches' flames) are not this kind of draw.
+    // RX_VK_DLSS_RIGID_ANY=1: taken whatever is there)
+    float o[19];
+    if (k.object_size < sizeof o || !memory_read_as_submitted(k.object, o, sizeof o)) return;
+    static const bool any = env_switch("RX_VK_DLSS_RIGID_ANY") > 0;
+    if (!any && (o[16] != 0.0f || o[17] != 0.0f || o[18] != 0.0f)) return;
+    std::memcpy(r.m, o, sizeof r.m);
+    for (float v : r.m)
+        if (!std::isfinite(v)) return;
+    if (dlss_actor::identity_3x4(r.m)) return;   // (fixed geometry in world space, or a skinned model's: not a rigid mover)
+    r.k = k;
+    r.model = model;
+    s.rigids.push_back(r);
+}
+
 namespace {
+void fg_capture(VkCommandBuffer cmd, State& s, const Camera& cam, const float* before, uint32_t rw, uint32_t rh, bool reset);
 /// dlss_out.comp: a perceptual picture (an upscaler's output, or the scene itself) squared into the game's picture, sharpened
 /// first when the Sharpness row asks. same_size: read texel for texel; else through the linear filter (DLAA's and FSR's
 /// native AA's picture is at the render size)
@@ -1552,6 +1812,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     s.jitter_phases = (uint32_t)(fsr && s.fsr_phases > 0 ? s.fsr_phases : dlss_jitter_phases(rw, rh, dw, dh));
     if (s.reason) logf("vk: %s draws the upscale again (frame %llu)", backend_name(mode), (unsigned long long)now);
     s.reason = nullptr;
+    fg_capture(cmd, s, cam, previous, rw, rh, reset);   // (relink, 0.7.9.3: DLSS Frame Generation's inputs, when it is asked for)
     // (RX_VK_DLSS_DEBUG=alternate, a test's reference: every other frame the game's own upscale over DLSS's, which still
     // draws and keeps its history. A frame of DLSS then has the game's picture of the frames either side to be measured against)
     static const bool alternate = getenv("RX_VK_DLSS_DEBUG") && !strcmp(getenv("RX_VK_DLSS_DEBUG"), "alternate");
@@ -1564,6 +1825,216 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
              show_motion ? " (its motion shown)" : "");
     }
     return true;
+}
+
+// ---- (relink, 0.7.9.3) NVIDIA DLSS Frame Generation ----
+// NVIDIA's frame generator through NGX, as its DLSS-FG guide (310.7.0) gives it without Streamline: a feature made for the
+// picture's size, evaluated once for each frame to make, in the present's recording, from the picture (with the HUD), the depth
+// and motion DLSS (or DLAA, or FSR) was given for that frame, and the camera. vk_framegen.cpp's display thread shows the made
+// frames and the game's, evenly, as it does its own; NGX neither times nor shows them. NVIDIA's runtime nvngx_dlssg.dll is looked
+// for where DLSS's is (scripts/ngx_sdk.py fetches both). It runs on the RTX 40 series and later only (NGX says,
+// FrameGeneration.Available): wherever it does not, or no upscaler of ours drew the frame, ReLink's own frames are made.
+// Switches: RX_VK_DLSSG=0 / 1 over the Frame generator row; RX_VK_DLSSG_STUB=1 runs all but NGX's own calls on any GPU (the
+// inputs found, the camera worked out and logged, ReLink's frames made: a test on a GPU without it); RX_VK_DLSSG_MATRIX=plain:
+// the matrices in our layout instead of NGX's (transposed); RX_VK_DLSSG_MVSCALE=norm: the motion said to be in UV units (1/w,
+// 1/h) instead of pixels; RX_VK_DLSSG_LOG=1: an evaluation's camera, the first 4 and then one every 600.
+namespace {
+bool fg_stub() {
+    static const bool on = env_switch("RX_VK_DLSSG_STUB") > 0;
+    return on;
+}
+
+void fg_capture(VkCommandBuffer cmd, State& s, const Camera& cam, const float* before, uint32_t rw, uint32_t rh, bool reset) {
+    if (!dlssg_asked() || opts.framegen < 2) return;
+    if (!fg_stub() && s.fg_available.load() == 0) return;
+    State::FgSlot& f = s.fg_slots[s.fg_next];
+    if (!make_image(cmd, f.depth, VK_FORMAT_R32_SFLOAT, s.depth.width, s.depth.height) ||
+        !make_image(cmd, f.motion, VK_FORMAT_R16G16_SFLOAT, s.motion.width, s.motion.height)) {
+        f.used = true;
+        return;
+    }
+    full_barrier(cmd);   // (DLSS's inputs, read by it and written before)
+    const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {rw, rh, 1}};
+    vkCmdCopyImage(cmd, s.depth.image, VK_IMAGE_LAYOUT_GENERAL, f.depth.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    vkCmdCopyImage(cmd, s.motion.image, VK_IMAGE_LAYOUT_GENERAL, f.motion.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    full_barrier(cmd);
+    f.frame = texture_frame_no(), f.rw = rw, f.rh = rh;
+    std::memcpy(f.vp, cam.current, sizeof f.vp);
+    dlss_math::unjitter(f.vp, cam.jitter);
+    std::memcpy(f.before, before, sizeof f.before);
+    std::memcpy(f.proj, cam.proj, sizeof f.proj);
+    dlss_math::unjitter(f.proj, cam.jitter);
+    f.jitter[0] = cam.jitter[0], f.jitter[1] = cam.jitter[1];
+    f.near_z = cam.near_z, f.far_z = cam.infinite ? 1e30f : cam.far_z, f.fov_y = cam.fov_y;
+    f.reset = reset, f.used = false;
+    s.fg_next ^= 1;
+}
+}  // namespace
+
+bool dlssg_asked() {
+    static const int env = env_switch("RX_VK_DLSSG");
+    return env >= 0 ? env != 0 : opts.fg_kind == 1;
+}
+
+DlssgWhy dlssg_why() {
+    if (fg_stub()) return DLSSG_OK;
+#ifndef RELINK_NGX
+    return DLSSG_NOT_BUILT;
+#else
+    const State& s = st();
+    if (s.fg_failed) return DLSSG_FAILED;
+    const int a = s.fg_available.load();
+    return a < 0 ? DLSSG_UNKNOWN : (DlssgWhy)s.fg_why.load();
+#endif
+}
+
+int dlssg_max_frames() {
+    static const int stub_max = env_switch("RX_VK_DLSSG_STUB_MAX") > 0 ? env_switch("RX_VK_DLSSG_STUB_MAX") : 1;
+    return fg_stub() ? stub_max : std::max(1, st().fg_max.load());
+}
+
+int dlssg_generate(VkCommandBuffer cmd, VkImage back, VkImageView back_view, const VkImage* out, const VkImageView* out_views,
+                   int n, uint32_t w, uint32_t h, bool reset) {
+    if (n <= 0 || !dlssg_asked() || !back || !back_view) return 0;
+    State& s = st();
+    std::lock_guard lk(s.mu);
+#ifdef RELINK_NGX
+    if (!s.ngx_tried && !fg_stub() && dlss_why() == DLSS_OK) ngx_init();   // (asks NGX of the frame generator too: fg_caps)
+#endif
+    if (s.fg_failed || (!fg_stub() && s.fg_available.load() != 1)) return 0;
+    // (this frame's inputs: the slot an upscale of this frame or the one before filled, not used yet)
+    const uint64_t now = texture_frame_no();
+    State::FgSlot* f = nullptr;
+    for (auto& k : s.fg_slots)
+        if (!k.used && k.frame + 2 >= now && (!f || k.frame > f->frame)) f = &k;
+    if (!f) {
+        s.fg_missed++;
+        return 0;
+    }
+    for (auto& k : s.fg_slots)
+        if (k.frame <= f->frame) k.used = true;   // (an older one is not taken after this one)
+    static const bool ours = getenv("RX_VK_DLSSG_MATRIX") && !strcmp(getenv("RX_VK_DLSSG_MATRIX"), "plain");
+    dlss_math::FgCamera cam{};
+    const bool camera = dlss_math::fg_camera(f->vp, f->before, f->proj, ours, &cam);
+    const bool cut = f->reset || reset || !camera;
+    const int frames = std::min(n, dlssg_max_frames());
+    static const bool trace = env_switch("RX_VK_DLSSG_LOG") > 0;
+    static uint64_t traced = 0;   // (the first 4, then one every 600: a later one is the play's camera, not the title's)
+    if ((trace || fg_stub()) && (traced++ < 4 || traced % 600 == 0)) {
+        logf("vk: DLSS Frame Generation%s: frame %llu, picture %ux%u, depth and motion %ux%u of %ux%u, %d frame%s, reset %d; "
+             "camera at %.1f %.1f %.1f, forward %.3f %.3f %.3f, up %.3f %.3f %.3f, near %.2f far %.0f fov %.3f; clip to the frame "
+             "before's: %.4f %.4f %.4f %.4f / %.4f %.4f %.4f %.4f", fg_stub() ? " (stub)" : "", (unsigned long long)f->frame, w, h,
+             f->rw, f->rh, f->depth.width, f->depth.height, frames, frames > 1 ? "s" : "", cut ? 1 : 0, cam.pos[0], cam.pos[1],
+             cam.pos[2], cam.fwd[0], cam.fwd[1], cam.fwd[2], cam.up[0], cam.up[1], cam.up[2], f->near_z, f->far_z, f->fov_y,
+             cam.clip_to_prev[0], cam.clip_to_prev[1], cam.clip_to_prev[2], cam.clip_to_prev[3], cam.clip_to_prev[4],
+             cam.clip_to_prev[5], cam.clip_to_prev[6], cam.clip_to_prev[7]);
+    }
+    if (fg_stub()) {
+        s.fg_frames++;
+        return 0;   // (ReLink's own frames: the stub ends before NGX)
+    }
+#ifdef RELINK_NGX
+    // (its feature for the picture's size; made again when the window's size changes)
+    if (!s.fg_feature || s.fg_w != w || s.fg_h != h) {
+        const uint64_t key = (uint64_t)w << 32 | h;
+        if (s.fg_refused == key) return 0;
+        if (s.fg_feature) {
+            NVSDK_NGX_Handle* old = s.fg_feature;
+            later([old] { NVSDK_NGX_VULKAN_ReleaseFeature(old); });
+            s.fg_feature = nullptr;
+        }
+        if (!s.fg_params && (NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&s.fg_params)) || !s.fg_params)) {
+            s.fg_failed = true;
+            logf("vk: NVIDIA DLSS Frame Generation: no parameters from NGX: ReLink's frames from now on");
+            return 0;
+        }
+        NVSDK_NGX_DLSSG_Create_Params cp{};
+        cp.Width = w, cp.Height = h, cp.NativeBackbufferFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        cp.RenderWidth = f->rw, cp.RenderHeight = f->rh, cp.DynamicResolutionScaling = true;
+        // (the helper of this SDK sets the size and format only: the render size and the dynamic resolution by their names.
+        // The game's Render resolution row moves the render size, and Auto moves it every few frames)
+        NVSDK_NGX_Parameter_SetUI(s.fg_params, NVSDK_NGX_DLSSG_Parameter_InternalWidth, cp.RenderWidth);
+        NVSDK_NGX_Parameter_SetUI(s.fg_params, NVSDK_NGX_DLSSG_Parameter_InternalHeight, cp.RenderHeight);
+        NVSDK_NGX_Parameter_SetUI(s.fg_params, NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 1);
+        const auto t0 = std::chrono::steady_clock::now();
+        const NVSDK_NGX_Result r = NGX_VK_CREATE_DLSSG(cmd, 1, 1, &s.fg_feature, s.fg_params, &cp);
+        note_work();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (NVSDK_NGX_FAILED(r) || !s.fg_feature) {
+            s.fg_feature = nullptr, s.fg_refused = key;
+            logf("vk: NVIDIA DLSS Frame Generation: its feature was not made (%#x) for %ux%u: ReLink's frames until the window's "
+                 "size changes", (unsigned)r, w, h);
+            return 0;
+        }
+        s.fg_refused = 0, s.fg_w = w, s.fg_h = h, s.fg_made++;
+        logf("vk: NVIDIA DLSS Frame Generation: feature %llu made for %ux%u (render %ux%u, dynamic), %.1f ms of CPU; up to %d "
+             "frame%s between two of the game's", (unsigned long long)s.fg_made, w, h, f->rw, f->rh, ms, dlssg_max_frames(),
+             dlssg_max_frames() > 1 ? "s" : "");
+    }
+    struct Disturbed {
+        ~Disturbed() { descriptors_disturbed(); }
+    } disturbed;
+    const auto view_res = [](VkImageView v, VkImage i, VkFormat fmt, uint32_t rw, uint32_t rh, bool write) {
+        return NVSDK_NGX_Create_ImageView_Resource_VK(v, i, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, fmt, rw, rh, write);
+    };
+    NVSDK_NGX_Resource_VK color = view_res(back_view, back, VK_FORMAT_R8G8B8A8_UNORM, w, h, false);
+    NVSDK_NGX_Resource_VK depth = resource(f->depth, false), mv = resource(f->motion, false);
+    static const bool norm = getenv("RX_VK_DLSSG_MVSCALE") && !strcmp(getenv("RX_VK_DLSSG_MVSCALE"), "norm");
+    full_barrier(cmd);   // (the picture copied, the made frames free)
+    for (int i = 1; i <= frames; i++) {
+        NVSDK_NGX_Resource_VK made = view_res(out_views[i - 1], out[i - 1], VK_FORMAT_R8G8B8A8_UNORM, w, h, true);
+        NVSDK_NGX_VK_DLSSG_Eval_Params ep{};
+        ep.pBackbuffer = &color, ep.pDepth = &depth, ep.pMVecs = &mv, ep.pOutputInterpFrame = &made;
+        NVSDK_NGX_DLSSG_Opt_Eval_Params op{};
+        op.multiFrameCount = (unsigned)frames, op.multiFrameIndex = (unsigned)i;
+        std::memcpy(op.cameraViewToClip, cam.view_to_clip, 64), std::memcpy(op.clipToCameraView, cam.clip_to_view, 64);
+        std::memcpy(op.clipToPrevClip, cam.clip_to_prev, 64), std::memcpy(op.prevClipToClip, cam.prev_to_clip, 64);
+        static const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+        std::memcpy(op.clipToLensClip, identity, 64);
+        op.jitterOffset[0] = f->jitter[0], op.jitterOffset[1] = -f->jitter[1];   // (clip space, Vulkan's y down)
+        // (dlss_prep.comp's motion: where the pixel was minus where it is, in render pixels, y down, no jitter: NVIDIA's
+        // convention with a scale of 1 as its parameter reference gives it)
+        op.mvecScale[0] = norm ? 1.0f / (float)f->rw : 1.0f, op.mvecScale[1] = norm ? 1.0f / (float)f->rh : 1.0f;
+        for (int k = 0; k < 3; k++)
+            op.cameraPos[k] = cam.pos[k], op.cameraUp[k] = cam.up[k], op.cameraRight[k] = cam.right[k], op.cameraFwd[k] = cam.fwd[k];
+        op.cameraNear = f->near_z > 0 ? f->near_z : 1.0f;
+        op.cameraFar = f->far_z > 0 ? std::min(f->far_z, 3.0e38f) : 100000.0f;
+        op.cameraFOV = f->fov_y > 0 ? f->fov_y : 0.8f;
+        op.cameraAspectRatio = (float)f->rw / (float)std::max(1u, f->rh);
+        op.colorBuffersHDR = false, op.depthInverted = false, op.cameraMotionIncluded = true;
+        op.reset = cut, op.notRenderingGameFrames = false, op.orthoProjection = false;
+        op.motionVectorsInvalidValue = 0.0f, op.motionVectorsDilated = false, op.menuDetectionEnabled = false;
+        op.mvecsSubrectBase = {0, 0}, op.mvecsSubrectSize = {f->rw, f->rh};
+        op.depthSubrectBase = {0, 0}, op.depthSubrectSize = {f->rw, f->rh};
+        op.backbufferSubrectBase = {0, 0}, op.backbufferSubrectSize = {w, h};
+        op.outputInterpSubrectBase = {0, 0}, op.outputInterpSubrectSize = {w, h};
+        const NVSDK_NGX_Result r = NGX_VK_EVALUATE_DLSSG(cmd, s.fg_feature, s.fg_params, &ep, &op);
+        note_work();
+        if (NVSDK_NGX_FAILED(r)) {
+            logf("vk: NVIDIA DLSS Frame Generation: its evaluation failed (%#x): ReLink's frames from now on", (unsigned)r);
+            s.fg_failed = true;
+            return 0;   // (the caller makes its own over whatever was written)
+        }
+    }
+    full_barrier(cmd);
+    s.fg_last = now, s.fg_frames++, s.holding = true, s.asked = now;
+    return frames;
+#else
+    (void)cmd, (void)out, (void)out_views, (void)w, (void)h, (void)frames, (void)cut;
+    return 0;
+#endif
+}
+
+void dlssg_status(char* b, size_t n) {
+    if (!n) return;
+    b[0] = 0;
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    const uint64_t made = s.fg_frames - s.fg_status_frames, missed = s.fg_missed - s.fg_status_missed;
+    if (!made && !missed) return;
+    snprintf(b, n, "; DLSS Frame Generation%s: %llu frames given to it, %llu without this frame's inputs (ReLink's made)",
+             fg_stub() ? " (stub)" : "", (unsigned long long)made, (unsigned long long)missed);
+    s.fg_status_frames = s.fg_frames, s.fg_status_missed = s.fg_missed;
 }
 
 } // namespace mkwvk

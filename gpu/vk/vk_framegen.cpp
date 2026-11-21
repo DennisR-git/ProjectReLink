@@ -705,7 +705,20 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     pass(cmd, fg.copy, {{src, fg.nearest}, {fg.frames[cur].view, VK_NULL_HANDLE}}, uw, uh, pc, sizeof pc);
     if (m > 1) pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
     set->made = 0;
-    if (blend && m > 1) {
+    // (relink, 0.7.9.3) NVIDIA DLSS Frame Generation, when the Frame generator row asks for it and it runs for this frame
+    // (vk_dlss.cpp dlssg_generate): its frames into the set's, from this picture and what DLSS was given; else ReLink's below
+    if (m > 1 && dlssg_asked()) {
+        VkImage outs[kMaxMult];
+        VkImageView views[kMaxMult];
+        for (int k = 0; k < m - 1; k++) outs[k] = set->frame[k].image, views[k] = set->frame[k].view;
+        const int made = dlssg_generate(cmd, fg.frames[cur].image, fg.frames[cur].view, outs, views, m - 1, uw, uh, !blend);
+        static int told_fewer;
+        if (made > 0 && made < m - 1 && told_fewer++ < 1)
+            logf("vk: frame generation: NVIDIA DLSS makes %d frame%s between two of the game's on this GPU, not %d", made,
+                 made > 1 ? "s" : "", m - 1);
+        if (made > 0) set->made = made;
+    }
+    if (blend && m > 1 && !set->made) {
         pass(cmd, fg.flow, {{fg.lumas[prev].view, fg.nearest}, {fg.lumas[cur].view, fg.nearest},
                             {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
         pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);

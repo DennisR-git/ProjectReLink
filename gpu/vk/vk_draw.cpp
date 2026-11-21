@@ -6657,15 +6657,17 @@ static void dlss_trace_draw(const NvnState& s, const Program& p, const DrawArgs&
 /// (0.7.9.3) And the models skinned rigidly: no weights at 4, one R8UI joint a vertex at 6 (20 draws of a Market frame on
 /// 19/11, program 26399306c91c02e8 with a 10-bone palette): each vertex wholly on its bone. They moved with what is behind
 /// them. RX_VK_DLSS_ONE_JOINT=0: left out, as before
+static void dlss_rigid_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at);
 static void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
     if (d.mesh || !d.indexed || d.indirect || d.instances != 1 || !at.n || !at.color[0] || !at.depth || at.width < 640 ||
-        at.color_format[0] != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || s.nvattr < 7 || !dlss_wanted())
+        at.color_format[0] != VK_FORMAT_B10G11R11_UFLOAT_PACK32 || !dlss_wanted())
         return;
+    if (s.nvattr < 7) return dlss_rigid_check(s, p, d, at);
     const auto attr = [&](int i) { return *reinterpret_cast<const nvn_va_st*>(&s.vattr[i]); };
     const nvn_va_st pos = attr(0);
     if ((pos.fmt != NVN_FORMAT_RGB32F && pos.fmt != NVN_FORMAT_RGBA16F) || pos.stream != 0) return;
     const nvn_p_bind_buf& bones = s.ubo[0][3];
-    if (!bones.addr || bones.size < 48 || bones.size % 48) return;
+    if (!bones.addr || bones.size < 48 || bones.size % 48) return dlss_rigid_check(s, p, d, at);
     DlssSkin k;
     k.formats = pos.fmt == NVN_FORMAT_RGBA16F ? dlss_actor::kHalfPosition : 0;
     static const bool one_joint = !getenv("RX_VK_DLSS_ONE_JOINT") || atoi(getenv("RX_VK_DLSS_ONE_JOINT")) != 0;
@@ -6682,12 +6684,34 @@ static void dlss_skin_check(const NvnState& s, const Program& p, const DrawArgs&
         k.weights[set] = w.offset, k.joints[set] = j.offset, k.sets = set + 1;
     }
     const uint32_t stride = s.vstream[0].stride;
-    if (!k.sets || !stride || stride % 4 || pos.offset % 4 || !s.vbuf[0].address) return;
+    if (!k.sets) return dlss_rigid_check(s, p, d, at);
+    if (!stride || stride % 4 || pos.offset % 4 || !s.vbuf[0].address) return;
     k.depth = at.depth, k.vbuf = s.vbuf[0].address, k.vsize = s.vbuf[0].size, k.stride = stride, k.pos = pos.offset;
     k.ibuf = d.ibuf, k.itype = d.itype, k.count = d.count, k.base_vertex = d.base_vertex;
     k.bones = bones.addr, k.bones_size = bones.size, k.object = s.ubo[0][1].addr, k.object_size = s.ubo[0][1].size;
     k.program = p.key;
     dlss_note_skinned_draw(k);
+}
+
+/// (relink, 0.7.9.3) A rigid draw into the scene, for the upscalers' motion (vk_dlss.cpp dlss_note_rigid_draw): an indexed draw of
+/// one vertex stream with no joints, its object buffer (the vertex stage's uniform buffer 4, NVN's binding 1) starting with its
+/// 3 x 4 world matrix (19/11's object trace: rigid models hold their world transform there, skinned ones the identity and their
+/// origin at 0x40; the rigid ones' 0x40 is zero). Doors, platforms, blocks, rocks, what is carried or thrown: they moved with
+/// what is behind them. RX_VK_DLSS_RIGID=0: left out, as before
+static void dlss_rigid_check(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
+    const nvn_p_bind_buf& object = s.ubo[0][1];
+    if (s.nvattr < 1 || !object.addr || object.size < 48 || !s.vbuf[0].address) return;
+    const nvn_va_st pos = *reinterpret_cast<const nvn_va_st*>(&s.vattr[0]);
+    if ((pos.fmt != NVN_FORMAT_RGB32F && pos.fmt != NVN_FORMAT_RGBA16F) || pos.stream != 0 || pos.offset % 4) return;
+    const uint32_t stride = s.vstream[0].stride;
+    if (!stride || stride % 4) return;
+    DlssSkin k;
+    k.formats = pos.fmt == NVN_FORMAT_RGBA16F ? dlss_actor::kHalfPosition : 0;
+    k.depth = at.depth, k.vbuf = s.vbuf[0].address, k.vsize = s.vbuf[0].size, k.stride = stride, k.pos = pos.offset;
+    k.ibuf = d.ibuf, k.itype = d.itype, k.count = d.count, k.base_vertex = d.base_vertex;
+    k.object = object.addr, k.object_size = object.size;
+    k.program = p.key;
+    dlss_note_rigid_draw(k);
 }
 
 // (relink) RX_VK_PEEK_PROG=<key prefix>: the storage buffers a program binds as the GPU holds them when it runs (what it reads

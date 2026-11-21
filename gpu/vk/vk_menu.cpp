@@ -149,6 +149,8 @@ const char* hn_reflex(int v, int variant) {
 // choice for a PC where it can
 namespace ur = upscaler_rows;
 int upscaler() { return dlss_mode(); }
+/// (relink, 0.7.9.3) NVIDIA DLSS Frame Generation can be chosen in the Frame generator row: it runs here, or NGX was not asked yet
+bool dlssg_choosable() { return dlssg_why() == DLSSG_OK || dlssg_why() == DLSSG_UNKNOWN; }
 bool dlss_ok() { return dlss_why() == DLSS_OK; }
 bool fsr_ok() { return fsr_why() == FSR_OK; }
 /// (relink) FSR 4 runs: AMD's runtime makes it on this GPU and the FSR version row leaves it on Auto
@@ -365,7 +367,8 @@ bool row_fixed(const int* value) {
     return (value == &opts.reflex && !reflex_available()) || (value == &opts.dlss && ur::upscaler_fixed(dlss_ok(), fsr_ok())) ||
            (value == &opts.resolution && ur::resolution_fixed(upscaler())) || (value == &opts.upscale && !filter_needed()) ||
            (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr)) ||
-           (value == &opts.fsr_version && (!fsr31_available() || (upscaler() != ur::FSR && upscaler() != ur::FSR_AA)));
+           (value == &opts.fsr_version && (!fsr31_available() || (upscaler() != ur::FSR && upscaler() != ur::FSR_AA))) ||
+           (value == &opts.fg_kind && !dlssg_choosable());
 }
 const char* tx_output_res(int v) {
     static char b[32];
@@ -508,6 +511,32 @@ const char* hn_framegen(int v, int variant) {
              : v == 5 ? "Four made frames" : v == 6 ? "Five made frames" : v == 7 ? "Six made frames" : "Seven made frames");
     return b[std::clamp(v, 2, 8)];
 }
+/// (relink, 0.7.9.3) The Frame generator row (opts.fg_kind): ReLink's own frames, or NVIDIA DLSS Frame Generation's
+const char* tx_fg_kind(int v) {
+    if (!dlssg_choosable()) return "ReLink";
+    return v == 1 ? "NVIDIA DLSS" : "ReLink";
+}
+/// The value chosen; variant 1: DLSS Frame Generation cannot run here (why); variant 2: it waits for an upscaler of ours
+const char* hn_fg_kind(int v, int variant) {
+    static const char* const why[DLSSG_WHY_COUNT] = {
+        nullptr, nullptr, "This build has no NVIDIA DLSS: ReLink makes the frames.",
+        "NVIDIA DLSS Frame Generation needs an RTX 40 series GPU or later: ReLink makes the frames.",
+        "NVIDIA DLSS Frame Generation needs a newer NVIDIA driver: ReLink makes the frames.",
+        "NVIDIA's frame generation runtime (nvngx_dlssg.dll) was not found: turn NVIDIA DLSS on again in the launcher.",
+        "NVIDIA DLSS Frame Generation failed in this session: ReLink makes the frames until a restart."};
+    static const char* const t[] = {
+        "ReLink's own frames, from the game's last two pictures: any GPU.",
+        "NVIDIA's frames, from the depth and motion DLSS, DLAA or FSR is given: fewer artifacts. RTX 40 series and later.",
+    };
+    static const char* const needs = "Works with DLSS, DLAA or FSR as the Upscaler: with the game's own, ReLink makes the frames.";
+    if (variant < 0) {
+        const DlssgWhy w = dlssg_why();
+        variant = w != DLSSG_OK && w != DLSSG_UNKNOWN ? 1 : v == 1 && (upscaler() == 0 || upscaler() == ur::NONE) ? 2 : 0;
+    }
+    if (variant == 1) return why[std::clamp((int)dlssg_why(), 0, DLSSG_WHY_COUNT - 1)];
+    if (variant == 2) return needs;
+    return variant == 0 ? t[std::clamp(v, 0, 1)] : nullptr;
+}
 MENU_HINTS(hn_pace, 0, "As soon as it is ready.",
            "At an even interval: less stutter, at up to one frame of delay (10 ms at most without Frame generation; not with "
            "Low latency on).")
@@ -613,6 +642,8 @@ Row rows[] = {
     {TAB_GRAPHICS, "Frame generation", &opts.framegen, 0, 8, 1, tx_framegen,
      "Makes frames between the game's own, for smoother motion, at a little input delay. Fast motion or camera cuts can "
      "show artifacts.", hn_framegen},
+    {TAB_GRAPHICS, "Frame generator", &opts.fg_kind, 0, 1, 1, tx_fg_kind,   // (relink, 0.7.9.3: vk_dlss.cpp dlssg_generate)
+     "What makes the frames between the game's: ReLink, or NVIDIA DLSS Frame Generation.", hn_fg_kind, false, true},
     {TAB_GRAPHICS, "Frame pacing", &opts.pace, 0, 1, 1, tx_onoff, "When each frame is shown.", hn_pace},
     {TAB_GRAPHICS, "V-Sync", &opts.vsync, 0, 1, 1, tx_onoff,   // (relink: vk_main.cpp make_swapchain)
      "Shows each frame in step with the display's refresh, so the picture never tears. Applies at once.", hn_vsync, false, true},
@@ -871,7 +902,8 @@ std::string restart_line(HDC dc, int width) {
 /// A row on its tab: the Cheats one only with cheats on, the DLSS model only in a build with DLSS (the Upscaler in every one)
 bool row_shown(int i) {
     return (i != kCheatsRow || cheats_enabled) && (rows[i].value != &opts.dlss || ur::upscaler_shown()) &&
-           (rows[i].value != &opts.dlss_model || ur::model_shown(dlss_built()));
+           (rows[i].value != &opts.dlss_model || ur::model_shown(dlss_built())) &&
+           (rows[i].value != &opts.fg_kind || dlss_built());   // (relink: the Frame generator row in a build with DLSS)
 }
 int tab_row_count(int t) {
     int c = 0;
@@ -888,7 +920,7 @@ const char* row_group(int i, int* place) {
         {"Upscaler", "UPSCALING", 2}, {"DLSS model", "UPSCALING", 2}, {"FSR version", "UPSCALING", 2},
         {"Render resolution", "UPSCALING", 2},
         {"Window scaling filter", "UPSCALING", 2}, {"Sharpness", "UPSCALING", 2},
-        {"Frame generation", "SMOOTHNESS", 3}, {"Frame pacing", "SMOOTHNESS", 3}, {"V-Sync", "SMOOTHNESS", 3}, {"Low latency", "SMOOTHNESS", 3},
+        {"Frame generation", "SMOOTHNESS", 3}, {"Frame generator", "SMOOTHNESS", 3}, {"Frame pacing", "SMOOTHNESS", 3}, {"V-Sync", "SMOOTHNESS", 3}, {"Low latency", "SMOOTHNESS", 3},
         {"Robust buffers", "ADVANCED", 4},
         {"Volume", "SOUND", 1}, {"Audio output", "SOUND", 1}, {"Microphone", "SOUND", 1},
         {"Item wheel", "ITEMS", 2}, {"Cycle items", "ITEMS", 2},

@@ -3522,6 +3522,11 @@ void status_tick() {
     char dlss[320] = "";
     const bool line = frames % sl::kEvery == 0;
     const int mode = line ? dlss_status(dlss, sizeof dlss) : dlss_mode();   // (dlss_status: since the last line, so only for one)
+    if (line) {   // (relink, 0.7.9.3: DLSS Frame Generation's, when it was asked for)
+        char fg[160];
+        dlssg_status(fg, sizeof fg);
+        strncat(dlss, fg, sizeof dlss - strlen(dlss) - 1);
+    }
     static bool over = false;
     if (known && sl::crossed(over, used, allowed)) {
         char w[200];

@@ -51,6 +51,9 @@ struct DlssSkin {
     uint64_t program = 0;
 };
 void dlss_note_skinned_draw(const DlssSkin& k);
+/// (0.7.9.3) A rigid draw into a scene-sized target: no joints, the object's buffer (k.object) starting with its 3 x 4 world
+/// matrix. Where that matrix moved since the frame before, the draw is drawn again with both (vk_dlss.cpp actor_motion)
+void dlss_note_rigid_draw(const DlssSkin& k);
 
 /// A gameplay upscale's dispatch (program `key`; vk_draw.cpp's dlss_stand_in finds them: the 4/3 network fd029a317a9a4b94 at
 /// the game's usual 3/4, the same-size pass 9dc98871eb7fc101 at full size, and one network of its own for each other share): its input as it samples it (in, in_view) and its output's storage
@@ -76,6 +79,26 @@ int dlss_status(char* b, size_t n);
 /// there is to be none (DLSS or FSR not drawing, or RX_VK_DLSS_JITTER=0). Axis 2: the jitter sequence's length for DLSS's
 /// scale (dlss_jitter_phases, HOS_OPT_DLSS_JITTER_PHASES), or FSR's (FFX's own count)
 uint32_t dlss_jitter_size(int axis);
+
+/// (relink, 0.7.9.3) NVIDIA DLSS Frame Generation (NGX, RTX 40 series and later; Windows), in place of ReLink's own frame
+/// interpolation (vk_framegen.cpp) when the Frame generator row asks for it (opts.fg_kind 1; RX_VK_DLSSG=0 / 1 over it). It
+/// takes what DLSS, DLAA or FSR were given for the frame (the depth, the motion, the camera), so it runs only while one of
+/// them is the Upscaler; else, and wherever it cannot run, ReLink's own makes the frames.
+enum DlssgWhy { DLSSG_OK, DLSSG_UNKNOWN, DLSSG_NOT_BUILT, DLSSG_NEEDS_RTX40, DLSSG_NEEDS_DRIVER, DLSSG_NO_RUNTIME, DLSSG_FAILED,
+                DLSSG_WHY_COUNT };
+DlssgWhy dlssg_why();
+/// The most frames it makes between two of the game's (1 on the RTX 40 series, up to 3 on the RTX 50), when it runs here
+int dlssg_max_frames();
+/// The Frame generator row (or RX_VK_DLSSG) asks for DLSS Frame Generation
+bool dlssg_asked();
+/// Records DLSS Frame Generation's frames between the last picture it was given and this one (back: RGBA8, w x h, GENERAL),
+/// n of them into out[0..n) (the same format and size, GENERAL), the first one the earliest. reset: the frame before is not
+/// this one's (a gap, a first frame). Returns the frames recorded: 0 when it does not run for this frame (not asked, not here,
+/// no upscale of ours with this frame's inputs), and the caller makes its own
+int dlssg_generate(VkCommandBuffer cmd, VkImage back, VkImageView back_view, const VkImage* out, const VkImageView* out_views,
+                   int n, uint32_t w, uint32_t h, bool reset);
+/// For the status line: what it made since the last call into b, or nothing
+void dlssg_status(char* b, size_t n);
 
 /// (relink) The mip bias the game's mipmapped textures are sampled with while DLSS or FSR scales the 3D up (0 otherwise):
 /// log2(render width / output width) - 1, in quarter steps (vk_draw.cpp sampler_make)

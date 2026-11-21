@@ -25,6 +25,8 @@ enum { HOS_OPT_KEY_FULLSCREEN = 73 };
 // (out of the box every feature is off: what the game does on its own. The ini beside the executable keeps a player's choices)
 struct Options {
     int framegen = 0;     // made frames: 0 off, or 2, 3, 4 times the game's frames
+    int fg_kind = 0;      // (relink, 0.7.9.3) what makes them (the Frame generator row, saved as frame_generator): 0 ReLink's own
+                          // (vk_framegen.cpp), 1 NVIDIA DLSS Frame Generation where it runs (vk_dlss.cpp dlssg_generate)
     int pace = 1;         // frames shown on an even line (vk_framegen.cpp; (relink, 0.7.9.3) on by default: it paces the
                           // game's frames alone too, and an options file from before, where it did nothing without frame
                           // generation, gets it once: vk_menu.cpp pacing_rev)
