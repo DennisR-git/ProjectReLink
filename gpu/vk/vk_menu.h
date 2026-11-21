@@ -46,11 +46,12 @@ struct Options {
                           // series and later), 1 FSR 3.1 (vk_fsr.cpp; vk_dlss.cpp make_fsr). Saved as fsr_version
     int sharpness = 0;    // 0 to 100: the game's own upscaler (the window's pass) and Upscaler None
     // (relink, 0.7.9.3) the Sharpness row while DLSS, DLAA or FSR draws (saved as upscaler_sharpness): their picture under the
-    // HUD sharpened by dlss_out.comp. 50 by default: measured in the Market at 1920x1080 (relink_release upscaler_best_TASKS.md,
-    // the mean luma step between neighbours), the 3D drawn at 3840x2160 and averaged down 7.3, DLSS 5.9 to 6.1 unsharpened (DLAA
-    // 6.2, FSR 5.8), 8.9 at 50 %, 10.1 at 80 %, the game's own upscaler 9.1. An options file without it takes the old row's
-    // value when it was not 0 (vk_menu.cpp menu_init)
-    int up_sharpness = 50;
+    // HUD sharpened by dlss_out.comp. 40 by default: measured in the Market at 1920x1080 (relink_release upscaler_best_TASKS.md,
+    // the mean luma step between neighbours), the 3D drawn at 3840x2160 and averaged down 7.3, the game's own upscaler 9.1 to
+    // 9.8; DLSS from the game's composite before its SMAA (vk_dlss.cpp upscale_input) 6.9 unsharpened, 7.6 at 30 %, 9.2 at 40 %,
+    // 10.2 at 50 %; FSR 6.4, 8.4, 8.8; DLAA 8.8 at 30 %. An options file without it takes the old row's value when it was not 0
+    // (vk_menu.cpp menu_init)
+    int up_sharpness = 40;
     int realtime = 1;     // game time follows the clock (host/nn_vi.c); 0: per frame (slower frames, slower game)
     int handheld = 0;     // the game's handheld profile: ~4 fps, softer; read once, at the start (host/nn_applet.c)
     int ultrawide = 0;    // the camera at the monitor's shape when it is wider than 16:9; read once, at the start (host/hos_main.c)

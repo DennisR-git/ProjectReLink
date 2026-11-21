@@ -33,6 +33,7 @@ void main() {
         return;
     }
     vec3 c = clamp(textureLod(scene, uv, 0.0).rgb, 0.0, 1.0);
+    if ((pc.flags & 16) != 0) c = sqrt(c);   // (bit 4: the scene given is the linear composite: encoded as the network's input)
     if ((pc.flags & 8) != 0) c *= c;   // (bit 3: the colour made linear again, for an upscaler that takes it so: FSR 3.1)
     imageStore(color, g, vec4(c, 1.0));
     const float d = textureLod(scene_depth, uv, 0.0).r;

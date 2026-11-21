@@ -219,6 +219,11 @@ struct State {
     // (the image the upscale was last given as the scene: other targets of its size and format (the characters' skin, drawn
     // apart) are not it)
     std::atomic<VkImage> scene_image{VK_NULL_HANDLE};
+    // (the game's composite of this frame: scene, bloom, exposure and ACES, before its SMAA: dlss_note_post_draw)
+    Texture* composite = nullptr;
+    uint64_t composite_frame = 0;
+    uint64_t composite_gen = 0;
+    bool told_composite = false;
     uint64_t mask_snaps = 0, mask_frames = 0, mask_given = 0, mask_ends = 0, mask_logged = 0;   // (for the status line: solid pictures taken, frames with one)
     Camera cam;               // (this frame's, since the last upscale)
     std::atomic<uint64_t> last_frame{0};   // (the frame DLSS last drew: read on the game's thread too)
@@ -806,6 +811,36 @@ void dlss_scene_blended(VkCommandBuffer cmd, Texture* color0, VkImageView view, 
     descriptors_disturbed();
     if (s.mask_frame != now) s.mask_frames++;
     s.mask_frame = now, s.mask_snaps++;
+}
+
+// ---- (relink, 0.7.9.3) the game's post chain (relink_release upscaler_best_TASKS.md, its map) ----
+// After the scene and its bloom, one full-screen draw (program ab3681946f93594a) makes the composite: the scene through a
+// colour matrix, plus the bloom, times the exposure, through ACES, in linear colour. The game's SMAA (26fe0c70ab9fc547 edges,
+// 685adb41edc19de7 weights, 6637ac1d052d22d4 blending) then blends it and writes its square root into the scene's image, the
+// network's input, which the upscalers were given. SMAA before a temporal upscaler softens every edge it finds, and DLSS and
+// FSR do their own anti-aliasing: they are given the composite instead (its square root, as the network's input is encoded).
+// Measured in the Market at 1920x1080, the mean luma step between neighbours (the 3D drawn at 3840x2160 and scaled down: 7.3):
+// DLSS unsharpened 5.8 from the network's input, 6.9 from the composite; FSR 5.8 and 6.4; and the colours nearer the
+// reference's (mean 106.2 85.2 88.9 against 105.9 84.9 88.8; 103.3 82.0 85.7 after SMAA). RX_VK_UPSCALE_INPUT=network: as
+// before. RX_VK_POST_COMPOSITE=<key>: another composite program
+namespace {
+uint64_t composite_key() {
+    static const uint64_t k = getenv("RX_VK_POST_COMPOSITE") ? strtoull(getenv("RX_VK_POST_COMPOSITE"), nullptr, 16)
+                                                              : 0xab3681946f93594aull;
+    return k;
+}
+int upscale_input() {   // (1: the composite before SMAA, by default; 0: the network's input, as before)
+    static const int v = getenv("RX_VK_UPSCALE_INPUT") && !strcmp(getenv("RX_VK_UPSCALE_INPUT"), "network") ? 0 : 1;
+    return v;
+}
+}  // namespace
+
+void dlss_note_post_draw(uint64_t key, Texture* color0, uint32_t w, uint32_t h) {
+    if (key != composite_key() || !color0 || color0->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return;
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    s.composite = color0, s.composite_frame = texture_frame_no(), s.composite_gen = texture_destroy_generation();
+    (void)w, (void)h;
 }
 
 void dlss_scene_pass_end(VkCommandBuffer cmd, Texture* color0, VkImageView view, uint32_t w, uint32_t h) {
@@ -1746,7 +1781,7 @@ void fg_capture(VkCommandBuffer cmd, State& s, const Camera& cam, const float* b
 // sharpening out meanwhile, upscaler_sharpens. RX_VK_UPSCALER_SHARPEN=0: as before, after the HUD)
 void out_pass(VkCommandBuffer cmd, State& s, VkImageView src, bool same_size, VkImageView out_view, uint32_t ow, uint32_t oh,
               bool linear = false) {
-    // (relink, 0.7.9.3: DLSS's, DLAA's and FSR's own Sharpness value, 50 % by default; None's is the game's own row's)
+    // (relink, 0.7.9.3: DLSS's, DLAA's and FSR's own Sharpness value, 40 % by default; None's is the game's own row's)
     const int row = is_plain(dlss_mode()) ? opts.sharpness : opts.up_sharpness;
     const float amount = upscaler_sharpen_on() ? std::clamp(row, 0, 100) / 100.0f : 0.0f;
     const struct {
@@ -1915,7 +1950,18 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     const bool fsr4_used = fsr && !(s.fsr_flags & FSR_V31) && fsr4_available();
     const bool fsr_linear = fsr && !fsr4_used && fsr_linear_env > 0;
     pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh;
-    pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0) | (fsr_linear ? 8 : 0);
+    // (relink, 0.7.9.3: RX_VK_UPSCALE_INPUT=composite: the game's composite before its SMAA, this frame's, the scene's size)
+    VkImageView color_in = in_view;
+    bool from_composite = false;
+    if (upscale_input() == 1 && s.composite && s.composite_frame == now && s.composite_gen == texture_destroy_generation() &&
+        s.composite->width == rw && s.composite->height == rh) {
+        if (const VkImageView v = scene_color_view(s, s.composite)) color_in = v, from_composite = true;
+    }
+    pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0) | (fsr_linear ? 8 : 0) | (from_composite ? 16 : 0);
+    if (from_composite != s.told_composite) {
+        s.told_composite = from_composite;
+        logf("vk: %s: given %s", backend_name(mode), from_composite ? "the game's composite before its SMAA" : "the network's input");
+    }
 
     full_barrier(cmd);   // (the scene's colour and depth, written before)
     // (relink, 0.7.9.3: this frame's see-through mask, when the scene's pieces made one: dlss_mask.comp mode 2 clears one of
@@ -1932,7 +1978,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         s.mask_frames = s.mask_snaps = s.mask_given = s.mask_ends = 0;
     }
     {
-        const VkDescriptorImageInfo info[5] = {{s.point, in_view, VK_IMAGE_LAYOUT_GENERAL},
+        const VkDescriptorImageInfo info[5] = {{s.point, color_in, VK_IMAGE_LAYOUT_GENERAL},
                                                {s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, s.color.view, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, s.depth.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -1968,7 +2014,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     if (show_motion && actors) {   // (RX_VK_DLSS_DEBUG=motion: the motion as it is now, the actors' in it)
         pc.flags = 4;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.prep);
-        const VkDescriptorImageInfo info[5] = {{s.point, in_view, VK_IMAGE_LAYOUT_GENERAL},
+        const VkDescriptorImageInfo info[5] = {{s.point, color_in, VK_IMAGE_LAYOUT_GENERAL},
                                                {s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, s.color.view, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, s.depth.view, VK_IMAGE_LAYOUT_GENERAL},

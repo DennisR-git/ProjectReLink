@@ -7257,6 +7257,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     cur_program = &p;
     dlss_trace_draw(s, p, d, at);
     dlss_skin_check(s, p, d, at);
+    if (at.n && at.color[0]) dlss_note_post_draw(p.key, at.color[0], at.width, at.height);   // (relink, 0.7.9.3)
     if (!record_progs().empty() && std::find(record_progs().begin(), record_progs().end(), p.key) != record_progs().end())
         record_draw(s, p, d, at);
     // (RX_VK_DUMP_EACH=<key>,...: in a dump, the pass ends after each draw of those programs, so every one of them is

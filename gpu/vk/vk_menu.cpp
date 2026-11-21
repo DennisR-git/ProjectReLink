@@ -590,12 +590,12 @@ const char* hn_sharpness(int v, int variant) {
 const char* hn_up_sharpness(int v, int variant) {
     static const char* const t[] = {
         "Off: as soft as the upscaler leaves it, a little softer than the 3D drawn at full size.",
-        "Less than the default: around 30% is about as crisp as the 3D drawn at full size.",
+        "Less than the default: around 20% is about as crisp as the 3D drawn at full size.",
         "The default: about as crisp as the game's own upscaler.",
         "Crisper than the game's own upscaler; edges get halos as it goes up.",
     };
     if (variant >= 0) return variant < 4 ? t[variant] : nullptr;
-    return t[v == 0 ? 0 : v < 50 ? 1 : v == 50 ? 2 : 3];
+    return t[v == 0 ? 0 : v < 40 ? 1 : v == 40 ? 2 : 3];
 }
 MENU_HINTS(hn_handheld, 0, "Docked: the Output resolution's size.", "Lower resolutions, lighter on the GPU.")
 MENU_HINTS(hn_ultrawide, 0, "The game's own shape.",
@@ -697,7 +697,7 @@ Row rows[] = {
      "Sharpens the picture as it goes to the window. Too much shows halos.", hn_sharpness},
     // (relink, 0.7.9.3) the same row while DLSS, DLAA or FSR draws, a value of its own (row_shown shows one of the two)
     {TAB_GRAPHICS, "Sharpness", &opts.up_sharpness, 0, 100, 10, tx_percent,
-     "Sharpens the 3D under the HUD. 50% by default; too much shows halos.", hn_up_sharpness},
+     "Sharpens the 3D under the HUD. 40% by default; too much shows halos.", hn_up_sharpness},
     {TAB_GRAPHICS, "Handheld profile", &opts.handheld, 0, 1, 1, tx_onoff,
      "Runs the game as if the console were undocked. Applies after a restart.", hn_handheld, true},
     {TAB_GRAPHICS, "Ultrawide", &opts.ultrawide, 0, 1, 1, tx_ultrawide,

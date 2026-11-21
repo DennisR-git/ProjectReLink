@@ -58,6 +58,9 @@ void dlss_note_rigid_draw(const DlssSkin& k);
 /// scene-like target (B10G11R11 with a depth: color0, its view and size), outside a pass (it ends the open one); and end_pass
 /// as a pass into such a target ends
 void dlss_scene_blended(VkCommandBuffer cmd, Texture* color0, VkImageView view, uint32_t w, uint32_t h);
+/// (relink, 0.7.9.3) A draw of the game's post chain (vk_draw.cpp, program key and its first target): the composite (scene,
+/// bloom, exposure, ACES) is noted, so the upscalers can take the picture before the game's SMAA
+void dlss_note_post_draw(uint64_t key, Texture* color0, uint32_t w, uint32_t h);
 void dlss_scene_pass_end(VkCommandBuffer cmd, Texture* color0, VkImageView view, uint32_t w, uint32_t h);
 
 /// A gameplay upscale's dispatch (program `key`; vk_draw.cpp's dlss_stand_in finds them: the 4/3 network fd029a317a9a4b94 at
