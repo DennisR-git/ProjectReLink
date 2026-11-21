@@ -82,6 +82,8 @@
 #include "shaders/dlss_actor_frag_spv.h"
 #include "shaders/dlss_actor_vert_spv.h"
 #include "shaders/dlss_mask_comp_spv.h"
+#include "shaders/fg_copy_comp_spv.h"
+#include "shaders/dlss_hudless_comp_spv.h"
 #include "shaders/dlss_out_comp_spv.h"
 #include "shaders/dlss_prep_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -305,6 +307,8 @@ struct State {
     // The frame generator runs in the present's recording; the next frame's upscale may be recorded first)
     struct FgSlot {
         Image depth, motion;
+        Image hudless;          // (relink, 0.7.9.3: the picture before the HUD, as the backbuffer holds it: RX_VK_DLSSG_HUDLESS)
+        bool has_hudless = false;
         uint64_t frame = 0;
         uint32_t rw = 0, rh = 0;
         float vp[16], before[16], proj[16];   // (no jitter in any)
@@ -313,6 +317,13 @@ struct State {
         bool reset = true, used = true;
     } fg_slots[2];
     int fg_next = 0;
+    VkDescriptorSetLayout copy_set = VK_NULL_HANDLE;   // (shaders/fg_copy.comp: a picture into an RGBA8 image)
+    VkPipelineLayout copy_layout = VK_NULL_HANDLE;
+    VkPipeline copy_pipe = VK_NULL_HANDLE;
+    VkDescriptorSetLayout hud_set = VK_NULL_HANDLE;    // (shaders/dlss_hudless.comp: the same, sRGB-encoded)
+    VkPipelineLayout hud_layout = VK_NULL_HANDLE;
+    VkPipeline hud_pipe = VK_NULL_HANDLE;
+    bool copy_failed = false;
 };
 State& st() {
     static State s;
@@ -709,7 +720,7 @@ VkImageView scene_color_view(State& s, Texture* t) {
     if (vkCreateImageView(dev.device, &vc, nullptr, &v) != VK_SUCCESS) v = VK_NULL_HANDLE;
     s.color_views[t->image] = v;
     static std::atomic<int> told{0};
-    if (told++ < 2) logf("vk: see-through mask: the scene's colour %ux%u, format %d, %u levels, %u layers: its view %s", t->width,
+    if (told++ < 4) logf("vk: the upscalers: a plain view of a picture %ux%u, format %d, %u levels, %u layers: its view %s", t->width,
                          t->height, (int)t->format, t->levels, t->layers, v ? "made" : "NOT made");
     return v;
 }
@@ -1581,7 +1592,7 @@ void dlss_idle() {
             for (const auto& [image, view] : old) vkDestroyImageView(dev.device, view, nullptr);
         });
     }
-    for (auto& f : s.fg_slots) drop_image(f.depth), drop_image(f.motion), f.used = true;
+    for (auto& f : s.fg_slots) drop_image(f.depth), drop_image(f.motion), drop_image(f.hudless), f.has_hudless = false, f.used = true;
 #ifdef RELINK_NGX
     if (s.fg_feature) {   // (DLSS Frame Generation's, with the inputs it takes)
         NVSDK_NGX_Handle* old = s.fg_feature;
@@ -1726,7 +1737,8 @@ void dlss_note_rigid_draw(const DlssSkin& k) {
 }
 
 namespace {
-void fg_capture(VkCommandBuffer cmd, State& s, const Camera& cam, const float* before, uint32_t rw, uint32_t rh, bool reset);
+void fg_capture(VkCommandBuffer cmd, State& s, const Camera& cam, const float* before, uint32_t rw, uint32_t rh, bool reset,
+                VkImageView out_view, uint32_t ow, uint32_t oh);
 /// dlss_out.comp: a perceptual picture (an upscaler's output, or the scene itself) squared into the game's picture, sharpened
 /// first when the Sharpness row asks. same_size: read texel for texel; else through the linear filter (DLAA's and FSR's
 /// native AA's picture is at the render size)
@@ -2087,7 +2099,10 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     s.jitter_phases = (uint32_t)(fsr && s.fsr_phases > 0 ? s.fsr_phases : dlss_jitter_phases(rw, rh, dw, dh));
     if (s.reason) logf("vk: %s draws the upscale again (frame %llu)", backend_name(mode), (unsigned long long)now);
     s.reason = nullptr;
-    fg_capture(cmd, s, cam, previous, rw, rh, reset);   // (relink, 0.7.9.3: DLSS Frame Generation's inputs, when it is asked for)
+    // (relink, 0.7.9.3: DLSS Frame Generation's inputs, when it is asked for; the picture as out_pass left it, before the HUD)
+    // (a plain 2D view of the picture's image to read it: the view the network writes through reads as nothing)
+    const VkImageView out_read = out && out_level == 0 && out->width == ow && out->height == oh ? scene_color_view(s, out) : VK_NULL_HANDLE;
+    fg_capture(cmd, s, cam, previous, rw, rh, reset, out_read, ow, oh);
     // (RX_VK_DLSS_DEBUG=alternate, a test's reference: every other frame the game's own upscale over DLSS's, which still
     // draws and keeps its history. A frame of DLSS then has the game's picture of the frames either side to be measured against)
     static const bool alternate = getenv("RX_VK_DLSS_DEBUG") && !strcmp(getenv("RX_VK_DLSS_DEBUG"), "alternate");
@@ -2119,7 +2134,48 @@ bool fg_stub() {
     return on;
 }
 
-void fg_capture(VkCommandBuffer cmd, State& s, const Camera& cam, const float* before, uint32_t rw, uint32_t rh, bool reset) {
+/// (relink, 0.7.9.3) RX_VK_DLSSG_HUDLESS=1: DLSS Frame Generation is given the picture before the HUD (pHudless), so the HUD
+/// is not moved with the 3D in the frames it makes. The game draws its HUD into the picture the upscale wrote (B10G11R11,
+/// linear) and one draw then copies that into the window's sRGB texture, which the backbuffer is read from (decoded, into
+/// RGBA8: vk_framegen.cpp fg_copy, which keeps the sRGB encoding). The upscale's picture sRGB-encoded into RGBA8 before the
+/// HUD is drawn is that backbuffer without it, if that last draw changes nothing but the encoding (measured at the Market
+/// outside the HUD: 1.25 / 255 off on average sRGB-encoded, 37.5 linear): RX_VK_DLSSG_HUDLESS_SHOW=1 (with the stub)
+/// shows it as the made frame, so a shot's _made.png can be compared with the shot itself outside the HUD
+bool hudless_on() {
+    static const bool on = env_switch("RX_VK_DLSSG_HUDLESS") > 0 || env_switch("RX_VK_DLSSG_HUDLESS_SHOW") > 0;
+    return on;
+}
+/// shaders/fg_copy.comp's pipeline, once: a sampled picture into an RGBA8 storage image (offset, size)
+bool make_copy_pipeline(State& s) {
+    if (s.copy_pipe && s.hud_pipe) return true;
+    if (s.copy_failed || !dev.push_descriptor || !vkCmdPushDescriptorSetKHR || !make_pipelines()) return false;
+    const VkDescriptorType types[2] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    if ((s.copy_pipe ||
+         make_pipeline(FG_COPY_COMP_SPV, sizeof FG_COPY_COMP_SPV, types, 2, 16, s.copy_set, s.copy_layout, s.copy_pipe)) &&
+        make_pipeline(DLSS_HUDLESS_COMP_SPV, sizeof DLSS_HUDLESS_COMP_SPV, types, 2, 16, s.hud_set, s.hud_layout, s.hud_pipe))
+        return true;
+    s.copy_failed = true;
+    logf("vk: DLSS Frame Generation: the HUD-less picture's shader was not made: none given");
+    return false;
+}
+/// One copy: encode, sRGB-encoded (dlss_hudless.comp), else as it is (fg_copy.comp)
+void copy_pass(VkCommandBuffer cmd, State& s, VkImageView src, VkImageView dst, uint32_t w, uint32_t h, bool encode = false) {
+    const VkPipeline pipe = encode ? s.hud_pipe : s.copy_pipe;
+    const VkPipelineLayout layout = encode ? s.hud_layout : s.copy_layout;
+    const int32_t pc[4] = {0, 0, (int32_t)w, (int32_t)h};
+    const VkDescriptorImageInfo info[2] = {{s.point, src, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, dst, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    wr[0].dstBinding = 0, wr[0].descriptorCount = 1, wr[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wr[0].pImageInfo = &info[0];
+    wr[1].dstBinding = 1, wr[1].descriptorCount = 1, wr[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    wr[1].pImageInfo = &info[1];
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 2, wr);
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+}
+void fg_capture(VkCommandBuffer cmd, State& s, const Camera& cam, const float* before, uint32_t rw, uint32_t rh, bool reset,
+                VkImageView out_view, uint32_t ow, uint32_t oh) {
     if (!dlssg_asked() || opts.framegen < 2) return;
     if (!fg_stub() && s.fg_available.load() == 0) return;
     State::FgSlot& f = s.fg_slots[s.fg_next];
@@ -2132,6 +2188,12 @@ void fg_capture(VkCommandBuffer cmd, State& s, const Camera& cam, const float* b
     const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {rw, rh, 1}};
     vkCmdCopyImage(cmd, s.depth.image, VK_IMAGE_LAYOUT_GENERAL, f.depth.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
     vkCmdCopyImage(cmd, s.motion.image, VK_IMAGE_LAYOUT_GENERAL, f.motion.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    f.has_hudless = false;
+    if (hudless_on() && out_view && make_copy_pipeline(s) &&
+        make_image(cmd, f.hudless, VK_FORMAT_R8G8B8A8_UNORM, ow, oh, VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        copy_pass(cmd, s, out_view, f.hudless.view, ow, oh, true);   // (out_pass's picture, written before the barrier above)
+        f.has_hudless = true;
+    }
     full_barrier(cmd);
     f.frame = texture_frame_no(), f.rw = rw, f.rh = rh;
     std::memcpy(f.vp, cam.current, sizeof f.vp);
@@ -2209,6 +2271,15 @@ int dlssg_generate(VkCommandBuffer cmd, VkImage back, VkImageView back_view, con
     }
     if (fg_stub()) {
         s.fg_frames++;
+        // (RX_VK_DLSSG_HUDLESS_SHOW=1: the HUD-less picture as the made frame, a test of it against the shot of the backbuffer)
+        static const bool show = env_switch("RX_VK_DLSSG_HUDLESS_SHOW") > 0;
+        if (show && f->has_hudless && f->hudless.width == w && f->hudless.height == h && make_copy_pipeline(s)) {
+            full_barrier(cmd);
+            copy_pass(cmd, s, f->hudless.view, out_views[0], w, h);
+            full_barrier(cmd);
+            descriptors_disturbed();
+            return 1;
+        }
         return 0;   // (ReLink's own frames: the stub ends before NGX)
     }
 #ifdef RELINK_NGX
@@ -2257,12 +2328,16 @@ int dlssg_generate(VkCommandBuffer cmd, VkImage back, VkImageView back_view, con
     };
     NVSDK_NGX_Resource_VK color = view_res(back_view, back, VK_FORMAT_R8G8B8A8_UNORM, w, h, false);
     NVSDK_NGX_Resource_VK depth = resource(f->depth, false), mv = resource(f->motion, false);
+    // (RX_VK_DLSSG_HUDLESS=1: the picture before the HUD, when it is the backbuffer's size: fg_capture)
+    const bool hudless = hudless_on() && f->has_hudless && f->hudless.width == w && f->hudless.height == h;
+    NVSDK_NGX_Resource_VK hud = hudless ? resource(f->hudless, false) : NVSDK_NGX_Resource_VK{};
     static const bool norm = getenv("RX_VK_DLSSG_MVSCALE") && !strcmp(getenv("RX_VK_DLSSG_MVSCALE"), "norm");
     full_barrier(cmd);   // (the picture copied, the made frames free)
     for (int i = 1; i <= frames; i++) {
         NVSDK_NGX_Resource_VK made = view_res(out_views[i - 1], out[i - 1], VK_FORMAT_R8G8B8A8_UNORM, w, h, true);
         NVSDK_NGX_VK_DLSSG_Eval_Params ep{};
         ep.pBackbuffer = &color, ep.pDepth = &depth, ep.pMVecs = &mv, ep.pOutputInterpFrame = &made;
+        if (hudless) ep.pHudless = &hud;
         NVSDK_NGX_DLSSG_Opt_Eval_Params op{};
         op.multiFrameCount = (unsigned)frames, op.multiFrameIndex = (unsigned)i;
         std::memcpy(op.cameraViewToClip, cam.view_to_clip, 64), std::memcpy(op.clipToCameraView, cam.clip_to_view, 64);
