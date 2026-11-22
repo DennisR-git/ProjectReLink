@@ -47,6 +47,12 @@
 #include "vk_dlss.h"
 #include "vk_fsr.h"
 #include "vk_reflex.h"
+#if defined(_WIN32)
+#include <psapi.h>   // (relink: the detailed FPS counter's RAM line, K32GetProcessMemoryInfo)
+#else
+#include <sys/resource.h>   // (its CPU line)
+#include <unistd.h>
+#endif
 #include "upscaler_rows.h"
 #include "menu_restart.h"
 #ifndef RELINK_VERSION   // (nx2/build.py gives it to this file: nx2/version.py)
@@ -95,6 +101,7 @@ const char* tx_framegen(int v) {
     return t[v];
 }
 const char* tx_onoff(int v) { return v ? "On" : "Off"; }
+const char* tx_fps_counter(int v) { return v >= 2 ? "Detailed" : v ? "On" : "Off"; }
 const char* tx_menu_look(int v) { return v ? "Dark" : "Light"; }
 // (relink) Motion controls: the choice, and whether a connected controller has a gyroscope (host/pad_sdl.c). Either can be
 // chosen whatever is connected: a pad plugged in later is read when it comes
@@ -601,7 +608,8 @@ MENU_HINTS(hn_handheld, 0, "Docked: the Output resolution's size.", "Lower resol
 MENU_HINTS(hn_ultrawide, 0, "The game's own shape.",
     "The camera widens to fill a screen wider than 16:9 (21:9, 32:9), the HUD in the middle. A 16:10 or 4:3 screen keeps 16:9.")
 MENU_HINTS(hn_robust, 0, "On, on every card.", "Can be faster on some NVIDIA cards.", "Always on.")
-MENU_HINTS(hn_fps, 0, nullptr, "With frame generation on, the game's own rate too.")
+MENU_HINTS(hn_fps, 0, nullptr, "With frame generation on, the game's own rate too.",
+           "Frame times and their graph, the 1% low, the GPU's time and video memory, the CPU and the RAM.")
 MENU_HINTS(hn_speed, 0, "A step each frame: the game slows down whenever it runs below 60 fps.",
            "Normal speed down to 15 fps, by taking longer steps.")
 MENU_HINTS(hn_text_speed, 0, "The game's own pace, with its pauses.", "Twice as fast.", "Four times as fast.",
@@ -709,7 +717,7 @@ Row rows[] = {
      "restart.", hn_robust, true},
 
     // Gameplay (7 rows here; Quit game and Cheats at the end of the table)
-    {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 1, 1, tx_onoff, "Frames per second in the top right corner.", hn_fps,
+    {TAB_GAMEPLAY, "FPS counter", &opts.show_fps, 0, 2, 1, tx_fps_counter, "Frames per second in the top right corner.", hn_fps,
      false, true},
     {TAB_GAMEPLAY, "Game speed", &opts.realtime, 0, 1, 1, tx_speed, "How the game keeps time when it runs below 60 fps.",
      hn_speed},
@@ -1337,10 +1345,14 @@ void gdi_draw(Bitmap& out, uint32_t w, uint32_t h, void (*paint)(HDC, uint32_t, 
     paint(dc, w, h, scale);
     paint_bits = nullptr;
     GdiFlush();
-    if (const char* dir = &out == &menu_bmp ? getenv("RX_VK_MENU_DUMP") : nullptr) {   // (test runs: each drawing of the menu, as menu_<n>.bmp)
+    // (test runs: each drawing of the menu, as menu_<n>.bmp; RX_VK_FPS_DUMP: the FPS counter's, as fps_<n>.bmp, 200 of them)
+    const bool fps_out = &out == &fps_bmp;
+    static int fps_dumped = 0;
+    if (const char* dir = &out == &menu_bmp ? getenv("RX_VK_MENU_DUMP") : fps_out && fps_dumped < 200 ? getenv("RX_VK_FPS_DUMP") : nullptr) {
         static int n = 0;
         char path[1024];
-        snprintf(path, sizeof path, "%s/menu_%03d.bmp", dir, n++);
+        if (fps_out) snprintf(path, sizeof path, "%s/fps_%03d.bmp", dir, fps_dumped++);
+        else snprintf(path, sizeof path, "%s/menu_%03d.bmp", dir, n++);
         if (FILE* f = fopen(path, "wb")) {   // (the 14-byte file header and the 40-byte info header, little-endian: 32-bit, top-down)
             uint8_t hd[54] = {'B', 'M'};
             auto put = [&](int at, uint32_t v, int bytes) { for (int i = 0; i < bytes; i++) hd[at + i] = (uint8_t)(v >> (8 * i)); };
@@ -3166,6 +3178,230 @@ void redraw_menu(int s) {
 std::atomic<int64_t> game_frames{0}, shown_frames{0};
 int cur_scale = 1;
 
+// (relink) The FPS counter's Detailed look: the frame rate, the frame times of the last second and a graph of the last ones, the
+// 1% low of the last 10 seconds (the frame time 99% of frames are under, as a rate), the GPU's time a game frame and how busy it
+// kept the GPU, the video memory against the driver's allowance, the CPU (this game, and the whole PC) and the RAM. Read every
+// half second on the menu's thread; the frame times come from menu_note_frame, on the thread that presents
+namespace fps_detail {
+constexpr uint32_t kRing = 8192;   // (presents: 27 s at 300 fps)
+std::atomic<int64_t> ring[kRing];
+std::atomic<uint32_t> ring_n{0};
+/// A frame shown, at now (one thread presents at a time: the replay's, or frame generation's)
+void note(int64_t now) {
+    const uint32_t i = ring_n.load(std::memory_order_relaxed);
+    ring[i % kRing].store(now, std::memory_order_relaxed);
+    ring_n.store(i + 1, std::memory_order_release);
+}
+constexpr int kGraph = 120;
+struct Stats {
+    double fps = 0, game = 0, frame_ms = 0, max_ms = 0, low1 = 0;
+    double gpu_ms = -1, gpu_busy = -1;             // (-1: not known yet)
+    double vram_used = -1, vram_allowed = -1;      // (GB)
+    double cpu = -1, cpu_all = -1;                 // (percent of the whole CPU)
+    double ram = -1, ram_total = -1, ram_load = -1;
+    int graph_n = 0;
+    float graph[kGraph] = {};                      // (the last frame times, ms, the oldest first)
+};
+Stats stats;
+constexpr double kGB = 1073741824.0;
+/// The frame times of the last 10 s, oldest first, from the presents' ring
+void frame_times(int64_t now, std::vector<float>& out) {
+    out.clear();
+    const uint32_t n = ring_n.load(std::memory_order_acquire), have = std::min(n, kRing);
+    int64_t prev = 0;
+    for (uint32_t k = n - have; k != n; k++) {
+        const int64_t t = ring[k % kRing].load(std::memory_order_relaxed);
+        if (prev && t > prev && now - t <= 10'000'000'000LL) out.push_back((float)((t - prev) / 1e6));
+        prev = t;
+    }
+}
+void take(int64_t now, double shown, double game) {
+    Stats s;
+    s.fps = shown, s.game = game;
+    static std::vector<float> iv, sorted;
+    frame_times(now, iv);
+    if (!iv.empty()) {
+        double sum = 0, most = 0;   // (the last second's)
+        int n = 0;
+        for (size_t i = iv.size(); i-- > 0 && sum < 1000.0;) sum += iv[i], most = std::max(most, (double)iv[i]), n++;
+        s.frame_ms = sum / n, s.max_ms = most;
+        sorted = iv;
+        const size_t at = std::min(sorted.size() - 1, (size_t)(sorted.size() * 0.99));
+        std::nth_element(sorted.begin(), sorted.begin() + (ptrdiff_t)at, sorted.end());
+        s.low1 = sorted[at] > 0 ? 1000.0 / sorted[at] : 0;
+        s.graph_n = (int)std::min<size_t>(iv.size(), kGraph);
+        std::copy(iv.end() - s.graph_n, iv.end(), s.graph);
+    }
+    static int64_t l_t = 0, l_gpu = 0, l_frames = 0;
+    const int64_t gpu = replay_gpu_ns_total(), frames = game_frames.load(std::memory_order_relaxed);
+    if (l_t && frames > l_frames && gpu >= l_gpu) {
+        s.gpu_ms = (gpu - l_gpu) / 1e6 / (double)(frames - l_frames);
+        s.gpu_busy = std::min(100.0, (gpu - l_gpu) * 100.0 / (double)(now - l_t));
+    }
+    uint64_t used = 0, allowed = 0;
+    if (vram_usage_now(&used, &allowed) && allowed) s.vram_used = used / kGB, s.vram_allowed = allowed / kGB;
+#if defined(_WIN32)
+    static uint64_t l_proc = 0, l_idle = 0, l_total = 0;
+    const auto ft = [](const FILETIME& f) { return (uint64_t)f.dwHighDateTime << 32 | f.dwLowDateTime; };   // (100 ns)
+    static const double cpus = [] { SYSTEM_INFO si{}; GetSystemInfo(&si); return (double)std::max<DWORD>(1, si.dwNumberOfProcessors); }();
+    FILETIME c{}, e{}, k{}, u{};
+    if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) {
+        const uint64_t p = ft(k) + ft(u);
+        if (l_t && now > l_t) s.cpu = std::min(100.0, (p - l_proc) * 100.0 * 100.0 / (double)(now - l_t) / cpus);
+        l_proc = p;
+    }
+    FILETIME si{}, sk{}, su{};
+    if (GetSystemTimes(&si, &sk, &su)) {   // (the kernel's time counts the idle time too)
+        const uint64_t idle = ft(si), total = ft(sk) + ft(su);
+        if (l_total && total > l_total) s.cpu_all = std::clamp(100.0 * (1.0 - (double)(idle - l_idle) / (double)(total - l_total)), 0.0, 100.0);
+        l_idle = idle, l_total = total;
+    }
+    PROCESS_MEMORY_COUNTERS pm{};
+    pm.cb = sizeof pm;
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pm, sizeof pm)) s.ram = pm.WorkingSetSize / kGB;
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) s.ram_total = ms.ullTotalPhys / kGB, s.ram_load = ms.dwMemoryLoad;
+#else
+    static uint64_t l_proc = 0;
+    static const double cpus = (double)std::max(1L, sysconf(_SC_NPROCESSORS_ONLN));
+    rusage ru{};
+    if (!getrusage(RUSAGE_SELF, &ru)) {   // (microseconds)
+        const uint64_t p = (uint64_t)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000000u + (uint64_t)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec);
+        if (l_t && now > l_t) s.cpu = std::min(100.0, (p - l_proc) * 100.0 * 1000.0 / (double)(now - l_t) / cpus);
+        l_proc = p;
+    }
+    if (FILE* f = fopen("/proc/self/statm", "r")) {
+        long size = 0, resident = 0;
+        if (fscanf(f, "%ld %ld", &size, &resident) == 2) s.ram = resident * (double)sysconf(_SC_PAGESIZE) / kGB;
+        fclose(f);
+    }
+    if (FILE* f = fopen("/proc/meminfo", "r")) {
+        char key[64];
+        long kb = 0, total = 0, avail = -1;
+        while (fscanf(f, "%63s %ld kB", key, &kb) == 2) {
+            if (!strcmp(key, "MemTotal:")) total = kb;
+            else if (!strcmp(key, "MemAvailable:")) avail = kb;
+        }
+        fclose(f);
+        if (total > 0) s.ram_total = total * 1024.0 / kGB;
+        if (total > 0 && avail >= 0) s.ram_load = 100.0 * (1.0 - (double)avail / total);
+    }
+#endif
+    l_t = now, l_gpu = gpu, l_frames = frames;
+    stats = s;
+}
+/// The GPU's name without its maker's brand ("NVIDIA GeForce RTX 3060 Ti": "RTX 3060 Ti")
+const char* gpu_short_name() {
+    static char name[64] = "";
+    if (!name[0]) {
+        const char* n = dev.props.deviceName;
+        for (const char* brand : {"NVIDIA GeForce ", "NVIDIA ", "AMD Radeon ", "AMD ", "Intel(R) "})
+            if (!strncmp(n, brand, strlen(brand))) { n += strlen(brand); break; }
+        snprintf(name, sizeof name, "%s", n);
+    }
+    return name;
+}
+constexpr int kWidth = 250, kPad = 12, kHeader = 38, kGraphH = 34, kRowH = 19, kFooter = 16;
+int rows_shown() { return 5 + (opts.framegen >= 2 ? 1 : 0); }
+uint32_t height(int s) { return (uint32_t)(s * (kPad + kHeader + kGraphH + 10 + rows_shown() * kRowH + 4 + kFooter + kPad - 4)); }
+/// The panel: the corners see-through (black), the rest drawn over
+void paint(HDC dc, uint32_t w, uint32_t h, int s) {
+    const Stats& st = stats;
+    const COLORREF panel = RGB(17, 21, 18), well = RGB(11, 14, 12), rule = RGB(40, 48, 42), green = RGB(72, 255, 110),
+                   label = RGB(146, 160, 150), value = RGB(238, 242, 238), amber = RGB(255, 184, 72), red = RGB(255, 90, 78);
+    fill(dc, 0, 0, (int)w, (int)h, RGB(0, 0, 0));
+    startup_gdi::round_rect(dc, 0, 0, (int)w, (int)h, 10 * s, panel);
+    fill(dc, 0, 10 * s, 3 * s, (int)h - 20 * s, green);   // (a thin green edge on the left, the counter's colour)
+    SetBkMode(dc, TRANSPARENT);
+    const int pad = kPad * s, right = (int)w - pad;
+    HFONT big = font(30 * s, FW_BOLD), mid = font(14 * s, FW_SEMIBOLD), small = font(12 * s, FW_NORMAL);
+    HGDIOBJ old = SelectObject(dc, big);
+    char t[64];
+    // the frame rate, large, and the 1% low on the right
+    snprintf(t, sizeof t, "%.0f", st.fps);
+    SetTextAlign(dc, TA_LEFT | TA_TOP);
+    SetTextColor(dc, green);
+    TextOutA(dc, pad, pad - 4 * s, t, (int)strlen(t));
+    SIZE sz{};
+    GetTextExtentPoint32A(dc, t, (int)strlen(t), &sz);
+    SelectObject(dc, mid);
+    TextOutA(dc, pad + sz.cx + 5 * s, pad + 13 * s, "FPS", 3);
+    SetTextAlign(dc, TA_RIGHT | TA_TOP);
+    SelectObject(dc, small);
+    SetTextColor(dc, label);
+    TextOutA(dc, right, pad, "1% low", 6);
+    snprintf(t, sizeof t, "%.0f", st.low1);
+    SelectObject(dc, mid);
+    SetTextColor(dc, st.low1 > 0 && st.low1 < st.fps * 0.5 ? amber : value);
+    TextOutA(dc, right, pad + 14 * s, t, (int)strlen(t));
+    // the graph of the last frame times: a bar each, amber past 1.5 times the median, red past 2.5 times; a line at 60 fps
+    const int gx = pad, gy = pad + kHeader * s, gw = (int)w - 2 * pad, gh = kGraphH * s;
+    startup_gdi::round_rect(dc, gx, gy, gw, gh, 4 * s, well);
+    if (st.graph_n > 1) {
+        float sorted[kGraph];
+        std::copy(st.graph, st.graph + st.graph_n, sorted);
+        std::nth_element(sorted, sorted + st.graph_n / 2, sorted + st.graph_n);
+        const float median = sorted[st.graph_n / 2];
+        float top = 0;
+        for (int i = 0; i < st.graph_n; i++) top = std::max(top, st.graph[i]);
+        top = std::clamp(std::max(top * 1.15f, median * 2.0f), 8.0f, 100.0f);
+        const float bar = (float)(gw - 4 * s) / kGraph;
+        if (16.67f < top) fill(dc, gx + 2 * s, gy + gh - 2 * s - (int)((gh - 4 * s) * 16.67f / top), gw - 4 * s, std::max(1, s / 2), rule);
+        for (int i = 0; i < st.graph_n; i++) {
+            const float v = std::min(st.graph[i], top);
+            const int bh = std::max(s, (int)((gh - 4 * s) * v / top));
+            const int x0 = gx + 2 * s + (int)((kGraph - st.graph_n + i) * bar), x1 = gx + 2 * s + (int)((kGraph - st.graph_n + i + 1) * bar);
+            const COLORREF c = st.graph[i] > median * 2.5f ? red : st.graph[i] > median * 1.5f ? amber : green;
+            fill(dc, x0, gy + gh - 2 * s - bh, std::max(1, x1 - x0 - (bar >= 2.5f * s ? 1 : 0)), bh, c);
+        }
+    }
+    // the rows: a label on the left, its values on the right
+    int y = gy + gh + 10 * s;
+    const auto row = [&](const char* name, const char* text, COLORREF c) {
+        SelectObject(dc, small);
+        SetTextAlign(dc, TA_LEFT | TA_TOP);
+        SetTextColor(dc, label);
+        TextOutA(dc, pad, y + s, name, (int)strlen(name));
+        SelectObject(dc, mid);
+        SetTextAlign(dc, TA_RIGHT | TA_TOP);
+        SetTextColor(dc, c);
+        TextOutA(dc, right, y, text, (int)strlen(text));
+        y += kRowH * s;
+    };
+    snprintf(t, sizeof t, "%.1f ms  max %.1f", st.frame_ms, st.max_ms);
+    row("Frame time", t, st.max_ms > st.frame_ms * 2.5 ? amber : value);
+    if (st.gpu_ms >= 0) snprintf(t, sizeof t, "%.1f ms  %.0f%%", st.gpu_ms, st.gpu_busy);
+    else snprintf(t, sizeof t, "-");
+    row("GPU", t, st.gpu_busy >= 97 ? amber : value);
+    if (st.vram_used >= 0) snprintf(t, sizeof t, "%.1f / %.1f GB", st.vram_used, st.vram_allowed);
+    else snprintf(t, sizeof t, "-");
+    row("VRAM", t, st.vram_used > st.vram_allowed ? red : st.vram_used > st.vram_allowed * 0.9 ? amber : value);
+    if (st.cpu >= 0 && st.cpu_all >= 0) snprintf(t, sizeof t, "%.0f%%  all %.0f%%", st.cpu, st.cpu_all);
+    else if (st.cpu >= 0) snprintf(t, sizeof t, "%.0f%%", st.cpu);
+    else snprintf(t, sizeof t, "-");
+    row("CPU", t, value);
+    if (st.ram >= 0 && st.ram_total > 0) snprintf(t, sizeof t, "%.1f GB  %.0f%% of %.0f", st.ram, st.ram_load, st.ram_total);
+    else if (st.ram >= 0) snprintf(t, sizeof t, "%.1f GB", st.ram);
+    else snprintf(t, sizeof t, "-");
+    row("RAM", t, st.ram_load >= 90 ? amber : value);
+    if (opts.framegen >= 2) {
+        snprintf(t, sizeof t, "%.0f fps", st.game);
+        row("Game", t, value);
+    }
+    // the GPU's name, small, at the bottom
+    fill(dc, pad, y + 2 * s, (int)w - 2 * pad, std::max(1, s / 2), rule);
+    SelectObject(dc, small);
+    SetTextAlign(dc, TA_LEFT | TA_TOP);
+    SetTextColor(dc, label);
+    TextOutA(dc, pad, y + 5 * s, gpu_short_name(), (int)strlen(gpu_short_name()));
+    SelectObject(dc, old);
+    DeleteObject(big);
+    DeleteObject(mid);
+    DeleteObject(small);
+}
+} // namespace fps_detail
+
 struct Upload {
     VkBuffer buf = VK_NULL_HANDLE;
     VmaAllocation alloc = nullptr;
@@ -3424,6 +3660,7 @@ void menu_note_present_sizes(uint32_t picture_w, uint32_t picture_h, uint32_t wi
     present_sizes.store(c(picture_w) << 48 | c(picture_h) << 32 | c(window_w) << 16 | c(window_h), std::memory_order_relaxed);
 }
 void menu_note_frame(bool game_frame) {
+    if (opts.show_fps >= 2) fps_detail::note(prof_now());   // (relink: the detailed counter's frame times)
     shown_frames.fetch_add(1, std::memory_order_relaxed);
     if (game_frame) game_frames.fetch_add(1, std::memory_order_relaxed);
 }
@@ -4111,11 +4348,16 @@ void menu_tick() {
         const int64_t now = prof_now();
         double shown = 0, game = 0;
         if (fps_take(now, shown_frames.load(), game_frames.load(), &next, &last_shown, &last_game, &shown, &game)) {
-            snprintf(fps_text, sizeof fps_text, "%.0f", shown);
-            if (opts.framegen >= 2) snprintf(fps_sub, sizeof fps_sub, "game %.0f", game);
-            else fps_sub[0] = 0;
             fps_bmp.keyed = true;
-            gdi_draw(fps_bmp, 120u * scale, 54u * scale, paint_fps, scale);
+            if (opts.show_fps >= 2) {   // (relink: Detailed, a panel of its own)
+                fps_detail::take(now, shown, game);
+                gdi_draw(fps_bmp, fps_detail::kWidth * scale, fps_detail::height(scale), fps_detail::paint, scale);
+            } else {
+                snprintf(fps_text, sizeof fps_text, "%.0f", shown);
+                if (opts.framegen >= 2) snprintf(fps_sub, sizeof fps_sub, "game %.0f", game);
+                else fps_sub[0] = 0;
+                gdi_draw(fps_bmp, 120u * scale, 54u * scale, paint_fps, scale);
+            }
         }
     }
     if (notice_new.exchange(false, std::memory_order_acq_rel)) {   // (relink: the Travel page's "picture saved" line)

@@ -54,7 +54,7 @@ struct Options {
     int realtime = 1;     // game time follows the clock (host/nn_vi.c); 0: per frame (slower frames, slower game)
     int handheld = 0;     // the game's handheld profile: ~4 fps, softer; read once, at the start (host/nn_applet.c)
     int ultrawide = 0;    // the camera at the monitor's shape when it is wider than 16:9; read once, at the start (host/hos_main.c)
-    int show_fps = 0;
+    int show_fps = 0;     // the counter: 0 off, 1 the frame rate, 2 detailed (frame times, 1% low, GPU, CPU, memory). Saved as fps_counter
     int fullscreen = 0;   // borderless, at the monitor's size: F11 is the same setting
     int hdr = 0;          // (relink) HDR output: the game's own HDR picture in HDR10, when Windows' HDR is on for the display;
                           // read once, at the start (vk_main.cpp hdr_output; RX_VK_HDR over it)

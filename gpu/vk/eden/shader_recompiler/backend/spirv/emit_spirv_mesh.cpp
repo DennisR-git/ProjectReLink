@@ -312,8 +312,12 @@ void TaskEpilogue(EmitContext& ctx) {
                 const Id first{ctx.OpIAdd(
                     ctx.U32[1], ctx.Const(MESH_FALLBACK_CAPACITY),
                     ctx.OpIMul(ctx.U32[1], slot, ctx.Const(ctx.mesh_info.payload_words)))};
-                const Id invocation{LocalInvocation(ctx)};
-                Strided(ctx, ctx.mesh_info.payload_words, ctx.mesh_threads, invocation, [&](Id index) {
+                // (relink, issue 182) the whole payload, by this thread alone: the slot is its own. It was copied as a shared
+                // region is, thread i taking words i, i + threads, ...: a slot held one word in 32 of its task's payload and its
+                // mesh workgroup read zeros for the rest. EDEN_FALLBACK_PAYLOAD_STRIDED=1: as before
+                static const bool strided{std::getenv("EDEN_FALLBACK_PAYLOAD_STRIDED") != nullptr};
+                const Id invocation{strided ? LocalInvocation(ctx) : ctx.u32_zero_value};
+                Strided(ctx, ctx.mesh_info.payload_words, strided ? ctx.mesh_threads : 1U, invocation, [&](Id index) {
                     ctx.OpStore(BufferWordAt(ctx, PushU64(ctx, ctx.mesh_fallback_payload_member_index),
                                              ctx.OpIAdd(ctx.U32[1], first, index)),
                                 ctx.OpLoad(ctx.U32[1], PayloadWord(ctx, index)));

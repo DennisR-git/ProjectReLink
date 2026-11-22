@@ -200,7 +200,7 @@ sealed class Settings
         GameSpeed = Int(g, "game_speed", 0, 0, 1);
         Handheld = Int(g, "handheld_profile", 0, 0, 1);
         Ultrawide = Int(g, "ultrawide", 0, 0, 1);
-        FpsCounter = Int(g, "fps_counter", 0, 0, 1);
+        FpsCounter = Int(g, "fps_counter", 0, 0, 2);   // (2: Detailed)
         Upscaler = Int(g, "dlss", 0, 0, 5);
         FsrVersion = Int(g, "fsr_version", 0, 0, 1);
         MenuLook = Int(g, "menu_look", 0, 0, 1);

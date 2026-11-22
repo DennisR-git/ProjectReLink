@@ -1124,9 +1124,15 @@ uint64_t disk_stamp() {
     // (relink) "RX_VK_GP_" (RX_VK_GP_TEST), not "RX_VK_GP": that also took RX_VK_GPU_DUMP, RX_VK_GPU_UNSWIZZLE, RX_VK_GPU_PAGES,
     // RX_VK_GPU_PROFILE and RX_VK_GPL, none of which the translation reads, and a line of them added to relink_env.txt or taken out
     // prepared every shader again
+    // (relink, issue 174) taken in name order, not in the environment's: relink_env.txt's lines are set in the file's order, so
+    // the same lines in another order made another stamp and prepared every shader again. Sorted, the hash is the old one
+    // whenever the variables already came in order (and with none or one of them)
+    std::vector<const char*> vars;
     for (char** e = _environ; e && *e; e++)
         for (const char* pre : {"RX_VK_OOT", "RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_CONV", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_NO_NAN_GUARD", "RX_VK_MARKERS", "RX_VK_LOOKUP", "EDEN_"})
-            if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
+            if (!strncmp(*e, pre, strlen(pre))) { vars.push_back(*e); break; }
+    std::sort(vars.begin(), vars.end(), [](const char* a, const char* b) { return strcmp(a, b) < 0; });
+    for (const char* v : vars) add(v, strlen(v));
     return h;
 }
 

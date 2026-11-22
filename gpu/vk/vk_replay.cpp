@@ -434,6 +434,7 @@ int64_t st_wait_ns;   // (time the replay waited for a recording slot: the GPU b
 VkQueryPool ts_pool = VK_NULL_HANDLE;
 bool ts_pending[kRecordings];
 int64_t st_gpu_ns, st_gpu_max_ns;
+std::atomic<int64_t> gpu_ns_total{0};   // (st_gpu_ns for another thread: the detailed FPS counter's GPU time)
 void gpu_time_collect(Recording& r) {
     if (!ts_pool || !ts_pending[r.slot]) return;
     ts_pending[r.slot] = false;
@@ -444,7 +445,11 @@ void gpu_time_collect(Recording& r) {
     const int64_t ns = (int64_t)((t[1] - t[0]) * (double)dev.props.limits.timestampPeriod);
     st_gpu_ns += ns;
     st_gpu_max_ns = std::max(st_gpu_max_ns, ns);
+    gpu_ns_total.fetch_add(ns, std::memory_order_relaxed);
 }
+}   // namespace (the accessor below is the FPS counter's: vk_menu.cpp)
+int64_t replay_gpu_ns_total() { return gpu_ns_total.load(std::memory_order_relaxed); }
+namespace {
 
 void gpu_time_begin(Recording& r) {
     if (!ts_pool) {

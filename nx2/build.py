@@ -65,6 +65,27 @@ EXE = "relink" if LINUX else "relink-game.exe"
 VK_LIB = "relink_vk.so" if LINUX else "relink_vk.dll"
 
 
+def link_failed(what, r, t, limit=60):
+    """A failed link said in full enough to act on (issue 177): the undefined symbols, else the linker's own error lines. Its
+    output's last 3000 characters were printed before, and when lld crashed they were only the end of the "Program arguments"
+    line of its stack dump (every object's path): the error itself never reached the player's report."""
+    out = (r.stdout or "") + (r.stderr or "")
+    lines = out.splitlines()
+    undefined = sorted({l.strip() for l in lines if "undefined symbol" in l})
+    print("%slink FAILED (%.0fs), %d undefined symbols" % (what + " " if what else "", time.time() - t, len(undefined)), flush=True)
+    if undefined:
+        print("\n".join(undefined[:limit]), flush=True)
+        return
+    clip = lambda l: l if len(l) <= 300 else l[:240] + " ... (%d characters)" % len(l)
+    keys = ("error", "warning", "PLEASE", "Stack dump", "Exception Code", "LLVM ERROR", "out of memory", "cannot open",
+            "could not", "No space", "Permission denied", "being used by another process")
+    said = [clip(l) for l in lines if any(k.lower() in l.lower() for k in keys) and "Program arguments" not in l]
+    print("\n".join(said[:40]) if said else "\n".join(clip(l) for l in lines[-30:]), flush=True)
+    if any(k in out for k in ("Stack dump", "PLEASE submit", "Exception Code")):
+        print("the linker itself crashed: often too little free memory or disk space, or an antivirus holding a file; "
+              "close big programs, check the free space and run the install again", flush=True)
+
+
 def check_vk_symbols(so):
     """The back end is dlopened with RTLD_NOW, so one unresolved symbol stops the whole thing
     loading -- and the only sign of that at run time is "the renderer did not start: the window
@@ -1183,10 +1204,8 @@ def main():
                                               "-Wl,--export-dynamic-symbol=hos_posix_*", "@" + rsp] + HOT_ORDER() +
                            (FFMPEG_LX[1] if FFMPEG_LX else []) + HOST_LIBS,
                            capture_output=True, text=True)
-        undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})
         if r.returncode:
-            print("link FAILED (%.0fs), %d undefined symbols" % (time.time() - t, len(undefined)))
-            print("\n".join(undefined[:60]) if undefined else (r.stdout + r.stderr)[-3000:])
+            link_failed("", r, t)
             return 1
         print("linked %s: %d MB (%.0fs)" % (exe, os.path.getsize(exe) >> 20, time.time() - t))
         sdl = os.environ.get("RELINK_SDL2", "")   # (libSDL2-2.0.so.0 beside it, when the AppImage brings one)
@@ -1207,10 +1226,8 @@ def main():
                             ["-lbcrypt", "-lmfplat", "-lmfuuid", "-lstrmiids", "-lole32"] if FFMPEG else []) +
                            (["-lc++", "-lunwind"] if toolchain.mingw() else []),   # (llvm-mingw: the C++ parts' runtime, linked in; MSVC's comes by itself)
                            capture_output=True, text=True)
-        undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})
         if r.returncode:
-            print("link FAILED (%.0fs), %d undefined symbols" % (time.time() - t, len(undefined)))
-            print("\n".join(undefined[:60]) if undefined else (r.stdout + r.stderr)[-3000:])
+            link_failed("", r, t)
             return 1
         print("linked %s: %d MB (%.0fs)" % (exe, os.path.getsize(exe) >> 20, time.time() - t))
         if wgpu:   # (wgpu_native.dll beside it; in use while the game runs)
@@ -1264,9 +1281,7 @@ def main():
                 ["-shared", "-o", vdll, toolchain.link_opt("/map:" + vdll[:-4] + ".map"), "@" + vrsp, "-luser32", "-lgdi32", "-lole32"] +                (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
         r = subprocess.run(link, capture_output=True, text=True)
         if r.returncode:
-            undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})
-            print("%s link FAILED, %d undefined symbols" % (VK_LIB, len(undefined)))
-            print("\n".join(undefined[:60]) if undefined else (r.stdout + r.stderr)[-3000:])
+            link_failed(VK_LIB, r, t)
             return 1
         if LINUX and not check_vk_symbols(vdll):
             return 1
@@ -1283,10 +1298,8 @@ def main():
         r = subprocess.run([cc] + toolchain.native_target() + toolchain.native_link() +
                            ["-shared", "-o", dll, toolchain.link_opt("/map:" + dll[:-4] + ".map"), "@" + rsp],
                            capture_output=True, text=True)
-        undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})
         if r.returncode:
-            print("link FAILED (%.0fs), %d undefined symbols" % (time.time() - t, len(undefined)))
-            print("\n".join(undefined[:40]) if undefined else (r.stdout + r.stderr)[-3000:])
+            link_failed("", r, t, 40)
             return 1
         print("linked %s: %d MB, no undefined symbols (%.0fs)" % (dll, os.path.getsize(dll) >> 20, time.time() - t))
     return 0

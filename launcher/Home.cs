@@ -20,9 +20,9 @@ public partial class MainWindow
     int origHz;
     bool display60Possible;
 
-    CheckBox Fullscreen = null!, Display60 = null!, FpsCounter = null!, Ultrawide = null!, FramePacing = null!, VSync = null!, Audio = null!, Handheld = null!, InvertY = null!,
+    CheckBox Fullscreen = null!, Display60 = null!, Ultrawide = null!, FramePacing = null!, VSync = null!, Audio = null!, Handheld = null!, InvertY = null!,
              NvidiaDlss = null!;
-    WrapPanel ResolutionGroup = null!, UpscalerGroup = null!, FsrVersionGroup = null!, UpscaleGroup = null!, FrameRateGroup = null!, SpeedGroup = null!, FramegenGroup = null!, UiLanguageGroup = null!, ThemeGroup = null!;
+    WrapPanel ResolutionGroup = null!, UpscalerGroup = null!, FsrVersionGroup = null!, UpscaleGroup = null!, FrameRateGroup = null!, SpeedGroup = null!, FramegenGroup = null!, FpsCounterGroup = null!, UiLanguageGroup = null!, ThemeGroup = null!;
     Slider Sharpness = null!;
     TextBlock SharpnessText = null!, Display60Hint = null!, FolderText = null!;
     ComboBox LanguageBox = null!;
@@ -94,7 +94,9 @@ public partial class MainWindow
         sharp.Children.Add(SharpnessText);
         RowsDisplay.Children.Add(new Border { Style = St("Row"), Child = sharp });
 
-        SwitchRow(RowsDisplay, L("Compteur d'images par seconde", "Frames-per-second counter"), null, out FpsCounter, out _);
+        FpsCounterGroup = ChoiceRow(RowsDisplay, L("Compteur d'images par seconde", "Frames-per-second counter"),
+                  L("Détaillé : temps d'image et leur courbe, 1 % bas, GPU, VRAM, CPU et RAM.", "Detailed: frame times and their graph, 1% low, GPU, VRAM, CPU and RAM."),
+                  "FpsCounter", (0, L("Masqué", "Off")), (1, L("Images par seconde", "Frame rate")), (2, L("Détaillé", "Detailed")));
         SwitchRow(RowsDisplay, L("Ultra-large", "Ultrawide"), L("La caméra prend le format de l'écran s'il est plus large que 16:9.", "The camera takes the display's shape when it is wider than 16:9."),
                   out Ultrawide, out _);
 
@@ -377,7 +379,7 @@ public partial class MainWindow
     {
         OnSwitch(Fullscreen, v => s.Fullscreen = v ? 1 : 0);
         OnSwitch(Display60, v => s.Display60 = v);
-        OnSwitch(FpsCounter, v => s.FpsCounter = v ? 1 : 0);
+        OnPick(FpsCounterGroup, v => s.FpsCounter = v);
         OnSwitch(Ultrawide, v => s.Ultrawide = v ? 1 : 0);
         OnSwitch(FramePacing, v => s.FramePacing = v ? 1 : 0);
         OnSwitch(VSync, v => s.VSync = v ? 1 : 0);
@@ -426,7 +428,7 @@ public partial class MainWindow
         loading = true;
         Fullscreen.IsChecked = s.Fullscreen != 0;
         Display60.IsChecked = s.Display60;
-        FpsCounter.IsChecked = s.FpsCounter != 0;
+        Pick(FpsCounterGroup, s.FpsCounter);
         Ultrawide.IsChecked = s.Ultrawide != 0;
         FramePacing.IsChecked = s.FramePacing != 0;
         VSync.IsChecked = s.VSync != 0;
