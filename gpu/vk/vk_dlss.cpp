@@ -70,6 +70,7 @@
 #include "vk_fsr.h"
 #include "vk_menu.h"
 #include "vk_paths.h"
+#include "vk_state.h"
 #include "vk_texture.h"
 
 #ifdef RELINK_NGX
@@ -84,6 +85,7 @@
 #include "shaders/dlss_mask_comp_spv.h"
 #include "shaders/fg_copy_comp_spv.h"
 #include "shaders/dlss_hudless_comp_spv.h"
+#include "shaders/dlss_post_comp_spv.h"
 #include "shaders/dlss_out_comp_spv.h"
 #include "shaders/dlss_prep_comp_spv.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
@@ -199,6 +201,7 @@ struct State {
     FsrContext* fsr = nullptr;
     uint32_t fsr_rw = 0, fsr_rh = 0, fsr_ow = 0, fsr_oh = 0, fsr_iw = 0, fsr_ih = 0;
     unsigned fsr_flags = 0;
+    bool feature_hdr = false;   // (relink, 0.7.9.3: DLSS's feature made for HDR colour: RX_VK_UPSCALE_INPUT=hdr)
     int fsr_phases = 0;
     uint64_t fsr_made = 0;
     std::chrono::steady_clock::time_point fsr_last{};   // (its last dispatch: the frame time it is given)
@@ -224,6 +227,17 @@ struct State {
     uint64_t composite_frame = 0;
     uint64_t composite_gen = 0;
     bool told_composite = false;
+    // (relink, 0.7.9.3, the post chain moved after the upscale: dlss_post.comp) the scene's texture (the network's input), its
+    // HDR picture kept at the composite's draw, the game's bloom of this frame, the composite's constants
+    Texture* scene_tex = nullptr;
+    Image hdr, post_out, post_final;
+    Texture* bloom = nullptr;
+    uint64_t bloom_frame = 0, hdr_frame = 0;
+    float post_consts[16]{};   // (the composite's constant buffer: rows 0..11, then 12 13 14 15: -, power, exposure, -)
+    VkDescriptorSetLayout post_set = VK_NULL_HANDLE;
+    VkPipelineLayout post_layout = VK_NULL_HANDLE;
+    VkPipeline post_pipe = VK_NULL_HANDLE;
+    bool post_failed = false, post_logged = false;
     uint64_t input_composite = 0, input_network = 0;   // (upscales from each, for the log every 600)
     uint64_t mask_snaps = 0, mask_frames = 0, mask_given = 0, mask_ends = 0, mask_logged = 0;   // (for the status line: solid pictures taken, frames with one)
     Camera cam;               // (this frame's, since the last upscale)
@@ -830,18 +844,115 @@ uint64_t composite_key() {
                                                               : 0xab3681946f93594aull;
     return k;
 }
-int upscale_input() {   // (1: the composite before SMAA, by default; 0: the network's input, as before)
-    static const int v = getenv("RX_VK_UPSCALE_INPUT") && !strcmp(getenv("RX_VK_UPSCALE_INPUT"), "network") ? 0 : 1;
+int upscale_input() {   // (1: the composite before SMAA, by default; 0: the network's input, as before; 2: the HDR scene)
+    static const int v = [] {
+        const char* e = getenv("RX_VK_UPSCALE_INPUT");
+        return e && !strcmp(e, "network") ? 0 : e && !strcmp(e, "hdr") ? 2 : 1;
+    }();
     return v;
 }
 }  // namespace
 
-void dlss_note_post_draw(uint64_t key, Texture* color0, uint32_t w, uint32_t h) {
-    if (key != composite_key() || !color0 || color0->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return;
+namespace {
+uint64_t bloom_key() {   // (the bloom chain's upsampling draw: its last of a frame is the bloom the composite adds)
+    static const uint64_t k = getenv("RX_VK_POST_BLOOM") ? strtoull(getenv("RX_VK_POST_BLOOM"), nullptr, 16) : 0x527f93dcd5945f3full;
+    return k;
+}
+/// RX_VK_POST_TEST=ours / diff / swap: the composite made by dlss_post.comp at the render size from the HDR scene kept at the
+/// game's composite, given to the upscaler instead of the game's (ours), or the difference with the game's times 16 (diff;
+/// swap: with the scene and bloom swapped). A test that dlss_post.comp is the game's composite: diff is black where it is
+int post_test() {
+    static const int v = [] {
+        const char* e = getenv("RX_VK_POST_TEST");
+        return !e ? -1 : !strcmp(e, "ours") ? 0 : !strcmp(e, "diff") ? 1 : !strcmp(e, "swap") ? 2 : -1;
+    }();
+    return v;
+}
+bool make_post_pipeline(State& s) {
+    if (s.post_pipe) return true;
+    if (s.post_failed || !dev.push_descriptor || !vkCmdPushDescriptorSetKHR || !make_pipelines()) return false;
+    const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    const VkDescriptorType types[4] = {S, S, S, I};
+    if (make_pipeline(DLSS_POST_COMP_SPV, sizeof DLSS_POST_COMP_SPV, types, 4, 80, s.post_set, s.post_layout, s.post_pipe)) return true;
+    s.post_failed = true;
+    logf("vk: the upscalers' composite: its shader was not made");
+    return false;
+}
+/// One dlss_post.comp pass (its modes there) at w x h into dst
+void post_pass(VkCommandBuffer cmd, State& s, int mode, VkImageView scene, VkImageView bloom, VkImageView game, VkImageView dst,
+               uint32_t w, uint32_t h) {
+    struct {
+        float row[12];
+        float power, exposure;
+        int32_t size[2];
+        int32_t mode;
+    } pc{};
+    std::memcpy(pc.row, s.post_consts, sizeof pc.row);
+    pc.power = s.post_consts[13], pc.exposure = s.post_consts[14];
+    pc.size[0] = (int32_t)w, pc.size[1] = (int32_t)h, pc.mode = mode;
+    const VkDescriptorImageInfo info[4] = {{s.point, scene, VK_IMAGE_LAYOUT_GENERAL},
+                                           {s.linear, bloom ? bloom : scene, VK_IMAGE_LAYOUT_GENERAL},
+                                           {s.point, game ? game : scene, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, dst, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet wr[4]{};
+    for (uint32_t i = 0; i < 4; i++) {
+        wr[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        wr[i].dstBinding = i, wr[i].descriptorCount = 1, wr[i].pImageInfo = &info[i];
+        wr[i].descriptorType = i < 3 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.post_pipe);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.post_layout, 0, 4, wr);
+    vkCmdPushConstants(cmd, s.post_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+    vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+}
+}  // namespace
+
+void dlss_note_post_draw(VkCommandBuffer cmd, uint64_t key, Texture* color0, uint32_t w, uint32_t h, const NvnState& ns) {
+    if ((key != composite_key() && key != bloom_key()) || !color0 || color0->format != VK_FORMAT_B10G11R11_UFLOAT_PACK32) return;
     State& s = st();
+    const uint64_t now = texture_frame_no();
+    if (key == bloom_key()) {
+        std::lock_guard lk(s.mu);
+        s.bloom = color0, s.bloom_frame = now;
+        return;
+    }
+    {
+        std::lock_guard lk(s.mu);
+        s.composite = color0, s.composite_frame = now, s.composite_gen = texture_destroy_generation();
+        // (its constants: the fragment stage's buffer 0, which its program reads as c3)
+        float c[16]{};
+        const nvn_p_bind_buf& b = ns.ubo[1][0];
+        if (b.addr && b.size >= sizeof c && memory_read_as_submitted(b.addr, c, sizeof c)) std::memcpy(s.post_consts, c, sizeof c);
+        if (!s.post_logged && post_test() >= 0) {
+            s.post_logged = true;
+            for (int stage = 0; stage < 2; stage++)
+                for (int u = 0; u < 4; u++) {
+                    const nvn_p_bind_buf& q = ns.ubo[stage][u];
+                    float f[16]{};
+                    if (!q.addr || !memory_read_as_submitted(q.addr, f, std::min<uint64_t>(sizeof f, q.size))) continue;
+                    logf("vk: the composite's buffer %d of stage %d (%llu bytes): %.4f %.4f %.4f %.4f | %.4f %.4f %.4f %.4f | %.4f %.4f "
+                         "%.4f %.4f | %.4f %.4f %.4f %.4f", u, stage, (unsigned long long)q.size, f[0], f[1], f[2], f[3], f[4], f[5],
+                         f[6], f[7], f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+                }
+        }
+    }
+    if (post_test() < 0 && upscale_input() != 2) return;
+    // (the HDR scene, kept: the game's SMAA writes its picture over the scene's image before the upscale)
+    Texture* scene = nullptr;
+    {
+        std::lock_guard lk(s.mu);
+        scene = s.scene_tex;
+        if (!scene || scene->width != w || scene->height != h || !make_post_pipeline(s)) return;
+    }
+    end_pass(cmd);   // (vk_draw.cpp's: the draw opens it again)
     std::lock_guard lk(s.mu);
-    s.composite = color0, s.composite_frame = texture_frame_no(), s.composite_gen = texture_destroy_generation();
-    (void)w, (void)h;
+    const VkImageView sv = scene_color_view(s, scene);
+    if (!sv || !make_image(cmd, s.hdr, VK_FORMAT_R16G16B16A16_SFLOAT, w, h)) return;
+    full_barrier(cmd);
+    post_pass(cmd, s, 3, sv, VK_NULL_HANDLE, VK_NULL_HANDLE, s.hdr.view, w, h);
+    full_barrier(cmd);
+    descriptors_disturbed();
+    s.hdr_frame = now;
 }
 
 void dlss_scene_pass_end(VkCommandBuffer cmd, Texture* color0, VkImageView view, uint32_t w, uint32_t h) {
@@ -1180,11 +1291,11 @@ unsigned wanted_preset() {
 }
 
 /// DLSS's feature for this output size and preset, made when either changes (cmd: its creation's work)
-bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh) {
+bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, bool hdr = false) {
     State& s = st();
     const unsigned preset = wanted_preset();
     if (s.feature && s.feature_ow == ow && s.feature_oh == oh && rw <= s.feature_rw && rh <= s.feature_rh &&
-        rw >= s.min_rw && rh >= s.min_rh && s.feature_preset == preset)
+        rw >= s.min_rw && rh >= s.min_rh && s.feature_preset == preset && s.feature_hdr == hdr)
         return true;
     const uint64_t refused_key = (uint64_t)ow << 40 ^ (uint64_t)oh << 16 ^ (uint64_t)preset ^ 1ull << 63;
     if (s.refused == refused_key) return fail("its feature was not made");
@@ -1194,6 +1305,8 @@ bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, ui
     else if (!s.feature) snprintf(why, sizeof why, "again after it was let go");
     else if (s.feature_ow != ow || s.feature_oh != oh)
         snprintf(why, sizeof why, "the output went from %ux%u to %ux%u", s.feature_ow, s.feature_oh, ow, oh);
+    else if (s.feature_hdr != hdr)
+        snprintf(why, sizeof why, "%s colour (RX_VK_UPSCALE_INPUT)", hdr ? "HDR" : "tonemapped");
     else if (s.feature_preset != preset)
         snprintf(why, sizeof why, "preset %c, was %c (the DLSS model row)", upscaler_rows::preset_letter(preset),
                  upscaler_rows::preset_letter(s.feature_preset));
@@ -1274,6 +1387,8 @@ bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, ui
     cp.Feature.InPerfQualityValue = mode;
     // (LDR colour, already tonemapped: no exposure; motion at the render size, not jittered; depth not reversed)
     cp.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
+    // (relink, 0.7.9.3: RX_VK_UPSCALE_INPUT=hdr: the HDR scene, its exposure applied already (dlss_post.comp mode 4))
+    if (hdr) cp.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
     const auto t0 = std::chrono::steady_clock::now();
     const NVSDK_NGX_Result r = NGX_VULKAN_CREATE_DLSS_EXT(cmd, 1, 1, &s.feature, s.params, &cp);
     const double made_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -1291,7 +1406,7 @@ bool make_feature(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, ui
     }
     s.refused = 0;
     s.feature_rw = max_w, s.feature_rh = max_h, s.feature_ow = ow, s.feature_oh = oh, s.min_rw = min_w, s.min_rh = min_h;
-    s.feature_preset = preset;
+    s.feature_preset = preset, s.feature_hdr = hdr;
     s.features_made++;
     logf("vk: NVIDIA DLSS: feature %llu made (%s; frame %llu, %.1f ms of CPU): %ux%u (%ux%u to %ux%u, made at %ux%u) -> %ux%u, "
          "mode %d, preset %c%s", (unsigned long long)s.features_made, why, (unsigned long long)texture_frame_no(), made_ms, rw, rh,
@@ -1620,7 +1735,7 @@ void dlss_idle() {
              "the next upscale with it makes them again", name, (unsigned long long)idle, (unsigned long long)s.asked,
              (unsigned long long)now, !strcmp(name, "AMD FSR") ? "upscaler" : "feature");
     }
-    for (Image* im : {&s.color, &s.depth, &s.motion, &s.output, &s.opaque, &s.mask, &s.delta[0], &s.delta[1]}) drop_image(*im);
+    for (Image* im : {&s.color, &s.depth, &s.motion, &s.output, &s.opaque, &s.mask, &s.delta[0], &s.delta[1], &s.hdr, &s.post_out, &s.post_final}) drop_image(*im);
     {   // (relink, 0.7.9.3: the scene colour views the mask made)
         auto old = std::move(s.color_views);
         s.color_views.clear();
@@ -1856,6 +1971,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     const Camera cam = s.cam;
     s.cam.valid = false;   // (each frame's own camera)
     if (in) s.scene_image.store(in->image, std::memory_order_relaxed);   // (relink, 0.7.9.3: the see-through mask's target)
+    if (in) s.scene_tex = in;   // (relink, 0.7.9.3: the HDR scene's texture, kept at the composite: dlss_note_post_draw)
     struct SkinsDone {     // (the skinned draws, each frame's own too: actor_motion takes them, or they go here)
         State& s;
         ~SkinsDone() { s.skins.clear(); }
@@ -1898,12 +2014,18 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         ~Disturbed() { descriptors_disturbed(); }
     } disturbed;
     uint32_t iw = 0, ih = 0;   // (the inputs' size: the largest render size the feature or upscaler takes)
+    // (relink, 0.7.9.3: RX_VK_UPSCALE_INPUT=hdr, DLSS only: the HDR scene kept at the game's composite, through its colour
+    // matrix and exposure; after DLSS the bloom is added and ACES applied at the output's size (dlss_post.comp modes 4 and 5).
+    // Without this frame's HDR scene or bloom, the composite as before)
+    const uint64_t now0 = texture_frame_no();
+    const bool hdr_path = !fsr && upscale_input() == 2 && s.hdr.image && s.hdr.width == rw && s.hdr.height == rh &&
+                          now0 - s.hdr_frame <= 1 && s.bloom && now0 - s.bloom_frame <= 1 && make_post_pipeline(s);
     if (fsr) {
         if (!make_fsr(rw, rh, dw, dh, cam)) return false;
         iw = s.fsr_iw, ih = s.fsr_ih;
     } else {
 #ifdef RELINK_NGX
-        if (!make_feature(cmd, rw, rh, dw, dh)) return false;
+        if (!make_feature(cmd, rw, rh, dw, dh, hdr_path)) return false;
         iw = s.feature_rw, ih = s.feature_rh;
 #endif
     }
@@ -1960,7 +2082,25 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         s.composite->width == rw && s.composite->height == rh) {
         if (const VkImageView v = scene_color_view(s, s.composite)) color_in = v, from_composite = true;
     }
-    pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0) | (fsr_linear ? 8 : 0) | (from_composite ? 16 : 0);
+    // (RX_VK_POST_TEST: dlss_post.comp's composite at the render size, or its difference with the game's, instead)
+    if (post_test() >= 0 && from_composite && now - s.hdr_frame <= 1 && s.hdr.width == rw && s.hdr.height == rh && s.bloom &&
+        now - s.bloom_frame <= 1 && make_post_pipeline(s) && make_image(cmd, s.post_out, VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh)) {
+        full_barrier(cmd);
+        post_pass(cmd, s, post_test(), s.hdr.view, scene_color_view(s, s.bloom), color_in, s.post_out.view, rw, rh);
+        full_barrier(cmd);
+        color_in = s.post_out.view;
+        static int told = 0;
+        if (told++ < 1) logf("vk: the upscalers' composite test: mode %d, constants %.4f %.4f %.4f %.4f / power %.4f exposure %.4f",
+                             post_test(), s.post_consts[0], s.post_consts[1], s.post_consts[2], s.post_consts[3], s.post_consts[13],
+                             s.post_consts[14]);
+    }
+    if (hdr_path && make_image(cmd, s.post_out, VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh)) {
+        full_barrier(cmd);
+        post_pass(cmd, s, 4, s.hdr.view, VK_NULL_HANDLE, VK_NULL_HANDLE, s.post_out.view, rw, rh);
+        full_barrier(cmd);
+        color_in = s.post_out.view, from_composite = false;
+    }
+    pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0) | (fsr_linear ? 8 : 0) | (from_composite ? 16 : 0) | (hdr_path ? 32 : 0);
     if (from_composite != s.told_composite) {
         s.told_composite = from_composite;
         logf("vk: %s: given %s", backend_name(mode), from_composite ? "the game's composite before its SMAA" : "the network's input");
@@ -2141,7 +2281,13 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
 #endif
     }
     full_barrier(cmd);
-    out_pass(cmd, s, s.output.view, !native, out_view, ow, oh, fsr_linear);
+    VkImageView picture = s.output.view;
+    if (hdr_path && make_image(cmd, s.post_final, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh)) {
+        post_pass(cmd, s, 5, s.output.view, scene_color_view(s, s.bloom), VK_NULL_HANDLE, s.post_final.view, dw, dh);
+        full_barrier(cmd);
+        picture = s.post_final.view;
+    }
+    out_pass(cmd, s, picture, !native, out_view, ow, oh, fsr_linear);
     s.last_frame = now;
     s.last_jitter[0] = cam.jitter[0], s.last_jitter[1] = cam.jitter[1];
     // (for the status line, dlss_status: the jitter DLSS (or FSR) was given, in render pixels)
