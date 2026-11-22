@@ -238,7 +238,7 @@ struct State {
     VkPipelineLayout post_layout = VK_NULL_HANDLE;
     VkPipeline post_pipe = VK_NULL_HANDLE;
     bool post_failed = false, post_logged = false;
-    uint64_t input_composite = 0, input_network = 0;   // (upscales from each, for the log every 600)
+    uint64_t input_composite = 0, input_network = 0, input_hdr = 0;   // (upscales from each, for the log every 600)
     uint64_t mask_snaps = 0, mask_frames = 0, mask_given = 0, mask_ends = 0, mask_logged = 0;   // (for the status line: solid pictures taken, frames with one)
     Camera cam;               // (this frame's, since the last upscale)
     std::atomic<uint64_t> last_frame{0};   // (the frame DLSS last drew: read on the game's thread too)
@@ -2109,12 +2109,12 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         s.told_composite = from_composite;
         logf("vk: %s: given %s", backend_name(mode), from_composite ? "the game's composite before its SMAA" : "the network's input");
     }
-    (from_composite ? s.input_composite : s.input_network)++;
-    if (s.input_composite + s.input_network >= 600) {
-        logf("vk: %s: of the last %llu upscales %llu took the composite before SMAA, %llu the network's input", backend_name(mode),
-             (unsigned long long)(s.input_composite + s.input_network), (unsigned long long)s.input_composite,
-             (unsigned long long)s.input_network);
-        s.input_composite = s.input_network = 0;
+    (hdr_path ? s.input_hdr : from_composite ? s.input_composite : s.input_network)++;
+    if (s.input_composite + s.input_network + s.input_hdr >= 600) {
+        logf("vk: %s: of the last %llu upscales %llu took the composite before SMAA, %llu the HDR scene, %llu the network's input",
+             backend_name(mode), (unsigned long long)(s.input_composite + s.input_network + s.input_hdr),
+             (unsigned long long)s.input_composite, (unsigned long long)s.input_hdr, (unsigned long long)s.input_network);
+        s.input_composite = s.input_network = s.input_hdr = 0;
     }
 
     full_barrier(cmd);   // (the scene's colour and depth, written before)
