@@ -224,6 +224,7 @@ struct State {
     uint64_t composite_frame = 0;
     uint64_t composite_gen = 0;
     bool told_composite = false;
+    uint64_t input_composite = 0, input_network = 0;   // (upscales from each, for the log every 600)
     uint64_t mask_snaps = 0, mask_frames = 0, mask_given = 0, mask_ends = 0, mask_logged = 0;   // (for the status line: solid pictures taken, frames with one)
     Camera cam;               // (this frame's, since the last upscale)
     std::atomic<uint64_t> last_frame{0};   // (the frame DLSS last drew: read on the game's thread too)
@@ -1953,7 +1954,9 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     // (relink, 0.7.9.3: RX_VK_UPSCALE_INPUT=composite: the game's composite before its SMAA, this frame's, the scene's size)
     VkImageView color_in = in_view;
     bool from_composite = false;
-    if (upscale_input() == 1 && s.composite && s.composite_frame == now && s.composite_gen == texture_destroy_generation() &&
+    // (noted this frame or the one before: a frame's pieces are recorded out of order on several threads, and the composite's
+    // draw runs before the upscale on the GPU whichever piece was recorded first)
+    if (upscale_input() == 1 && s.composite && now - s.composite_frame <= 1 && s.composite_gen == texture_destroy_generation() &&
         s.composite->width == rw && s.composite->height == rh) {
         if (const VkImageView v = scene_color_view(s, s.composite)) color_in = v, from_composite = true;
     }
@@ -1961,6 +1964,13 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     if (from_composite != s.told_composite) {
         s.told_composite = from_composite;
         logf("vk: %s: given %s", backend_name(mode), from_composite ? "the game's composite before its SMAA" : "the network's input");
+    }
+    (from_composite ? s.input_composite : s.input_network)++;
+    if (s.input_composite + s.input_network >= 600) {
+        logf("vk: %s: of the last %llu upscales %llu took the composite before SMAA, %llu the network's input", backend_name(mode),
+             (unsigned long long)(s.input_composite + s.input_network), (unsigned long long)s.input_composite,
+             (unsigned long long)s.input_network);
+        s.input_composite = s.input_network = 0;
     }
 
     full_barrier(cmd);   // (the scene's colour and depth, written before)
