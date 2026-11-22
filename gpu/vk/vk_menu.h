@@ -49,8 +49,7 @@ struct Options {
     // HUD sharpened by dlss_out.comp. 40 by default: measured in the Market at 1920x1080 (relink_release upscaler_best_TASKS.md,
     // the mean luma step between neighbours), the 3D drawn at 3840x2160 and averaged down 7.3, the game's own upscaler 9.1 to
     // 9.8; DLSS from the game's composite before its SMAA (vk_dlss.cpp upscale_input) 6.9 unsharpened, 7.6 at 30 %, 9.2 at 40 %,
-    // 10.2 at 50 %; FSR 6.4, 8.4, 8.8; DLAA 8.8 at 30 %. An options file without it takes the old row's value when it was not 0
-    // (vk_menu.cpp menu_init)
+    // 10.2 at 50 %; FSR 6.4, 8.4, 8.8; DLAA 8.8 at 30 %. An options file without it gets 40 too (vk_menu.cpp menu_init)
     int up_sharpness = 40;
     int realtime = 1;     // game time follows the clock (host/nn_vi.c); 0: per frame (slower frames, slower game)
     int handheld = 0;     // the game's handheld profile: ~4 fps, softer; read once, at the start (host/nn_applet.c)

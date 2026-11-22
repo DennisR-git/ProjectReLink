@@ -3333,9 +3333,10 @@ void menu_init() {
         // it is on for that file too, until the file is saved with pacing_rev (here or by the launcher), which says the row's
         // value was seen as it works now. With frame generation on, the row did what it does: left as saved
         if (!pacing_rev && opts.framegen == 0) opts.pace = 1;
-        // (relink, 0.7.9.3) a file from before DLSS's, DLAA's and FSR's own Sharpness: the one row's value where it was set
-        // (the hints advised 80% for them), else their default
-        if (!up_sharp && opts.sharpness > 0) opts.up_sharpness = opts.sharpness;
+        // (relink, 0.7.9.3) a file from before DLSS's, DLAA's and FSR's own Sharpness gets their default, 40 %, whatever the old
+        // row said: the hints advised 80 % for a softer input than they are given now (the composite before SMAA), so a value
+        // carried over would sharpen twice as much as it did (the user's choice, 22/11)
+        (void)up_sharp;
     }
     // An opt-in profile for 4 GB cards: keep existing options authoritative, but make a first run usable on
     // low-VRAM hardware without requiring the menu to render first.

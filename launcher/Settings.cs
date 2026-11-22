@@ -194,9 +194,9 @@ sealed class Settings
         Resolution = Int(g, "resolution", 1, 0, 6);
         Upscaling = Int(g, "upscaling", 0, 0, 2);
         Sharpness = Int(g, "sharpness", 0, 0, 100);
-        // (relink, 0.7.9.3: the game's rule, vk_menu.cpp menu_init: DLSS's, DLAA's and FSR's own Sharpness, 40 by default; a
-        // file from before takes the one row's value where it was set)
-        UpSharpness = g.ContainsKey("upscaler_sharpness") ? Int(g, "upscaler_sharpness", 40, 0, 100) : Sharpness > 0 ? Sharpness : 40;
+        // (relink, 0.7.9.3: the game's rule, vk_menu.cpp menu_init: DLSS's, DLAA's and FSR's own Sharpness, 40 by default, a
+        // file from before too)
+        UpSharpness = Int(g, "upscaler_sharpness", 40, 0, 100);
         GameSpeed = Int(g, "game_speed", 0, 0, 1);
         Handheld = Int(g, "handheld_profile", 0, 0, 1);
         Ultrawide = Int(g, "ultrawide", 0, 0, 1);
