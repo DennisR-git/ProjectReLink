@@ -116,10 +116,11 @@
     },
     {
       "id": "fps_counter", "label": "FPS counter", "group": "Smoothness",
-      "help": "Frames per second in the top right corner of the game.",
+      "help": "Frames per second in the top right corner of the game. Detailed: frame times and their graph, 1% low, GPU, VRAM, CPU and RAM.",
       "choices": [
         { "label": "Off", "set": { "fps_counter": "0" } },
-        { "label": "On", "set": { "fps_counter": "1" } }
+        { "label": "On", "set": { "fps_counter": "1" } },
+        { "label": "Detailed", "set": { "fps_counter": "2" } }
       ],
       "defaults": { "fps_counter": "0" }
     },
