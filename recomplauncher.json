@@ -71,9 +71,15 @@
     },
     {
       "id": "sharpness", "label": "Sharpness", "group": "Display",
-      "help": "Sharpens the picture as it goes to the window. Too much shows halos around edges.",
+      "help": "With the game's own upscaler: sharpens the picture as it goes to the window. Too much shows halos around edges.",
       "slider": { "key": "sharpness", "min": 0, "max": 100, "step": 10, "format": "%d" },
       "defaults": { "sharpness": "0" }
+    },
+    {
+      "id": "upscaler_sharpness", "label": "Upscaler sharpness", "group": "Display",
+      "help": "With NVIDIA DLSS, DLAA or AMD FSR (chosen in the game's menu): sharpens the 3D under the HUD. 40 % is about as crisp as the game's own upscaler.",
+      "slider": { "key": "upscaler_sharpness", "min": 0, "max": 100, "step": 10, "format": "%d" },
+      "defaults": { "upscaler_sharpness": "40" }
     },
     {
       "id": "ultrawide", "label": "Ultrawide", "group": "Display",
