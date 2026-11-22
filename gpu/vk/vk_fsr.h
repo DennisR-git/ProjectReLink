@@ -48,7 +48,8 @@ bool fsr31_available();
 /// runtime's default: the FSR version row), FSR_PERCEPTUAL (the colour given is gamma-encoded: FSR 4 is told at its
 /// creation, FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE; 3.1 only by the dispatch's flag, as before)
 struct FsrContext;
-enum { FSR_DEPTH_INFINITE = 1, FSR_DYNAMIC = 2, FSR_V31 = 4, FSR_PERCEPTUAL = 8 };
+enum { FSR_DEPTH_INFINITE = 1, FSR_DYNAMIC = 2, FSR_V31 = 4, FSR_PERCEPTUAL = 8,
+       FSR_HDR = 16 };   // (relink, 0.7.9.3: linear HDR colour, RX_VK_UPSCALE_INPUT=hdr)
 /// nullptr when it was not made (why in the log). Its creation records nothing: no command buffer is needed. An FSR 4 that
 /// cannot be made at these sizes falls back to FSR 3.1 (said in the log)
 FsrContext* fsr_create(uint32_t max_render_w, uint32_t max_render_h, uint32_t out_w, uint32_t out_h, unsigned flags);

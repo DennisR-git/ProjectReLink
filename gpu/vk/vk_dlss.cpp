@@ -1447,7 +1447,7 @@ void drop_fsr() {
 /// memory follows it: into 2560x1440, 221 MB made for the output's size, 134 MB for 67%'s), again only when a larger one
 /// comes. Its inputs grow
 /// with the largest render size given
-bool make_fsr(uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh, const Camera& cam) {
+bool make_fsr(uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh, const Camera& cam, bool hdr = false) {
     State& s = st();
     const bool dynamic = opts.resolution == 0 && dw != rw;
     // (relink: the FSR version row, opts.fsr_version 1: FSR 3.1 over the runtime's default (FSR 4 where it gives it). A change
@@ -1455,7 +1455,8 @@ bool make_fsr(uint32_t rw, uint32_t rh, uint32_t dw, uint32_t dh, const Camera& 
     // its creation)
     static const bool perceptual = env_switch("RX_VK_FSR_SRGB") != 0;
     const unsigned flags = (cam.infinite ? FSR_DEPTH_INFINITE : 0u) | (dynamic ? FSR_DYNAMIC : 0u) |
-                           (opts.fsr_version == 1 && fsr31_available() ? FSR_V31 : 0u) | (perceptual ? FSR_PERCEPTUAL : 0u);
+                           (opts.fsr_version == 1 && fsr31_available() ? FSR_V31 : 0u) |
+                           (perceptual && !hdr ? FSR_PERCEPTUAL : 0u) | (hdr ? FSR_HDR : 0u);
     if (s.fsr && s.fsr_ow == dw && s.fsr_oh == dh && s.fsr_flags == flags && rw <= s.fsr_rw && rh <= s.fsr_rh) {
         s.fsr_iw = std::max(s.fsr_iw, rw), s.fsr_ih = std::max(s.fsr_ih, rh);
         return true;
@@ -2014,14 +2015,17 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         ~Disturbed() { descriptors_disturbed(); }
     } disturbed;
     uint32_t iw = 0, ih = 0;   // (the inputs' size: the largest render size the feature or upscaler takes)
-    // (relink, 0.7.9.3: RX_VK_UPSCALE_INPUT=hdr, DLSS only: the HDR scene kept at the game's composite, through its colour
-    // matrix and exposure; after DLSS the bloom is added and ACES applied at the output's size (dlss_post.comp modes 4 and 5).
-    // Without this frame's HDR scene or bloom, the composite as before)
+    // (relink, 0.7.9.3: RX_VK_UPSCALE_INPUT=hdr, DLSS and FSR (made for HDR colour): the HDR scene kept at the game's composite, through its colour
+    // matrix and exposure; after the upscale the bloom is added and ACES applied at the output's size (dlss_post.comp modes 4
+    // and 5))
     const uint64_t now0 = texture_frame_no();
-    const bool hdr_path = !fsr && upscale_input() == 2 && s.hdr.image && s.hdr.width == rw && s.hdr.height == rh &&
+    const bool hdr_path = upscale_input() == 2 && s.hdr.image && s.hdr.width == rw && s.hdr.height == rh &&
                           now0 - s.hdr_frame <= 1 && s.bloom && now0 - s.bloom_frame <= 1 && make_post_pipeline(s);
+    // (a frame without them is left to the game's network: DLSS's feature or FSR's upscaler made again for the tonemapped
+    // colour and back cost up to a second each (FSR: 988 ms measured), and the first frame would make it so)
+    if (upscale_input() == 2 && !hdr_path) return fail("no HDR scene this frame");
     if (fsr) {
-        if (!make_fsr(rw, rh, dw, dh, cam)) return false;
+        if (!make_fsr(rw, rh, dw, dh, cam, hdr_path)) return false;
         iw = s.fsr_iw, ih = s.fsr_ih;
     } else {
 #ifdef RELINK_NGX
@@ -2071,7 +2075,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
     // it keeps it. RX_VK_FSR_LINEAR=0 / 1 over the default
     static const int fsr_linear_env = env_switch("RX_VK_FSR_LINEAR");
     const bool fsr4_used = fsr && !(s.fsr_flags & FSR_V31) && fsr4_available();
-    const bool fsr_linear = fsr && !fsr4_used && fsr_linear_env > 0;
+    const bool fsr_linear = fsr && !fsr4_used && fsr_linear_env > 0 && !hdr_path;
     pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh;
     // (relink, 0.7.9.3: RX_VK_UPSCALE_INPUT=composite: the game's composite before its SMAA, this frame's, the scene's size)
     VkImageView color_in = in_view;
@@ -2248,7 +2252,7 @@ bool dlss_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, Vk
         f.fov_y = cam.fov_y > 0 ? cam.fov_y : 0.8f;
         f.meters = kFsrMeters;
         static const bool linear = env_switch("RX_VK_FSR_SRGB") == 0;
-        f.perceptual = !linear && !fsr_linear;   // (dlss_prep.comp's colour is the network's input: the square root of the tonemapped colour)
+        f.perceptual = !linear && !fsr_linear && !hdr_path;   // (dlss_prep.comp's colour is the network's input: the square root of the tonemapped colour)
         const uint32_t r = fsr_dispatch(s.fsr, cmd, f);
         note_work();   // (FFX's own commands, which vk_work.h does not see)
         layouts(cmd, inputs, n_inputs, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);

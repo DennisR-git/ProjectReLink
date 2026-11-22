@@ -303,7 +303,8 @@ FsrContext* make(uint32_t mrw, uint32_t mrh, uint32_t ow, uint32_t oh, unsigned 
     const bool fsr4 = !v31 && g_fsr4.load(std::memory_order_relaxed);
     c->desc.flags = (flags & FSR_DEPTH_INFINITE ? FFX_UPSCALE_ENABLE_DEPTH_INFINITE : 0u) |
                     (flags & FSR_DYNAMIC ? FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION : 0u) |
-                    (fsr4 && (flags & FSR_PERCEPTUAL) ? FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE : 0u) |
+                    (fsr4 && (flags & FSR_PERCEPTUAL) && !(flags & FSR_HDR) ? FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE : 0u) |
+                    (flags & FSR_HDR ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE : 0u) |
                     (debug ? FFX_UPSCALE_ENABLE_DEBUG_CHECKING : 0u);
     c->desc.maxRenderSize = {mrw, mrh};
     c->desc.maxUpscaleSize = {ow, oh};
